@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/kikuzawa/Documents/git/wc-bindable-protocol/wc-bindable-protocol/packages/ai/**)",
+      "PowerShell(Copy-Item \"c:\\\\Users\\\\kikuzawa\\\\Documents\\\\git\\\\csbc-dev\\\\ai-agent\\\\CLAUDE.md\" \"c:\\\\Users\\\\kikuzawa\\\\Documents\\\\git\\\\csbc-dev\\\\auth0\\\\CLAUDE.md\" -Force; Write-Output \"copied\"; \\(Get-Item \"c:\\\\Users\\\\kikuzawa\\\\Documents\\\\git\\\\csbc-dev\\\\auth0\\\\CLAUDE.md\"\\).Length)"
+    ]
+  }
+}
