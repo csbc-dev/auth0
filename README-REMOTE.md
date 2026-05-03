@@ -300,7 +300,7 @@ The companion element that turns the three-stage readiness sequence (authenticat
 |-----------|------|---------|-------------|
 | `target` | `string` | — | ID of the paired `<auth0-gate>` element. |
 | `core` | `string` | — | Key for a registered Core declaration. Look up via the registry (`registerCoreDeclaration`). |
-| `url` | `string` | — | WebSocket URL override. Falls back to the target's `remote-url`. |
+| `url` | `string` | — | WebSocket URL override. Falls back to the target's `remote-url`. **Read once per `_startWatching()` cycle.** Dynamic changes to either `<auth0-session>`'s `url` or the target `<auth0-gate>`'s `remote-url` AFTER the session has connected are NOT observed — the URL must be set before the session begins watching, or you must `start()` the session manually after the change. (`<auth0-session>`'s `attributeChangedCallback` re-runs `_startWatching()` only when the session is idle — `target` / `core` / `url` / `auto-connect` mutations against an already-open transport are coalesced but ignored until teardown.) |
 | `auto-connect` | `boolean` | `true` | Start the session automatically on `connectedCallback`. Set `auto-connect="false"` to defer and call `.start()` imperatively. |
 
 ### Bindable output state
@@ -362,6 +362,19 @@ const wss = await createAuthenticatedWSS({
 ```
 
 For handler options, protocol error codes, `verifyAuth0Token()` utility, and RBAC propagation on refresh, see [SPEC-REMOTE.md §5 Server Side](SPEC-REMOTE.md) and §3.6 onwards.
+
+### Resource & rate-limit knobs
+
+| Option | Default | Effect |
+|--------|---------|--------|
+| `maxPayload` | `262144` (256 KiB) | Maximum WebSocket message size. Forwarded to `new WebSocketServer({ maxPayload })`. The `ws` library defaults to 100 MiB, far larger than any legitimate `auth:refresh` (a JWT — a few KiB) or normal RPC frame; the lower default caps the per-frame memory a single client can pin. Override only if your application legitimately pushes larger frames. |
+| `minRefreshIntervalMs` | `5_000` | Minimum interval (ms) between successful in-band `auth:refresh` operations on a single connection. A refresh arriving within the window is rejected with `auth:refresh-failure` BEFORE `verifyAuth0Token` / `onTokenRefresh` runs. Defends against a client that loops on refresh (bug or hostile probe) — without the gate every iteration would run a JWKS round-trip and signature check. Set to `0` to disable. |
+
+`verifyAuth0Token` accepts an additional knob for clock skew:
+
+| Option | Default | Effect |
+|--------|---------|--------|
+| `clockTolerance` | `"30s"` | Forwarded to `jose`'s `jwtVerify` for `exp` / `iat` / `nbf` checks. Accepts seconds (number) or a duration string (`"30s"`, `"2m"`). Without it, normal NTP drift between Auth0 and the verifying server surfaces as `"exp" claim timestamp check failed` / `"iat" claim timestamp check failed` rejections — closing the WebSocket with `1008` mid-handshake on a token that should have been accepted. |
 
 ### Session expiry hardening
 

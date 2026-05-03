@@ -2,8 +2,9 @@ import { RemoteShellProxy, WebSocketServerTransport } from "@wc-bindable/remote"
 import type { ServerTransport } from "@wc-bindable/remote";
 import { verifyAuth0Token } from "./verifyAuth0Token.js";
 import { extractTokenFromProtocol } from "./extractTokenFromProtocol.js";
-import { base64UrlDecode } from "../jwtPayload.js";
+import { base64UrlDecode, parseJwtPayload } from "../jwtPayload.js";
 import { PROTOCOL_PREFIX } from "../protocolPrefix.js";
+import { ERROR_PREFIX } from "../raiseError.js";
 import type { AuthenticatedConnectionOptions, UserContext } from "../types.js";
 
 /**
@@ -89,9 +90,34 @@ export interface HandleConnectionOptions {
    * receives `throw`, no session state advances, and an
    * `auth:refresh-failure` event fires.
    *
-   * For the reference `UserCore`, pass `(core, user) => core.updateUser(user)`.
+   * **Atomicity contract — caller responsibility.** Core mutations
+   * inside `onTokenRefresh` MUST be performed atomically — typically
+   * as the final action before return. The connection handler does
+   * NOT roll back state changes the hook already pushed onto the wire
+   * via `RemoteShellProxy` property events: if the hook mutates the
+   * Core mid-execution and THEN throws/rejects, the partial update is
+   * already observable by the client even though the server emits
+   * `auth:refresh-failure` and replies with `throw`. To stay correct,
+   * either (a) compute new state in locals first and assign to the
+   * Core only at the end of the hook, or (b) wrap multi-step
+   * mutations in transactional logic that the Core itself can roll
+   * back on a subsequent failure signal.
+   *
+   * For the reference `UserCore`, pass `(core, user) => core.updateUser(user)`
+   * — its `updateUser` is a single-call atomic update.
    */
   onTokenRefresh?: (core: EventTarget, user: UserContext) => void | Promise<void>;
+  /**
+   * Minimum interval (ms) between successful in-band `auth:refresh`
+   * operations on a single connection. A refresh arriving within
+   * `minRefreshIntervalMs` of the previous successful one is
+   * rejected with `auth:refresh-failure` (`"Token refresh rate
+   * limit exceeded"`) before token verification or the
+   * `onTokenRefresh` hook runs. Set to `0` to disable.
+   *
+   * Default: 5000.
+   */
+  minRefreshIntervalMs?: number;
   /**
    * Optional pre-verified user context.
    *
@@ -167,6 +193,7 @@ export async function handleConnection(
     sessionGraceMs = 60_000,
     expParseFailurePolicy = "allow",
     preVerifiedUser,
+    minRefreshIntervalMs = 5_000,
   } = options;
 
   const token = extractTokenFromProtocol(protocolHeader);
@@ -205,7 +232,7 @@ export async function handleConnection(
 
   if (initialExpParseFailed && expParseFailurePolicy === "close") {
     const err = new Error(
-      "[@csbc-dev/auth0] JWT exp claim unparseable under 'close' policy; rejecting connection.",
+      `${ERROR_PREFIX} JWT exp claim unparseable under 'close' policy; rejecting connection.`,
     );
     onEvent?.({ type: "auth:failure", error: err });
     throw err;
@@ -255,6 +282,28 @@ export async function handleConnection(
   // simplest correct behaviour: clients that genuinely need parallel
   // refreshes can queue them themselves.
   let refreshInFlight = false;
+  // Timestamp (ms epoch) of the last successfully-committed refresh on
+  // this connection. Used together with `minRefreshIntervalMs` to
+  // reject a flurry of `auth:refresh` commands that would otherwise
+  // each run `verifyAuth0Token` + `onTokenRefresh` in tight succession
+  // — a hostile or buggy client looping on refresh would otherwise
+  // pin server CPU and JWKS network round-trips for no productive
+  // work. `refreshInFlight` already serialises concurrent refreshes;
+  // this gate adds a minimum gap BETWEEN them. 0 = initial value
+  // (no prior refresh on this connection); the gate compares
+  // `Date.now() - lastRefreshAt` so a 0 sentinel always passes the
+  // first refresh through.
+  let lastRefreshAt = 0;
+  // One-shot visibility flag: warn the operator the first time an
+  // `auth:refresh` arrives without an `onTokenRefresh` handler wired.
+  // The refresh STILL succeeds (the new token is honoured for session
+  // expiry purposes), but the per-connection Core's `UserContext` —
+  // including any `permissions` / `roles` derived from the original
+  // handshake token — does NOT update. Without this warning,
+  // applications whose Core surfaces token-derived bindable state
+  // would silently observe stale claims after every refresh. Latched
+  // so a flurry of refreshes only emits the warn once per connection.
+  let refreshNoHandlerWarned = false;
 
   // Create a transport wrapper that intercepts auth:refresh
   const rawTransport: ServerTransport = new WebSocketServerTransport(socket as any);
@@ -269,11 +318,44 @@ export async function handleConnection(
   // for the same id). The transport's own close path will fire the
   // server-side `dispose()` cycle and emit `connection:close`, so
   // swallowing here is safe and keeps the handler stable.
+  //
+  // Caveat: a blanket `try/catch {}` would also swallow logic bugs
+  // (e.g. JSON serialisation failures from a non-cloneable object
+  // accidentally added to a message payload). To keep these visible,
+  // route any error encountered against a STILL-OPEN socket through
+  // `onEvent` (or `console.warn` if no observer is wired). Closure
+  // races — the common case — are silenced because the socket state
+  // is no longer OPEN by the time we re-check.
   function _safeSend(message: any): void {
     try {
       rawTransport.send(message);
-    } catch {
-      // intentionally ignored — see comment above
+    } catch (sendErr) {
+      // Re-read the socket's readyState lazily so we observe the
+      // CLOSING / CLOSED transition that races send(). Some runtimes
+      // (browser WebSocket, ws) expose `readyState` on the underlying
+      // socket; treat its absence as "unknown — assume closure" so the
+      // legacy swallow behaviour applies when state cannot be probed.
+      const rs = (socket as { readyState?: number }).readyState;
+      // ws + browser both define CLOSING=2, CLOSED=3.
+      const isClosed = rs === undefined || rs === 2 || rs === 3;
+      if (isClosed) return;
+      const err = _normalizeError(sendErr);
+      if (onEvent) {
+        // Surface as a connection:close-shaped event would mislead
+        // observers; the existing `auth:failure` slot is the closest
+        // semantic match for "an outbound message could not be
+        // delivered against an open socket". Don't let a faulty
+        // observer break the send path itself.
+        try {
+          onEvent({ type: "auth:failure", error: err });
+        } catch {
+          /* observer faults are not the send path's problem */
+        }
+      } else {
+        console.warn(
+          `${ERROR_PREFIX} createAuthenticatedWSS: send() failed against an open socket: ${err.message}`,
+        );
+      }
     }
   }
 
@@ -323,6 +405,36 @@ export async function handleConnection(
                 name: "Error",
                 message: "Token refresh already in progress",
               },
+            });
+            return;
+          }
+          // Per-connection rate limit (SPEC-REMOTE §3.4.1 — defensive
+          // depth against a client that loops on refresh). `refreshInFlight`
+          // already serialises concurrent refreshes; this gate adds a
+          // minimum gap BETWEEN them so a tight loop "refresh -> wait for
+          // return -> refresh again" cannot sustain hot JWKS / CPU traffic
+          // on the server. Reject BEFORE running `verifyAuth0Token` and
+          // BEFORE flipping `refreshInFlight` to true — the rejection is a
+          // pure protocol-level decision; no async work needs to happen and
+          // a successful first refresh's deadline must not be touched by a
+          // refused follow-up. `minRefreshIntervalMs <= 0` disables the
+          // gate (legacy behaviour for tests / deployments that rely on
+          // synthetic back-to-back refreshes).
+          if (
+            minRefreshIntervalMs > 0 &&
+            lastRefreshAt > 0 &&
+            Date.now() - lastRefreshAt < minRefreshIntervalMs
+          ) {
+            const remainingMs =
+              minRefreshIntervalMs - (Date.now() - lastRefreshAt);
+            const rateErr = new Error(
+              `Token refresh rate limit exceeded; retry after ${remainingMs}ms`,
+            );
+            onEvent?.({ type: "auth:refresh-failure", error: rateErr });
+            _safeSend({
+              type: "throw",
+              id: msg.id,
+              error: { name: "Error", message: rateErr.message },
             });
             return;
           }
@@ -413,6 +525,16 @@ export async function handleConnection(
               // the Core stays stale. `await` covers both cases — sync
               // throws are converted to a rejected microtask by async,
               // and `await undefined` is a no-op when no hook is wired.
+              if (!options.onTokenRefresh && !refreshNoHandlerWarned) {
+                refreshNoHandlerWarned = true;
+                console.warn(
+                  `${ERROR_PREFIX} auth:refresh accepted without an \`onTokenRefresh\` handler. ` +
+                  "Session expiry has been extended, but the per-connection Core's UserContext " +
+                  "(permissions, roles, custom claims) is frozen at the initial handshake token. " +
+                  "Wire `onTokenRefresh: (core, user) => core.updateUser(user)` (or equivalent) " +
+                  "on createAuthenticatedWSS / handleConnection to propagate refreshed claims.",
+                );
+              }
               try {
                 await options.onTokenRefresh?.(core, newUser);
               } catch (hookErr) {
@@ -434,6 +556,16 @@ export async function handleConnection(
               }
               user = newUser;
               // sessionExpiresAt + timer are already at the new value.
+              // Record the commit timestamp BEFORE sending the success
+              // response so a client racing the response with another
+              // `auth:refresh` (the `refreshInFlight` flag flips to
+              // false in `.finally`, then the rate-limit gate runs)
+              // observes the just-completed refresh's wall-clock time.
+              // Only updated on the success path — a rolled-back hook
+              // failure / sub mismatch / exp parse failure does NOT
+              // count as a "successful" refresh and must not start the
+              // rate-limit clock.
+              lastRefreshAt = Date.now();
               onEvent?.({ type: "auth:refresh", user: newUser });
               _safeSend({ type: "return", id: msg.id, value: undefined });
             })
@@ -495,7 +627,33 @@ function _getExpFromToken(
   graceMs: number,
   onEvent?: (event: AuthEvent) => void,
 ): number {
+  // Compose `parseJwtPayload` so the segment-count / decode / JSON.parse /
+  // null-or-primitive guard logic lives in a single place
+  // (`src/jwtPayload.ts`). The wrapper here only adds the
+  // `auth:exp-parse-failure` observability emission and the grace-period
+  // arithmetic. The try/catch is preserved at the wrapper level — even
+  // though `parseJwtPayload` already returns `null` on decode/parse
+  // failure, we re-run a minimal decode in the failure branch to
+  // surface the underlying error message (e.g. an `atob` polyfill that
+  // throws a non-Error string), matching the legacy contract that
+  // exposed the cause via `auth:exp-parse-failure.error.message`.
   try {
+    const payload = parseJwtPayload(token);
+    if (payload) {
+      const exp = payload.exp;
+      if (typeof exp === "number") {
+        return exp * 1000 + graceMs;
+      }
+      onEvent?.({
+        type: "auth:exp-parse-failure",
+        error: new Error("JWT payload has no numeric `exp` claim"),
+      });
+      return Infinity;
+    }
+    // `parseJwtPayload` returned null without throwing — the token was
+    // structurally broken (missing payload segment, non-object payload,
+    // or a swallowed decode error). Re-run JSON.parse on the raw segment
+    // to surface a meaningful error to the observer.
     const parts = token.split(".");
     if (parts.length < 2) {
       onEvent?.({
@@ -504,28 +662,27 @@ function _getExpFromToken(
       });
       return Infinity;
     }
-    // Guard against primitive / null payloads before accessing `exp`
-    // — a token like `eyJ...null...` would otherwise crash with
-    // `TypeError: Cannot read properties of null`, which the try/catch
-    // would then route to `auth:exp-parse-failure` but with a misleading
-    // "Cannot read properties of null" message that suggests a code bug
-    // rather than a malformed claim.
-    const payload: unknown = JSON.parse(base64UrlDecode(parts[1]));
-    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    // Rerun decode → JSON.parse so any thrown error propagates to the
+    // catch below with its original message preserved. Reuses
+    // `base64UrlDecode` from the shared jwtPayload module so the
+    // decode behaviour stays identical to the happy path.
+    //
+    // The post-decode shape check (`decoded` not a plain object) is
+    // the only structural failure mode `parseJwtPayload` swallows
+    // silently — every other reason it returns `null` (decode throw,
+    // JSON.parse throw) re-throws here and lands in the outer catch.
+    // After this branch there is no remaining reachable case, so a
+    // tail-emit was previously unreachable in practice and has been
+    // removed; the outer `return Infinity` covers any control-flow
+    // path that drops through.
+    const decoded: unknown = JSON.parse(base64UrlDecode(parts[1]));
+    if (decoded === null || typeof decoded !== "object" || Array.isArray(decoded)) {
       onEvent?.({
         type: "auth:exp-parse-failure",
         error: new Error("JWT payload is not an object"),
       });
       return Infinity;
     }
-    const exp = (payload as Record<string, unknown>).exp;
-    if (typeof exp === "number") {
-      return exp * 1000 + graceMs;
-    }
-    onEvent?.({
-      type: "auth:exp-parse-failure",
-      error: new Error("JWT payload has no numeric `exp` claim"),
-    });
   } catch (err) {
     onEvent?.({
       type: "auth:exp-parse-failure",
@@ -534,6 +691,7 @@ function _getExpFromToken(
   }
   return Infinity;
 }
+
 
 /**
  * Convenience factory that creates a `ws.WebSocketServer` with built-in
@@ -576,8 +734,17 @@ export async function createAuthenticatedWSS(
   // never reaches the `connection` event (e.g. upgrade aborted).
   const preVerifiedUsers = new WeakMap<object, UserContext>();
 
+  // 256 KiB default — see `AuthenticatedConnectionOptions.maxPayload`
+  // in src/types.ts for the full rationale (sized for typical RPC
+  // commands while still cutting `ws`'s permissive 100 MiB default
+  // by ~400x). Forwarded verbatim to `new WebSocketServer({...})`,
+  // so `0` / `Infinity` / unset all map to the same "use ws default"
+  // semantics ws itself implements.
+  const maxPayload = options.maxPayload ?? 256 * 1024;
+
   const wss = new WebSocketServer({
     port: options.port,
+    maxPayload,
     handleProtocols(protocols: Set<string>) {
       for (const proto of protocols) {
         if (proto.startsWith(PROTOCOL_PREFIX)) {
@@ -669,6 +836,7 @@ export async function createAuthenticatedWSS(
           onTokenRefresh: options.onTokenRefresh,
           sessionGraceMs: options.sessionGraceMs,
           expParseFailurePolicy: options.expParseFailurePolicy,
+          minRefreshIntervalMs: options.minRefreshIntervalMs,
           preVerifiedUser,
         },
       );

@@ -1910,4 +1910,203 @@ describe("handleConnection", () => {
       expect(refreshed[0].roles).toEqual(["editor", "admin"]);
     });
   });
+
+  describe("auth:refresh rate limit (minRefreshIntervalMs)", () => {
+    it("rejects a follow-up auth:refresh that arrives within the window", async () => {
+      // Refresh #1 succeeds, refresh #2 arrives well within the
+      // configured min interval and must be rejected with
+      // `auth:refresh-failure` BEFORE jwtVerify runs again. Without
+      // the gate, `verifyAuth0Token` runs (a JWKS lookup + signature
+      // check per call) and `onTokenRefresh` runs against the same
+      // token in tight succession — the SPEC-REMOTE §3.4.1
+      // "defensive depth" guard this test exists to lock in.
+      jwtVerify.mockResolvedValueOnce({
+        payload: { sub: "auth0|123", permissions: [] },
+      });
+
+      const socket = createMockSocket();
+      const core = new EventTarget();
+      (core.constructor as any).wcBindable = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+      };
+
+      const events: AuthEvent[] = [];
+
+      await handleConnection(
+        socket,
+        "auth0-gate.bearer." + makeJwt({ sub: "auth0|123" }),
+        {
+          auth0Domain: "test.auth0.com",
+          auth0Audience: "https://api.example.com",
+          createCores: () => core,
+          onEvent: (e) => events.push(e),
+          // Short interval so the test is fast; the fast-path comparison
+          // is the same one production uses.
+          minRefreshIntervalMs: 10_000,
+        },
+      );
+
+      // First refresh — succeeds.
+      jwtVerify.mockResolvedValueOnce({
+        payload: { sub: "auth0|123", permissions: [], exp: Math.floor(Date.now() / 1000) + 300 },
+      });
+
+      const messageHandlers = socket._listeners["message"];
+      messageHandlers[0]({
+        data: JSON.stringify({
+          type: "cmd",
+          name: "auth:refresh",
+          id: "refresh-1",
+          args: [makeJwt({ sub: "auth0|123" })],
+        }),
+      });
+      await new Promise((r) => setTimeout(r, 10));
+
+      // Second refresh — within the window; must be refused before
+      // jwtVerify is called again. We deliberately DO NOT prime
+      // jwtVerify a second time: if the gate ever leaks, the test
+      // fails on the unmocked-call rather than passing silently.
+      const callsBeforeSecond = jwtVerify.mock.calls.length;
+      messageHandlers[0]({
+        data: JSON.stringify({
+          type: "cmd",
+          name: "auth:refresh",
+          id: "refresh-2-too-fast",
+          args: [makeJwt({ sub: "auth0|123" })],
+        }),
+      });
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(jwtVerify.mock.calls.length).toBe(callsBeforeSecond);
+
+      // The rejection must be surfaced as `auth:refresh-failure` and
+      // a `throw` response carrying the rate-limit message — the
+      // contract the client-side `refreshToken()` rejects against.
+      const lastCall = socket.send.mock.calls[socket.send.mock.calls.length - 1][0];
+      const lastResp = JSON.parse(lastCall);
+      expect(lastResp.type).toBe("throw");
+      expect(lastResp.id).toBe("refresh-2-too-fast");
+      expect(lastResp.error?.message).toContain(
+        "Token refresh rate limit exceeded",
+      );
+      const failure = events
+        .filter((e) => e.type === "auth:refresh-failure")
+        .pop();
+      expect(failure?.error?.message).toContain(
+        "Token refresh rate limit exceeded",
+      );
+    });
+
+    it("does not block the very first auth:refresh on a brand-new connection", async () => {
+      // Sanity: the gate keys on `lastRefreshAt > 0`; the initial
+      // sentinel of 0 must let the first refresh through even when
+      // the configured interval is large.
+      jwtVerify.mockResolvedValueOnce({
+        payload: { sub: "auth0|123", permissions: [] },
+      });
+
+      const socket = createMockSocket();
+      const core = new EventTarget();
+      (core.constructor as any).wcBindable = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+      };
+
+      await handleConnection(
+        socket,
+        "auth0-gate.bearer." + makeJwt({ sub: "auth0|123" }),
+        {
+          auth0Domain: "test.auth0.com",
+          auth0Audience: "https://api.example.com",
+          createCores: () => core,
+          minRefreshIntervalMs: 60_000,
+        },
+      );
+
+      jwtVerify.mockResolvedValueOnce({
+        payload: { sub: "auth0|123", permissions: [], exp: Math.floor(Date.now() / 1000) + 300 },
+      });
+
+      const messageHandlers = socket._listeners["message"];
+      messageHandlers[0]({
+        data: JSON.stringify({
+          type: "cmd",
+          name: "auth:refresh",
+          id: "first-refresh",
+          args: [makeJwt({ sub: "auth0|123" })],
+        }),
+      });
+      await new Promise((r) => setTimeout(r, 10));
+
+      const lastResp = JSON.parse(
+        socket.send.mock.calls[socket.send.mock.calls.length - 1][0],
+      );
+      expect(lastResp.type).toBe("return");
+      expect(lastResp.id).toBe("first-refresh");
+    });
+
+    it("disables the rate limit when minRefreshIntervalMs is 0", async () => {
+      // 0 = legacy / opt-out behaviour. Two back-to-back refreshes
+      // must both reach `verifyAuth0Token`.
+      jwtVerify.mockResolvedValueOnce({
+        payload: { sub: "auth0|123", permissions: [] },
+      });
+
+      const socket = createMockSocket();
+      const core = new EventTarget();
+      (core.constructor as any).wcBindable = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+      };
+
+      await handleConnection(
+        socket,
+        "auth0-gate.bearer." + makeJwt({ sub: "auth0|123" }),
+        {
+          auth0Domain: "test.auth0.com",
+          auth0Audience: "https://api.example.com",
+          createCores: () => core,
+          minRefreshIntervalMs: 0,
+        },
+      );
+
+      jwtVerify.mockResolvedValueOnce({
+        payload: { sub: "auth0|123", permissions: [], exp: Math.floor(Date.now() / 1000) + 300 },
+      });
+      jwtVerify.mockResolvedValueOnce({
+        payload: { sub: "auth0|123", permissions: [], exp: Math.floor(Date.now() / 1000) + 300 },
+      });
+
+      const messageHandlers = socket._listeners["message"];
+      messageHandlers[0]({
+        data: JSON.stringify({
+          type: "cmd",
+          name: "auth:refresh",
+          id: "rl-off-1",
+          args: [makeJwt({ sub: "auth0|123" })],
+        }),
+      });
+      await new Promise((r) => setTimeout(r, 10));
+      messageHandlers[0]({
+        data: JSON.stringify({
+          type: "cmd",
+          name: "auth:refresh",
+          id: "rl-off-2",
+          args: [makeJwt({ sub: "auth0|123" })],
+        }),
+      });
+      await new Promise((r) => setTimeout(r, 10));
+
+      const responses = socket.send.mock.calls.map((c: any[]) => JSON.parse(c[0]));
+      const ids = responses
+        .filter((m: any) => m.type === "return")
+        .map((m: any) => m.id);
+      expect(ids).toContain("rl-off-1");
+      expect(ids).toContain("rl-off-2");
+    });
+  });
 });

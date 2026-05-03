@@ -367,6 +367,36 @@ describe("createAuthenticatedWSS", () => {
     expect(socket.close).not.toHaveBeenCalledWith(1008, "Forbidden origin");
   });
 
+  it("defaults WebSocketServer maxPayload to 256 KiB when unspecified", async () => {
+    // Regression: the `ws` library defaults to 100 MiB which is far
+    // larger than any legitimate `auth:refresh` (a JWT is a few KiB)
+    // or normal RPC frame, so the server clamps the per-frame budget
+    // to 256 KiB (262144) by default. A regression that drops this
+    // floor would let a single client pin connection-worth memory by
+    // streaming a single oversized frame.
+    const wss: any = await createAuthenticatedWSS({
+      auth0Domain: "test.auth0.com",
+      auth0Audience: "aud",
+      createCores: () => new EventTarget(),
+    });
+
+    expect(wss.options.maxPayload).toBe(256 * 1024);
+  });
+
+  it("forwards an explicit maxPayload to the WebSocketServer", async () => {
+    // Applications that legitimately push larger frames (or want a
+    // tighter limit than 256 KiB) override `maxPayload`. The value
+    // must reach `new WebSocketServer({ maxPayload })` verbatim.
+    const wss: any = await createAuthenticatedWSS({
+      auth0Domain: "test.auth0.com",
+      auth0Audience: "aud",
+      createCores: () => new EventTarget(),
+      maxPayload: 8192,
+    });
+
+    expect(wss.options.maxPayload).toBe(8192);
+  });
+
   it("propagates rolesClaim to the pre-handshake verifyClient verification path", async () => {
     // End-to-end: rolesClaim must reach the pre-handshake
     // verifyAuth0Token call inside verifyClient so that the

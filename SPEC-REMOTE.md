@@ -762,6 +762,25 @@ interface AuthenticatedConnectionOptions {
   allowedOrigins?: string[];
   /** RemoteShellProxy options */
   proxyOptions?: RemoteShellProxyOptions;
+  /**
+   * Maximum WebSocket message size in bytes accepted by the server.
+   * Forwarded to `new WebSocketServer({ maxPayload })`. The `ws`
+   * default is 100 MiB, far larger than any legitimate `auth:refresh`
+   * (a JWT — a few KiB) or normal RPC frame, so a hostile or buggy
+   * client could pin connection-worth memory by streaming a single
+   * oversized frame. Default: `262144` (256 KiB).
+   */
+  maxPayload?: number;
+  /**
+   * Minimum interval (ms) between successful in-band `auth:refresh`
+   * operations on a single connection. A refresh arriving within
+   * `minRefreshIntervalMs` of the previous successful one is rejected
+   * with `auth:refresh-failure` BEFORE token verification or
+   * `onTokenRefresh` runs. Defends against clients that loop on
+   * refresh, which would otherwise pin CPU on JWKS/signature work.
+   * Set to `0` to disable. Default: `5000` (5 seconds).
+   */
+  minRefreshIntervalMs?: number;
 }
 ```
 
@@ -875,7 +894,7 @@ import { verifyAuth0Token } from "@csbc-dev/auth0/server";
 
 wss.on("connection", async (socket, req) => {
   try {
-    const token = extractTokenFromProtocol(req);
+    const token = extractTokenFromProtocol(req.headers["sec-websocket-protocol"]);
     const user = await verifyAuth0Token(token, {
       domain: "your-tenant.auth0.com",
       audience: "https://api.example.com",
@@ -887,7 +906,7 @@ wss.on("connection", async (socket, req) => {
 });
 ```
 
-#### `extractTokenFromProtocol(req): string`
+#### `extractTokenFromProtocol(protocolHeader: string | string[] | undefined): string`
 
 Parses the `Sec-WebSocket-Protocol` header to extract the token from `auth0-gate.bearer.{JWT}`.
 
@@ -1313,6 +1332,17 @@ export interface AuthenticatedConnectionOptions {
    *  Required when claims the Core exposes can change across refreshes. */
   onTokenRefresh?: (core: EventTarget, user: UserContext) => void | Promise<void>;
   proxyOptions?: import("@wc-bindable/remote").RemoteShellProxyOptions;
+  /** Maximum WebSocket message size in bytes. Forwarded to
+   *  `new WebSocketServer({ maxPayload })`. Defaults to 256 KiB
+   *  (262144) — caps the per-frame memory a single client can pin,
+   *  vs. the `ws` default of 100 MiB. */
+  maxPayload?: number;
+  /** Minimum interval (ms) between successful in-band `auth:refresh`
+   *  operations on a single connection. Refreshes arriving inside
+   *  the window are rejected with `auth:refresh-failure` before
+   *  `verifyAuth0Token` / `onTokenRefresh` run. Set to `0` to
+   *  disable. Default: `5000`. */
+  minRefreshIntervalMs?: number;
 }
 
 /** Token verification options */
@@ -1330,6 +1360,12 @@ export interface VerifyTokenOptions {
    *  default-RBAC tenants otherwise see `UserContext.roles === []`
    *  and every `roles.includes(...)` check fails closed. */
   rolesClaim?: string;
+  /** Clock tolerance forwarded to `jose`'s `jwtVerify` for `exp` /
+   *  `iat` / `nbf` checks. Accepts seconds (number) or a duration
+   *  string (`"30s"`, `"2m"`). Without it, normal NTP drift between
+   *  the issuer and the verifying server surfaces as spurious
+   *  timestamp-check rejections. Default: `"30s"`. */
+  clockTolerance?: string | number;
 }
 ```
 
@@ -1350,6 +1386,10 @@ export interface VerifyTokenOptions {
     "./server": {
       "import": "./dist/server/index.js",
       "types": "./dist/server/index.d.ts"
+    },
+    "./auto": {
+      "types": "./src/auto/auto.d.ts",
+      "default": "./src/auto/auto.min.js"
     }
   }
 }
@@ -1546,7 +1586,7 @@ import { useWcBindable } from "@wc-bindable/react";
 import { createRemoteCoreProxy } from "@wc-bindable/remote";
 import type { Auth } from "@csbc-dev/auth0";
 import type { AuthShellValues, AuthUser } from "@csbc-dev/auth0";
-import "@csbc-dev/auth0"; // Register custom elements
+import "@csbc-dev/auth0/auto"; // Register custom elements
 
 // --- AppCore wcBindable declaration (shared with server) ---
 const AppCoreDeclaration = {
@@ -1617,8 +1657,9 @@ function App() {
       bind(proxy, (name, value) => {
         setAppValues((prev) => ({ ...prev, [name]: value }));
         if (firstBatch) {
+          firstBatch = false;
           // Defer so all sync properties are applied before rendering
-          queueMicrotask(() => { setSynced(true); firstBatch = false; });
+          queueMicrotask(() => { setSynced(true); });
         }
       });
     })();

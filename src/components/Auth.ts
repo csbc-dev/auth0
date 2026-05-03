@@ -1,8 +1,9 @@
 import type { ClientTransport } from "@wc-bindable/remote";
 import { config } from "../config.js";
 import { IWcBindable, AuthMode, AuthError, AuthUser } from "../types.js";
-import { AuthShell } from "../shell/AuthShell.js";
+import { AuthShell, DEFAULT_SCOPE } from "../shell/AuthShell.js";
 import { registerAutoTrigger, unregisterAutoTrigger } from "../autoTrigger.js";
+import { ERROR_PREFIX } from "../raiseError.js";
 
 export class Auth extends HTMLElement {
   static hasConnectedCallbackPromise = true;
@@ -30,6 +31,29 @@ export class Auth extends HTMLElement {
   // and disconnect — without this flag a false reading on disconnect
   // would unbalance the refcount in autoTrigger.ts.
   private _autoTriggerRegistered: boolean = false;
+  // One-shot guard for the unknown-`mode` console.warn. Per-instance
+  // because the wrong attribute is per-instance; a single page can
+  // legitimately have multiple `<auth0-gate>` mounts and a typo on
+  // one should not silence a future typo on another.
+  private _unknownModeWarned: boolean = false;
+  // One-shot guard for the post-init "inert attribute mutated" warn.
+  // The Auth0 SPA SDK is constructed once with `audience` / `scope` /
+  // `redirect-uri` / `cache-location` / `use-refresh-tokens` plumbed
+  // straight into its options; mutating any of these attributes
+  // post-init does NOT reconfigure the live SDK (the SDK keys its
+  // session storage by audience, scope and cache-location all
+  // partition the cache, refresh-token usage is bound at
+  // construction). The browser still delivers
+  // `attributeChangedCallback` for them because they're in
+  // `observedAttributes`, so a framework re-stamp or an explicit
+  // mid-life setAttribute would otherwise silently no-op while the
+  // operator believes the change took effect. A single warn covers
+  // all of them — burying the user under five separate "X mutated"
+  // messages would be louder than helpful, and the fix in every case
+  // is the same (tear down and remount the element). Latched so a
+  // framework that re-stamps multiple inert attributes in one tick
+  // does not flood the console.
+  private _postInitMutationWarned: boolean = false;
 
   constructor() {
     super();
@@ -71,7 +95,7 @@ export class Auth extends HTMLElement {
   }
 
   get scope(): string {
-    return this.getAttribute("scope") || "openid profile email";
+    return this.getAttribute("scope") || DEFAULT_SCOPE;
   }
 
   set scope(value: string) {
@@ -96,6 +120,19 @@ export class Auth extends HTMLElement {
     this.setAttribute("use-refresh-tokens", value ? "true" : "false");
   }
 
+  /**
+   * Use Auth0's popup login flow (`loginWithPopup`) instead of the
+   * default redirect (`loginWithRedirect`).
+   *
+   * Read on demand at every `login()` call rather than mirrored into
+   * `observedAttributes` — the value only matters at the moment login
+   * is invoked, and the popup-vs-redirect decision is driven by the
+   * caller's intent at click time, not by long-lived state. Adding it
+   * to `observedAttributes` would needlessly fire
+   * `attributeChangedCallback` (and currently has no effect because
+   * the callback ignores anything not listed in the init-relevant
+   * set), so the on-demand read is intentional.
+   */
   get popup(): boolean {
     return this.hasAttribute("popup");
   }
@@ -125,10 +162,29 @@ export class Auth extends HTMLElement {
    *
    * In `"remote"` mode the access token is not reachable from JS —
    * `.token` returns `null` and `getToken()` throws.
+   *
+   * Unknown attribute values (e.g. typo `mode="remot"`) fall through
+   * to the implicit resolution and emit a one-time `console.warn` so
+   * the integrator sees the mistake instead of silently landing in
+   * the wrong mode.
    */
   get mode(): AuthMode {
     const attr = this.getAttribute("mode");
     if (attr === "remote" || attr === "local") return attr;
+    if (attr !== null && attr !== "") {
+      // One-time warn per element — `_unknownModeWarned` latches so
+      // a framework that re-reads `mode` repeatedly does not flood
+      // the console. Implicit fallback (no attribute, or empty
+      // attribute) is intentionally NOT warned.
+      if (!this._unknownModeWarned) {
+        this._unknownModeWarned = true;
+        console.warn(
+          `${ERROR_PREFIX} <auth0-gate>: unknown mode="${attr}". ` +
+          `Falling back to implicit resolution (remote-url presence). ` +
+          `Valid values: "local" | "remote".`,
+        );
+      }
+    }
     return this.remoteUrl ? "remote" : "local";
   }
 
@@ -185,6 +241,20 @@ export class Auth extends HTMLElement {
     return this._shell.client;
   }
 
+  /**
+   * Resolves once the element's `connectedCallback` has settled
+   * (initialize() success or failure).
+   *
+   * Limitation: the promise reference is captured at the moment a
+   * caller reads it. If `auto-connect` flips from `false` to `true`
+   * mid-life on the paired `<auth0-session>`, or any imperative
+   * `start()` is invoked after the initial connect cycle, the value
+   * read PRIOR to that transition does NOT auto-update — a caller
+   * that cached `el.connectedCallbackPromise` early will continue to
+   * await the original (already-resolved) promise and miss the second
+   * start. Re-read `connectedCallbackPromise` after any deliberate
+   * mid-life restart to pick up the fresh promise.
+   */
   get connectedCallbackPromise(): Promise<void> {
     return this._connectedCallbackPromise;
   }
@@ -207,6 +277,15 @@ export class Auth extends HTMLElement {
     if (v && this._trigger) return;
     if (v) {
       this._trigger = true;
+      // Dispatch the `true` transition so wcBindable consumers see
+      // BOTH `trigger=true` and the subsequent `trigger=false` —
+      // before this, only the `false` reset emitted, leaving
+      // `data-wcs`-bound spinners that gate on `trigger` unable to
+      // observe the in-flight phase.
+      this.dispatchEvent(new CustomEvent("auth0-gate:trigger-changed", {
+        detail: true,
+        bubbles: true,
+      }));
       this._connectedCallbackPromise
         .then(() => this.login())
         .catch(() => { /* error surfaces via this.error (AuthShell state); avoid unhandled rejection */ })
@@ -343,6 +422,48 @@ export class Auth extends HTMLElement {
       this._shell.mode = this.mode;
     }
 
+    // `audience`, `scope`, `redirect-uri`, `cache-location`, and
+    // `use-refresh-tokens` are all observed (so the browser delivers
+    // mutations here) but the Auth0 SPA SDK is already constructed
+    // with their original values — re-initialising would orphan the
+    // cached session, and partial reconfiguration is not supported
+    // by the SDK. Warn once per element on the FIRST post-init
+    // mutation so the operator sees the silent inertness instead of
+    // debugging a "the new value didn't take effect" mystery.
+    //
+    // `_oldValue !== null` skips the initial attribute landing
+    // (oldValue null means "attribute first set", which IS observed
+    // by the deferred-init microtask below); only post-init
+    // mutations trigger the warn. A single one-shot covers the whole
+    // group — five separate per-attribute warnings would be louder
+    // than helpful, and the remediation is identical across them
+    // (tear down and remount).
+    const _INERT_POST_INIT_ATTRIBUTES = [
+      "audience",
+      "scope",
+      "redirect-uri",
+      "cache-location",
+      "use-refresh-tokens",
+    ];
+    if (
+      _INERT_POST_INIT_ATTRIBUTES.includes(_name) &&
+      _oldValue !== null &&
+      _oldValue !== _newValue &&
+      (this._shell.client || this._shell.initPromise) &&
+      !this._postInitMutationWarned
+    ) {
+      this._postInitMutationWarned = true;
+      console.warn(
+        `${ERROR_PREFIX} <auth0-gate>: \`${_name}\` mutated after initialize() ` +
+        `("${_oldValue}" -> "${_newValue}"). The Auth0 SPA SDK is constructed once ` +
+        `with the initial values of \`audience\`, \`scope\`, \`redirect-uri\`, \`cache-location\`, ` +
+        `and \`use-refresh-tokens\`; mid-life changes to any of these attributes are NOT ` +
+        `applied to the existing client. Tear down and remount <auth0-gate> if you genuinely ` +
+        `need to reconfigure. (connect()/reconnect() in remote mode still validates the live ` +
+        `\`audience\` attribute against the server.)`,
+      );
+    }
+
     // Coalesce synchronous attribute stamps (frameworks that set domain,
     // client-id, cache-location, … in sequence) into a single init
     // attempt. Without the microtask, init fires as soon as domain +
@@ -397,6 +518,17 @@ export class Auth extends HTMLElement {
     // instance actually registered — otherwise we would under-decrement
     // the refcount for an element whose connect happened while
     // `config.autoTrigger` was false.
+    //
+    // The autoTrigger unregister is intentionally synchronous (and
+    // therefore asymmetric with the deferred WebSocket teardown
+    // below): existing regression tests assert that
+    // `document.removeEventListener("click", ...)` runs in the same
+    // task as `el.remove()` once the last `<auth0-gate>` leaves the
+    // DOM. The shared refcount in `autoTrigger.ts` makes
+    // detach/reattach cheap (re-attach during the same task on
+    // a portal move just bumps the count; only the very last leaver
+    // calls `removeEventListener`), so the churn cost is bounded
+    // even in rapid mount/unmount scenarios.
     if (this._autoTriggerRegistered) {
       unregisterAutoTrigger();
       this._autoTriggerRegistered = false;

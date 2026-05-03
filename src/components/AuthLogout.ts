@@ -1,4 +1,5 @@
 import { config } from "../config.js";
+import { ERROR_PREFIX } from "../raiseError.js";
 import { Auth } from "./Auth.js";
 
 /**
@@ -50,7 +51,7 @@ export class AuthLogout extends HTMLElement {
       // would noise up SSR / unrelated pages that include the script.
       if (this.target) {
         console.warn(
-          `[@csbc-dev/auth0] <auth0-logout>: target="${this.target}" did not resolve to a <auth0-gate> element. Click ignored.`,
+          `${ERROR_PREFIX} <auth0-logout>: target="${this.target}" did not resolve to a <auth0-gate> element. Click ignored.`,
         );
       }
       return;
@@ -74,7 +75,7 @@ export class AuthLogout extends HTMLElement {
     // application-level UI that observes those continues to work.
     authElement.logout(options).catch((err: unknown) => {
       console.warn(
-        "[@csbc-dev/auth0] <auth0-logout>: logout() failed.",
+        `${ERROR_PREFIX} <auth0-logout>: logout() failed.`,
         err,
       );
     });

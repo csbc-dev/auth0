@@ -25,16 +25,19 @@ function handleClick(event: Event): void {
   const authElement = document.getElementById(authId);
   if (!authElement || authElement.tagName.toLowerCase() !== config.tagNames.auth) return;
 
-  event.preventDefault();
   // Duck-check before invocation. The tag-name match above only
   // proves the element's tagName is registered — not that the
   // upgrade has installed the prototype methods yet. On the very
   // first click after navigation (custom element definition loaded
   // via `defer` after parse), `login` can still be undefined, and
   // calling it would throw `TypeError: authElement.login is not a
-  // function` into the click handler's call stack.
+  // function` into the click handler's call stack. preventDefault
+  // is deferred until AFTER the duck check so a click on a
+  // not-yet-upgraded element falls through to the default action
+  // instead of being silently swallowed.
   const loginFn = (authElement as unknown as { login?: unknown }).login;
   if (typeof loginFn !== "function") return;
+  event.preventDefault();
   // `login()` is async and can reject (e.g. click fires before the
   // element's `domain` / `client-id` attributes are set, or during
   // an init failure). Treat the returned value as a potential

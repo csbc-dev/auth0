@@ -169,6 +169,33 @@ describe("config", () => {
     expect(config.tagNames.authLogout).toBe("auth0-logout");
     expect(config.tagNames.authSession).toBe("auth0-session");
   });
+
+  // Custom-element name shape validation. The downstream
+  // `tagName.toLowerCase() === config.tagNames.<…>` comparisons in
+  // AuthLogout / AuthSession / autoTrigger silently miss when the
+  // configured name has any uppercase character or no hyphen; the
+  // misconfig only surfaces as "<auth0-logout> button does nothing"
+  // far from the setConfig call. Catching the shape at the
+  // configuration boundary keeps the diagnostic next to the cause.
+  it("setConfig()で tagNames に不正な custom element 名を渡すと raiseError する", () => {
+    // Uppercase
+    expect(() => setConfig({ tagNames: { auth: "Auth0-Gate" } }))
+      .toThrow(/tagNames\.auth.*valid lower-case custom element name/);
+    // No hyphen — required by the spec for any custom element
+    expect(() => setConfig({ tagNames: { authLogout: "logout" } }))
+      .toThrow(/tagNames\.authLogout.*valid lower-case custom element name/);
+    // Starts with a digit
+    expect(() => setConfig({ tagNames: { authSession: "1session-x" } }))
+      .toThrow(/tagNames\.authSession.*valid lower-case custom element name/);
+    // Trailing hyphen
+    expect(() => setConfig({ tagNames: { auth: "auth-" } }))
+      .toThrow(/tagNames\.auth.*valid lower-case custom element name/);
+
+    // Defaults intact — no partial mutation leaked through any throw.
+    expect(config.tagNames.auth).toBe("auth0-gate");
+    expect(config.tagNames.authLogout).toBe("auth0-logout");
+    expect(config.tagNames.authSession).toBe("auth0-session");
+  });
 });
 
 describe("bootstrapAuth", () => {
@@ -1129,6 +1156,98 @@ describe("Auth (auth0-gate)", () => {
       await expect(el.getToken()).rejects.toThrow(
         "getToken() is disabled in remote mode",
       );
+    });
+  });
+
+  describe("post-init inert attribute mutation warn", () => {
+    // Regression for the one-shot console.warn that fires when one of
+    // `audience` / `scope` / `redirect-uri` / `cache-location` /
+    // `use-refresh-tokens` is mutated AFTER initialize() has run. The
+    // Auth0 SPA SDK is constructed once with these values and silently
+    // ignores live mutations; the warn surfaces that inertness so
+    // operators don't debug a "the new value didn't take effect"
+    // mystery. The latch keeps the noise to one warn per element.
+    it("初回属性スタンプ (oldValue===null) ではwarnを出さない", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const mockClient = createMockAuth0Client();
+        createAuth0Client.mockResolvedValue(mockClient);
+
+        const el = document.createElement("auth0-gate") as Auth;
+        // These setAttributes are all "first sets" — the browser
+        // delivers them with oldValue === null, which the warn gate
+        // explicitly skips. Initialise must come up clean.
+        el.setAttribute("domain", "test.auth0.com");
+        el.setAttribute("client-id", "client-id");
+        el.setAttribute("audience", "https://api.example.com");
+        el.setAttribute("scope", "openid profile email");
+        el.setAttribute("redirect-uri", "/callback");
+        document.body.appendChild(el);
+        await el.connectedCallbackPromise;
+
+        expect(warnSpy).not.toHaveBeenCalled();
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("初期化後の audience 変更で1回だけwarnが出る", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const mockClient = createMockAuth0Client();
+        createAuth0Client.mockResolvedValue(mockClient);
+
+        const el = document.createElement("auth0-gate") as Auth;
+        el.setAttribute("domain", "test.auth0.com");
+        el.setAttribute("client-id", "client-id");
+        el.setAttribute("audience", "https://api.example.com");
+        document.body.appendChild(el);
+        await el.connectedCallbackPromise;
+
+        // Sanity: connection-time stamps must not have warned yet.
+        expect(warnSpy).not.toHaveBeenCalled();
+
+        // Mutation AFTER initialize() — the SDK is already constructed,
+        // so this is the inert path the warn exists to surface.
+        el.setAttribute("audience", "https://api.example.com/v2");
+
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        const message = String(warnSpy.mock.calls[0][0]);
+        expect(message).toContain("<auth0-gate>");
+        expect(message).toContain("audience");
+        expect(message).toContain("mutated after initialize()");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("warn発火後の scope 変更ではラッチで再warnしない", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const mockClient = createMockAuth0Client();
+        createAuth0Client.mockResolvedValue(mockClient);
+
+        const el = document.createElement("auth0-gate") as Auth;
+        el.setAttribute("domain", "test.auth0.com");
+        el.setAttribute("client-id", "client-id");
+        el.setAttribute("audience", "https://api.example.com");
+        el.setAttribute("scope", "openid profile email");
+        document.body.appendChild(el);
+        await el.connectedCallbackPromise;
+
+        // Fire the one-shot via `audience` …
+        el.setAttribute("audience", "https://api.example.com/v2");
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+
+        // … any further inert attribute change (here `scope`) is
+        // silently swallowed by the per-instance latch — the
+        // remediation ("tear down and remount") is identical, so a
+        // second warn would just be noise.
+        el.setAttribute("scope", "openid email");
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        warnSpy.mockRestore();
+      }
     });
   });
 });

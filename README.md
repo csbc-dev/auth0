@@ -52,6 +52,8 @@ npm install @csbc-dev/auth0 @auth0/auth0-spa-js
 
 Remote deployments additionally need `@wc-bindable/remote`.
 
+> **Developing this package from source:** the in-tree `package.json` pins `@wc-bindable/remote` as a `file:` reference to a sibling checkout (`../../wc-bindable-protocol/wc-bindable-protocol/packages/remote`). Clone the monorepo at that path before `npm install` if you are working on the package itself. Released artifacts on npm resolve `@wc-bindable/remote` from the registry; the `file:` pin is rewritten to a semver range as part of the release procedure (see [.claude/skills/release/SKILL.md](.claude/skills/release/SKILL.md)).
+
 ## Which doc should I read?
 
 | If you… | Read |

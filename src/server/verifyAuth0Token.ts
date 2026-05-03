@@ -1,5 +1,6 @@
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import type { VerifyTokenOptions, UserContext } from "../types.js";
+import { ERROR_PREFIX } from "../raiseError.js";
 
 /**
  * JWKS keyed by issuer URL. `createRemoteJWKSet` already caches the
@@ -18,7 +19,7 @@ export async function verifyAuth0Token(
   token: string,
   options: VerifyTokenOptions,
 ): Promise<UserContext> {
-  const { domain, audience, rolesClaim } = options;
+  const { domain, audience, rolesClaim, clockTolerance = "30s" } = options;
   const issuer = `https://${domain}/`;
   const jwksUri = `${issuer}.well-known/jwks.json`;
 
@@ -31,10 +32,29 @@ export async function verifyAuth0Token(
   const { payload } = await jwtVerify(token, jwks, {
     issuer,
     audience,
+    // Pin the accepted JWS algorithm to RS256 — Auth0 access tokens
+    // are exclusively RS256-signed under the SPA / API flows this
+    // package targets. Without an explicit allowlist, `jose` defaults
+    // to "any algorithm the resolved key supports", which keeps the
+    // verifier honest in the happy path but leaves the door open to
+    // JWK-confusion vectors where an unexpected `alg` header (e.g.
+    // `HS256` paired with a tampered JWKS response, or a future Auth0
+    // tenant misconfiguration that publishes a key supporting
+    // multiple algs) would still verify. Pinning here closes that
+    // class of attack at the verifier; if Auth0 ever introduces a
+    // non-RS256 signing alg this option is the single point that
+    // needs to widen, with full visibility on the change.
+    algorithms: ["RS256"],
+    // Default 30s clock skew tolerance — without it, normal NTP drift
+    // between Auth0's issuer and the verifying server (or a token
+    // whose `iat` is fractionally in the future) rejects with
+    // `"exp"`/`"iat"` claim check failures and closes the handshake
+    // with 1008 even though the token is otherwise valid.
+    clockTolerance,
   });
 
   if (!payload.sub) {
-    throw new Error("[@csbc-dev/auth0] JWT payload missing 'sub' claim.");
+    throw new Error(`${ERROR_PREFIX} JWT payload missing 'sub' claim.`);
   }
 
   const payloadRec = payload as Record<string, unknown>;

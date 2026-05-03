@@ -44,6 +44,27 @@ function _normalizeAuthError(err: unknown): AuthError | Error {
  *     `_error` and emit `auth0-gate:error` for binding subscribers.
  */
 export class AuthCore extends EventTarget {
+  /**
+   * **Security contract — `token` listed here is intentional, scope-limited.**
+   *
+   * `token` IS published on `AuthCore.wcBindable.properties` so that an
+   * in-process consumer (e.g. an `AuthShell` that constructs the Core
+   * directly, or a unit test that drives Auth0 via the headless Core)
+   * can observe `auth0-gate:token-changed` through the wcBindable
+   * declaration. The CLAUDE.md "token must NEVER appear in the
+   * wcBindable surface" rule applies to the **`<auth0-gate>` element**
+   * surface — `AuthShell.wcBindable` (omits `token`) and
+   * `Auth.wcBindable` (extends `AuthShell.wcBindable`, also omits
+   * `token`) — which is what `data-wcs` and equivalent declarative
+   * binders attach to. AuthCore is the in-runtime decision Core, never
+   * directly bound by external `data-wcs` consumers, so the token
+   * declaration here does NOT leak the bearer through the documented
+   * Shell binding surface. Removing it would break `AuthShell`'s
+   * internal `commitToken()` → `auth0-gate:token-changed` subscribers
+   * that rely on the Core's wcBindable declaration to discover the
+   * event name (and the published unit-test contract that this
+   * package's `AuthCore` sits across — see __tests__/authCore.test.ts).
+   */
   static wcBindable: IWcBindable = {
     protocol: "wc-bindable",
     version: 1,
@@ -115,9 +136,18 @@ export class AuthCore extends EventTarget {
    * every call site. Kept private so the `unknown`-typed public
    * `client` getter remains the sole external view — callers outside
    * AuthCore must still narrow via `as Auth0Client` themselves.
+   *
+   * Typed as `Auth0Client` (via type-only `import("@auth0/auth0-spa-js")`
+   * — the package is a peer dependency, but type-only imports do NOT
+   * pull anything into the runtime bundle) so internal SDK usage gets
+   * full method-shape checking and autocomplete instead of the silent
+   * `any` accepted before. Falls back to `unknown` if the peer dep is
+   * not installed at TS-resolve time, which a downstream consumer
+   * never hits since `@auth0/auth0-spa-js` is also a devDependency
+   * of this package.
    */
-  private get _sdk(): any {
-    return this._client;
+  private get _sdk(): import("@auth0/auth0-spa-js").Auth0Client {
+    return this._client as import("@auth0/auth0-spa-js").Auth0Client;
   }
 
   /**
@@ -308,7 +338,12 @@ export class AuthCore extends EventTarget {
 
     if (isAuthenticated) {
       const user = await this._sdk.getUser();
-      this._setUser(user ?? null);
+      // Auth0's `User` type declares `sub: string | undefined`, but the
+      // OIDC contract guarantees that an authenticated user has a `sub`.
+      // Cast through the package's local `AuthUser` to bring the type
+      // back in line with downstream consumers that rely on `sub`
+      // being present whenever `authenticated === true`.
+      this._setUser((user as AuthUser | undefined) ?? null);
 
       try {
         const token = await this._sdk.getTokenSilently();
@@ -432,6 +467,26 @@ export class AuthCore extends EventTarget {
 
   /**
    * Get access token silently (from cache or via refresh).
+   *
+   * Returns:
+   *   - `string` — the access token, when the Auth0 SDK successfully
+   *     returns one (and updates `_token`).
+   *   - `null` in two distinct situations:
+   *     1. The SDK returned `null`/`undefined` (no token currently
+   *        cached and silent refresh is unavailable). `_error` stays
+   *        unchanged and `auth0-gate:error` does not fire.
+   *     2. The SDK rejected — `null` is the swallowed-failure return.
+   *        In this case `_error` IS updated and `auth0-gate:error`
+   *        IS dispatched. Callers that need to distinguish the two
+   *        must inspect `error` alongside the returned value (read
+   *        immediately after the await; subsequent operations may
+   *        clear it).
+   *
+   * This contract intentionally never rejects — see the class JSDoc
+   * "Error delivery contract" — so a silent `null` followed by an
+   * unchecked use can mask a recoverable Auth0 outage. Refresh
+   * schedulers should treat `null` as a failure-or-absence signal and
+   * branch on `error !== null` to decide whether to retry.
    */
   async getToken(options?: Record<string, any>): Promise<string | null> {
     if (!this._client) {

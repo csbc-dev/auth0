@@ -90,7 +90,18 @@ export class AuthSession extends HTMLElement {
     this.setAttribute("core", value);
   }
 
-  /** Optional URL override. Falls back to the target `<auth0-gate>`'s `remote-url`. */
+  /**
+   * Optional URL override. Falls back to the target `<auth0-gate>`'s `remote-url`.
+   *
+   * Read once per `_startWatching()` cycle (in `_connect()`). Dynamic
+   * changes to either this attribute OR the target's `remote-url`
+   * AFTER the session has an open transport are NOT observed —
+   * `attributeChangedCallback` re-runs `_startWatching()` only while
+   * the session is idle (`!_transport && !_connecting`). Set the URL
+   * before the session connects, or tear down (logout / removal) and
+   * remount with the new value, or call `start()` manually after the
+   * change.
+   */
   get url(): string {
     return this.getAttribute("url") || "";
   }
@@ -156,6 +167,22 @@ export class AuthSession extends HTMLElement {
     return this._transport;
   }
 
+  /**
+   * Resolves once the initial `_startWatching()` cycle settles.
+   *
+   * Limitation: when `auto-connect="false"` the session does not
+   * auto-start, so `connectedCallbackPromise` keeps the
+   * already-resolved initial value and does NOT track the lifecycle
+   * of any subsequent imperative `start()` call. Applications that
+   * drive the session via `start()` should `await start()` directly —
+   * the promise read from this property at startup will not reflect
+   * the imperative cycle's progress. This also applies when
+   * `auto-connect` is flipped from `false` to `true` mid-life: a
+   * caller that cached the promise BEFORE the flip is left awaiting
+   * the original (already-resolved) promise and misses the second
+   * start. Re-read `connectedCallbackPromise` after any deliberate
+   * mid-life restart to pick up the fresh promise.
+   */
   get connectedCallbackPromise(): Promise<void> {
     return this._connectedCallbackPromise;
   }
@@ -183,8 +210,10 @@ export class AuthSession extends HTMLElement {
 
   disconnectedCallback(): void {
     this._teardown();
+    // `_unsubscribeAuth()` now clears `_authEl` as part of its
+    // teardown, so the explicit assignment that used to follow
+    // (kept for the redundant clear) is no longer needed.
     this._unsubscribeAuth();
-    this._authEl = null;
   }
 
   attributeChangedCallback(_name: string, _oldValue: string | null, _newValue: string | null): void {
@@ -246,6 +275,21 @@ export class AuthSession extends HTMLElement {
     // is the API contract the producers (`raiseOwnershipError()` in
     // AuthShell, the `_connect` construction below) explicitly opt
     // into.
+    //
+    // Precedence rule: a standing ownership error WINS over any new
+    // restart's natural error clear, even when the restart was
+    // triggered by a mutation to `target` / `core` / `url` that was
+    // intended to FIX the ownership conflict. This is deliberate —
+    // the ownership condition is re-evaluated synchronously by
+    // `_connect()` below, which calls `_setError(null)` on its own
+    // happy path and `_setError(ownershipErr)` on the still-violating
+    // path. So a corrected configuration clears the message in the
+    // same `_startWatching()` run; the only wording that lingers is
+    // for genuinely unresolved ownership violations. Applications
+    // that want the standing error cleared explicitly on attribute
+    // change should call `start()` after manually setting `error =
+    // null` (which the public surface does not currently expose, by
+    // design — see `_setError`'s identity-comparison rationale).
     const standingOwnershipError = isOwnershipError(this._error) ? this._error : null;
     if (!standingOwnershipError) this._setError(null);
 
@@ -256,19 +300,19 @@ export class AuthSession extends HTMLElement {
 
     const auth = this._resolveAuth();
     if (!auth) {
-      this._setError(new Error(`[@csbc-dev/auth0] <auth0-session>: target "${this.target}" not found.`));
+      this._setError(new Error(`${ERROR_PREFIX} <auth0-session>: target "${this.target}" not found.`));
       return;
     }
     this._authEl = auth;
 
     const coreKey = this.core;
     if (!coreKey) {
-      this._setError(new Error("[@csbc-dev/auth0] <auth0-session>: `core` attribute is required."));
+      this._setError(new Error(`${ERROR_PREFIX} <auth0-session>: \`core\` attribute is required.`));
       return;
     }
     const decl = getCoreDeclaration(coreKey);
     if (!decl) {
-      this._setError(new Error(`[@csbc-dev/auth0] <auth0-session>: core "${coreKey}" is not registered. Call registerCoreDeclaration("${coreKey}", decl) first.`));
+      this._setError(new Error(`${ERROR_PREFIX} <auth0-session>: core "${coreKey}" is not registered. Call registerCoreDeclaration("${coreKey}", decl) first.`));
       return;
     }
     this._coreDecl = decl;
@@ -337,9 +381,16 @@ export class AuthSession extends HTMLElement {
     }
     this._authListener = null;
     this._connectedListener = null;
-    // Note: `_authEl` is intentionally NOT cleared here so a subsequent
-    // `_startWatching` can re-resolve to (typically) the same target via
-    // `_resolveAuth()`. `disconnectedCallback` clears it.
+    // Clear `_authEl` so any subsequent `_startWatching()` re-runs
+    // `_resolveAuth()` from a clean slate. `_resolveAuth()` always
+    // re-fetches by current `target` attribute anyway, so retaining a
+    // stale reference here served no purpose — and crucially, leaking
+    // a reference to a possibly-removed Auth element across teardowns
+    // could keep that element reachable from this session past its
+    // intended lifetime. `disconnectedCallback` already does this for
+    // the disconnect path; making it consistent across all teardown
+    // paths simplifies the lifecycle invariant.
+    this._authEl = null;
   }
 
   private async _connect(): Promise<void> {
@@ -380,7 +431,7 @@ export class AuthSession extends HTMLElement {
     const url = this.url || auth.remoteUrl;
     if (!url) {
       this._setError(new Error(
-        "[@csbc-dev/auth0] <auth0-session>: no WebSocket URL configured. " +
+        `${ERROR_PREFIX} <auth0-session>: no WebSocket URL configured. ` +
         "Set the `url` attribute on <auth0-session> or `remote-url` on the target <auth0-gate>.",
       ));
       return;
@@ -475,11 +526,31 @@ export class AuthSession extends HTMLElement {
     this._transport = null;
   }
 
+  /**
+   * Resolve the target `<auth0-gate>` by ID.
+   *
+   * Limitation: uses `document.getElementById`, which only walks the
+   * main document tree. A `<auth0-session>` placed inside a Shadow DOM
+   * tree cannot resolve a target that lives in a different shadow root
+   * — applications composing across shadow boundaries should keep both
+   * elements in the same tree, or set `.target` programmatically to a
+   * pre-resolved `<auth0-gate>` element via a wrapper that exposes the
+   * looked-up node. (Unlike `<auth0-logout>`, `<auth0-session>` always
+   * requires an explicit `target` ID, so there is no `closest()` /
+   * `querySelector` fallback path.)
+   */
   private _resolveAuth(): Auth | null {
     if (!this.target) return null;
     const el = document.getElementById(this.target);
     if (el && el.tagName.toLowerCase() === config.tagNames.auth) {
-      return el as unknown as Auth;
+      // A node that carries the right tag name but has not yet
+      // upgraded (script still loading, custom element registry
+      // race) has no `connect` / `logout` methods; calling
+      // `.connect(...)` would throw a TypeError during connect().
+      // Mirror `<auth0-logout>`'s guard — return null when the
+      // element has not yet upgraded so the caller hits the friendly
+      // "target not found" error path instead of crashing.
+      return _isAuth(el) ? (el as unknown as Auth) : null;
     }
     return null;
   }
@@ -529,3 +600,13 @@ export class AuthSession extends HTMLElement {
   }
 }
 
+/**
+ * Duck-type guard: treat an element as an upgraded `<auth0-gate>`
+ * only once its `connect` method is a callable function. Mirrors the
+ * helper in `AuthLogout` — keeps a freshly-parsed-but-not-yet-
+ * upgraded custom element from being passed to `_connect()`, which
+ * would crash on the missing method.
+ */
+function _isAuth(el: Element): boolean {
+  return typeof (el as unknown as { connect?: unknown }).connect === "function";
+}

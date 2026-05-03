@@ -2019,6 +2019,117 @@ describe("AuthShell", () => {
     });
   });
 
+  // Defense-in-depth filter: AuthShell wraps AuthCore in a private
+  // relay so that `auth0-gate:token-changed` events from AuthCore
+  // are dropped before reaching the outer dispatch target whenever
+  // the shell is in remote mode. The token must NEVER be observable
+  // from imperative DOM listeners on `<auth0-gate>` in remote mode —
+  // that's the same contract `AuthShell.wcBindable` enforces by
+  // omitting `token` from the declarative surface.
+  //
+  // These regression tests lock the filter in. The constructor
+  // accepts an explicit `target` EventTarget (mirroring how `Auth`
+  // passes `this` so the outer DOM element receives the events) and
+  // we listen on that outer target.
+  describe("token-changed relay filter (cycle-3 fix #5 regression)", () => {
+    it("drops auth0-gate:token-changed on the outer target in remote mode", async () => {
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently: vi.fn().mockResolvedValue("remote-token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const outer = new EventTarget();
+      const tokenEvents: Array<string | null> = [];
+      outer.addEventListener("auth0-gate:token-changed", (e: Event) => {
+        tokenEvents.push((e as CustomEvent).detail);
+      });
+
+      const shell = new AuthShell(outer);
+      await shell.initialize({
+        domain: "d", clientId: "c", audience: "a",
+        mode: "remote",
+      });
+      // initialize() in remote mode triggers `_setToken("remote-token")`
+      // inside AuthCore via `_syncState`, exercising the relay.
+
+      // Drive a further commit to cover the explicit `commitToken` path
+      // too (which connect() / refreshToken() use in production).
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (shell as any)._core.commitToken("explicit-remote-token");
+
+      // No token-changed event must escape to the outer target while
+      // in remote mode — the relay drops them so DOM observers on
+      // <auth0-gate> never see token material.
+      expect(tokenEvents).toEqual([]);
+
+      // Sanity: AuthShell's `.token` getter is also `null` in remote
+      // mode (the wcBindable + getter contract; orthogonal to the relay
+      // but co-validated here so a regression in either fails loudly).
+      expect(shell.token).toBeNull();
+    });
+
+    it("forwards auth0-gate:token-changed to the outer target in local mode", async () => {
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently: vi.fn().mockResolvedValue("local-token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const outer = new EventTarget();
+      const tokenEvents: Array<string | null> = [];
+      outer.addEventListener("auth0-gate:token-changed", (e: Event) => {
+        tokenEvents.push((e as CustomEvent).detail);
+      });
+
+      const shell = new AuthShell(outer);
+      await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+      // mode defaults to "local"; `_setToken("local-token")` runs inside
+      // _syncState and the relay forwards it to `outer`.
+
+      expect(tokenEvents).toContain("local-token");
+      // Local mode keeps the existing event-with-token contract intact.
+      expect(shell.token).toBe("local-token");
+    });
+
+    it("drops the token-changed event when mode flips local->remote between commits", async () => {
+      // The filter reads `this._mode` at relay-time, not at relay
+      // construction. A late switch to remote mode (mirrored from the
+      // <auth0-gate mode> attribute via Auth.attributeChangedCallback)
+      // must take effect for subsequent token commits — otherwise an
+      // app that flips into remote mode mid-session would still leak
+      // the token through DOM listeners until the next page reload.
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently: vi.fn().mockResolvedValue("local-token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const outer = new EventTarget();
+      const tokenEvents: Array<string | null> = [];
+      outer.addEventListener("auth0-gate:token-changed", (e: Event) => {
+        tokenEvents.push((e as CustomEvent).detail);
+      });
+
+      const shell = new AuthShell(outer);
+      await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+      // Local mode commit reaches outer.
+      expect(tokenEvents).toEqual(["local-token"]);
+
+      // Flip the shell into remote mode (same path Auth's attribute
+      // mirror takes) and commit a new token.
+      shell.mode = "remote";
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (shell as any)._core.commitToken("post-flip-token");
+
+      // The post-flip commit must NOT have escaped to the outer target.
+      expect(tokenEvents).toEqual(["local-token"]);
+    });
+  });
+
   describe("transport passthrough helpers", () => {
     it("forwards onClose to the underlying transport", async () => {
       const mockClient = createMockAuth0Client({

@@ -1,4 +1,5 @@
 import { PROTOCOL_PREFIX } from "../protocolPrefix.js";
+import { ERROR_PREFIX } from "../raiseError.js";
 
 /**
  * Extract a JWT from the `Sec-WebSocket-Protocol` header.
@@ -13,7 +14,7 @@ export function extractTokenFromProtocol(
   protocolHeader: string | string[] | undefined,
 ): string {
   if (!protocolHeader) {
-    throw new Error("[@csbc-dev/auth0] Missing Sec-WebSocket-Protocol header.");
+    throw new Error(`${ERROR_PREFIX} Missing Sec-WebSocket-Protocol header.`);
   }
 
   // The declared input type is `string | string[] | undefined`, but
@@ -28,7 +29,7 @@ export function extractTokenFromProtocol(
   // the error surface uniform with the other "malformed header" paths.
   if (typeof protocolHeader !== "string" && !Array.isArray(protocolHeader)) {
     throw new Error(
-      "[@csbc-dev/auth0] Sec-WebSocket-Protocol header must be a string or string[]; got " +
+      `${ERROR_PREFIX} Sec-WebSocket-Protocol header must be a string or string[]; got ` +
         (protocolHeader === null ? "null" : typeof protocolHeader) +
         ".",
     );
@@ -52,13 +53,13 @@ export function extractTokenFromProtocol(
     if (proto.startsWith(PROTOCOL_PREFIX)) {
       const token = proto.slice(PROTOCOL_PREFIX.length);
       if (!token) {
-        throw new Error("[@csbc-dev/auth0] Empty token in Sec-WebSocket-Protocol.");
+        throw new Error(`${ERROR_PREFIX} Empty token in Sec-WebSocket-Protocol.`);
       }
       return token;
     }
   }
 
   throw new Error(
-    `[@csbc-dev/auth0] No ${PROTOCOL_PREFIX}* entry in Sec-WebSocket-Protocol.`,
+    `${ERROR_PREFIX} No ${PROTOCOL_PREFIX}* entry in Sec-WebSocket-Protocol.`,
   );
 }

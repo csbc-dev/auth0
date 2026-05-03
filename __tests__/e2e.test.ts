@@ -49,7 +49,7 @@ vi.mock("jose", async () => {
 import { createAuthenticatedWSS } from "../src/server/createAuthenticatedWSS";
 import { PROTOCOL_PREFIX } from "../src/protocolPrefix";
 import { AuthCore } from "../src/core/AuthCore";
-import { _clearJwksCache } from "../src/server/verifyAuth0Token";
+import { verifyAuth0Token, _clearJwksCache } from "../src/server/verifyAuth0Token";
 
 // --- key + JWT helpers ---------------------------------------------------
 
@@ -387,6 +387,65 @@ describe("e2e: real JWT + JWKS + Sec-WebSocket-Protocol + refresh", () => {
       expect(events.some(e => e.type === "auth:refresh-failure")).toBe(true);
     } finally {
       await server.close();
+    }
+  });
+
+  it("rejects an HS256-signed token even when the JWKS exposes an RS256 key with the same kid", async () => {
+    // Defense-in-depth against alg-confusion: the verifier pins
+    // `algorithms: ["RS256"]`, and `verifyAuth0Token.test.ts` already
+    // asserts that allowlist is forwarded through the (mocked) `jose`
+    // call. This test exercises the same gate against the REAL
+    // `jose.jwtVerify` — it signs a structurally valid JWT with the
+    // HS256 algorithm and the same `kid` as the published RS256 key,
+    // then routes it through `verifyAuth0Token`. The RS256 allowlist
+    // must reject regardless of how cleverly the header is forged.
+    const hs256Domain = `hs256-${Date.now()}.test.invalid`;
+    const hs256Issuer = `https://${hs256Domain}/`;
+    const hs256Audience = "https://api.hs256.example.com";
+
+    // Use a fresh resolver scoped to this test only — the hs256Domain
+    // is unique, so the module-level JWKS cache stores it under its
+    // own key and other tests in this file are unaffected. We still
+    // restore `activeJwksResolver` at the end as a paranoia measure
+    // in case the mock's thunk binding outlives the cache entry.
+    const previousResolver = activeJwksResolver;
+    try {
+      const rs256Material = await newKeyMaterial("kid-rs256");
+      activeJwksResolver = createLocalJWKSet({
+        keys: [rs256Material.publicJwk],
+      });
+
+      // Forge an HS256 token. We use a raw `Uint8Array` secret so
+      // jose's `SignJWT` happily emits an `alg: HS256` header. The
+      // `kid` matches the RS256 key in the JWKS so a naïve resolver
+      // would still find a key — only the algorithm allowlist closes
+      // the door.
+      const hs256Secret = new TextEncoder().encode(
+        "this-secret-must-not-let-the-token-through",
+      );
+      const hs256Token = await new SignJWT({ permissions: [] })
+        .setProtectedHeader({ alg: "HS256", kid: rs256Material.kid })
+        .setIssuer(hs256Issuer)
+        .setAudience(hs256Audience)
+        .setIssuedAt()
+        .setSubject("auth0|hs256-attacker")
+        .setExpirationTime("1h")
+        .sign(hs256Secret);
+
+      // Real `jose.jwtVerify` runs through `verifyAuth0Token`. The pin
+      // (`algorithms: ["RS256"]`) rejects regardless of whether the
+      // resolved key happens to share the forged token's `kid`. Match
+      // the rejection message specifically against the algorithm gate
+      // so an unrelated future failure (expiry, kid mismatch, etc.)
+      // doesn't silently keep this test green.
+      await expect(
+        verifyAuth0Token(hs256Token, {
+          domain: hs256Domain,
+          audience: hs256Audience,
+        }),
+      ).rejects.toThrow(/alg|algorithm/i);
+    } finally {
+      activeJwksResolver = previousResolver;
     }
   });
 });

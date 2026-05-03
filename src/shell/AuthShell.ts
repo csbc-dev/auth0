@@ -1,12 +1,23 @@
 import { WebSocketClientTransport } from "@wc-bindable/remote";
 import type { ClientTransport, ClientMessage, ServerMessage } from "@wc-bindable/remote";
 import { AuthCore } from "../core/AuthCore.js";
-import { raiseError, raiseOwnershipError } from "../raiseError.js";
+import { raiseError, raiseOwnershipError, ERROR_PREFIX } from "../raiseError.js";
 import { IWcBindable, AuthMode, AuthShellOptions, AuthError, AuthUser } from "../types.js";
 import { PROTOCOL_PREFIX } from "../protocolPrefix.js";
 
 let _nextRefreshId = 1;
 type RefreshResponseMessage = Extract<ServerMessage, { type: "return" | "throw" }>;
+
+/**
+ * Default OAuth scope requested when none is supplied.
+ *
+ * Centralised so `AuthShell.initialize()` and `<auth0-gate>.scope`'s
+ * attribute getter cannot drift out of sync. `openid profile email`
+ * is the conventional Auth0 default — `openid` is required for any
+ * OIDC flow, `profile` / `email` populate `AuthUser.name` / `email`
+ * which the `auth0-gate:user-changed` consumers depend on.
+ */
+export const DEFAULT_SCOPE = "openid profile email";
 
 /**
  * Remote-capable authentication shell.
@@ -59,6 +70,16 @@ export class AuthShell extends EventTarget {
   // the race across `Auth.connect()`'s `await connectedCallbackPromise`
   // microtask — observe an existing handshake synchronously.
   private _connectInFlight: boolean = false;
+  // Monotonic generation counter incremented on every `disconnect()` /
+  // `logout()`. Each `connect()` / `reconnect()` captures the current
+  // value at entry and re-checks it after every `await`; if the
+  // counter has moved forward by the time the handshake resolves, the
+  // freshly-opened socket is closed and the call rejects so a pending
+  // connect cannot resolve to `connected=true` AFTER the user already
+  // logged out (with the token already invalidated). Without this,
+  // `disconnect()` / `logout()` would tear down the transport but a
+  // racing `connect()` could re-set `connected=true` one microtask later.
+  private _connectGeneration: number = 0;
 
   constructor(target?: EventTarget) {
     super();
@@ -68,8 +89,57 @@ export class AuthShell extends EventTarget {
     // dispatch — if we dispatched on `this` instead, the event would
     // land on the AuthShell and never reach the outer Auth element that
     // AuthSession (and any application listener) registered against.
-    this._target = target ?? this;
-    this._core = new AuthCore(this._target);
+    const outer = target ?? this;
+    this._target = outer;
+
+    // Build a private relay EventTarget that AuthCore dispatches into,
+    // and re-fire each `auth0-gate:*` event onto `outer` — EXCEPT
+    // `auth0-gate:token-changed` while in remote mode.
+    //
+    // Why this filter exists:
+    //   `AuthShell.wcBindable` deliberately excludes `token` so the
+    //   declarative binding surface (`data-wcs="..."`) cannot subscribe
+    //   to it in remote mode. But the underlying `auth0-gate:token-changed`
+    //   CustomEvent — dispatched by AuthCore via `_target.dispatchEvent`
+    //   — was previously firing directly on the Auth element with the
+    //   bearer in `event.detail`. Any application code listening
+    //   imperatively (`authEl.addEventListener("auth0-gate:token-changed",
+    //   ...)`) or any third-party DOM observer would receive the token
+    //   on every commit, defeating the remote-mode "token never reachable
+    //   from JS" contract (see CLAUDE.md §3 — Token visibility).
+    //
+    //   The relay routes AuthCore's events through us; for token-changed
+    //   in remote mode we DROP the re-dispatch entirely, so DOM
+    //   listeners on the Auth element observe nothing. Local-mode
+    //   token-changed still fires on `outer` so existing local-mode
+    //   subscribers are unaffected.
+    //
+    //   AuthCore itself remains a discoverable EventTarget for
+    //   in-process consumers (unit tests, advanced direct-Core
+    //   embedders) that listen on the AuthCore instance — the wcBindable
+    //   "token in AuthCore is intentional, scope-limited" carve-out in
+    //   AuthCore.ts is preserved.
+    const relay = new EventTarget();
+    const FORWARDED_EVENT_NAMES = [
+      "auth0-gate:authenticated-changed",
+      "auth0-gate:user-changed",
+      "auth0-gate:loading-changed",
+      "auth0-gate:error",
+      "auth0-gate:token-changed",
+    ] as const;
+    for (const name of FORWARDED_EVENT_NAMES) {
+      relay.addEventListener(name, (e) => {
+        if (name === "auth0-gate:token-changed" && this._mode === "remote") {
+          return;
+        }
+        const ce = e as CustomEvent;
+        outer.dispatchEvent(new CustomEvent(name, {
+          detail: ce.detail,
+          bubbles: true,
+        }));
+      });
+    }
+    this._core = new AuthCore(relay);
   }
 
   // --- Delegated getters ---------------------------------------------------
@@ -114,7 +184,35 @@ export class AuthShell extends EventTarget {
   }
 
   set mode(value: AuthMode) {
+    // No synchronous audience validation here: the `<auth0-gate>`
+    // element pattern mirrors `mode` from its attribute during the
+    // element lifecycle (connectedCallback / attributeChangedCallback)
+    // BEFORE `initialize()` plumbs `_audience` into the shell. A
+    // strict setter-level validation would therefore reject every
+    // legal `<auth0-gate mode="remote" audience="...">` mount and
+    // every `attributeChangedCallback` mirror that runs against a
+    // shell whose audience has not yet been initialised.
+    //
+    // Audience enforcement happens at `connect()` / `reconnect()` —
+    // the only places the missing-audience misconfiguration is
+    // actually observable on the wire (server's verifyAuth0Token
+    // rejects on `aud` mismatch and closes with 1008). Catching it
+    // there keeps the precondition next to the wire interaction.
+    //
+    // On an actual mode change, bump `_connectGeneration` so any
+    // in-flight `connect()` / `reconnect()` started under the old
+    // mode sees the mismatch on its next `await` boundary and bails
+    // — without this, a mid-flight handshake from before the flip
+    // could resolve and commit `connected=true` for a session whose
+    // mode (and therefore the remote-vs-local token contract) has
+    // since changed under it. The attribute mirror in
+    // `Auth.attributeChangedCallback` writes the same value
+    // repeatedly, so guard on actual change to avoid bumping the
+    // generation on no-op writes (which would tear down legitimate
+    // in-flight handshakes started by the same attribute landing).
+    if (this._mode === value) return;
     this._mode = value;
+    this._connectGeneration++;
   }
 
   /**
@@ -173,7 +271,7 @@ export class AuthShell extends EventTarget {
     this._audience = options.audience || undefined;
 
     const authorizationParams: Record<string, any> = {
-      scope: options.scope ?? "openid profile email",
+      scope: options.scope ?? DEFAULT_SCOPE,
     };
     if (options.redirectUri) {
       authorizationParams.redirect_uri = options.redirectUri;
@@ -217,6 +315,15 @@ export class AuthShell extends EventTarget {
     // explicit `_setConnected(false)` here publishes the transition
     // synchronously; the inner equality guard prevents a duplicate
     // event if the socket's close handler beat us to it.
+    //
+    // Bump the connect generation so any pending `connect()` /
+    // `reconnect()` whose handshake has already opened (or is awaiting
+    // open) cannot resume past its post-await guard and re-set
+    // `connected=true` after we've torn down the session. The token has
+    // been invalidated by Auth0; resolving the racing connect would
+    // leave the application advertising `connected` against a server
+    // that no longer honours the bearer.
+    this._connectGeneration++;
     this._closeWebSocket();
     this._setConnected(false);
     return this._core.logout(options);
@@ -235,6 +342,14 @@ export class AuthShell extends EventTarget {
    * Idempotent when no connection is open.
    */
   disconnect(): void {
+    // Bump the connect generation so a pending `connect()` /
+    // `reconnect()` whose `await new Promise(open|error)` is still
+    // pending (or has just resolved) sees the mismatch and bails
+    // before flipping `connected=true`. Without this bump, a
+    // disconnect that lands between the WebSocket `open` event and
+    // the connect()'s `_setConnected(true)` would still see the
+    // racing connect publish `connected=true` post-disconnect.
+    this._connectGeneration++;
     this._closeWebSocket();
     this._setConnected(false);
   }
@@ -312,6 +427,12 @@ export class AuthShell extends EventTarget {
       );
     }
     this._connectInFlight = true;
+    // Capture the generation BEFORE the first await so a concurrent
+    // `disconnect()` / `logout()` that bumps the counter while we're
+    // mid-handshake is observable on resume. Re-checked after the
+    // open/error promise — if it's stale, we close the just-opened
+    // socket and reject without ever flipping `connected=true`.
+    const myGeneration = this._connectGeneration;
 
     try {
       // Fetch-then-commit: same invariant as refreshToken / reconnect.
@@ -322,6 +443,13 @@ export class AuthShell extends EventTarget {
       const token = await this._core.fetchToken();
       if (!token) {
         raiseError("Failed to obtain access token.");
+      }
+      // A `disconnect()` / `logout()` that landed during fetchToken()
+      // means the token we just obtained is destined for a session the
+      // caller has already torn down. Bail before opening a socket so
+      // we don't even hand a token to the wire post-logout.
+      if (this._connectGeneration !== myGeneration) {
+        raiseError("connect(): superseded by disconnect()/logout() during token fetch.");
       }
 
       // Capture the last server-accepted token BEFORE we close the
@@ -340,6 +468,13 @@ export class AuthShell extends EventTarget {
       // strict rollback ordering must opt into `failIfConnected: true`,
       // which short-circuits the race at the ownership guard.
       const priorToken = this._core.token;
+      // Capture the previous URL so a handshake failure can roll
+      // `_url` back: writing it BEFORE the open event would leave a
+      // bad URL cached for a subsequent `reconnect()`, which uses
+      // `_url` verbatim. The mid-call write is required so the
+      // close-handler / debugging surface sees the URL we are
+      // attempting; restoring it on failure is the symmetrical step.
+      const priorUrl = this._url;
 
       this._closeWebSocket();
 
@@ -347,36 +482,12 @@ export class AuthShell extends EventTarget {
       const ws = new WebSocket(url, [`${PROTOCOL_PREFIX}${token}`]);
       this._ws = ws;
 
-      ws.addEventListener("close", (event: CloseEvent) => {
-        if (this._ws === ws) {
-          // Null the reference so `_ws` reflects "live connection", not
-          // "last connection that ever existed". Otherwise the
-          // `failIfConnected` ownership guard (`_ws !== null`) would
-          // keep rejecting subsequent reconnects by <auth0-session>
-          // after any server-side close (network blip, token expiry,
-          // server restart), stranding the session in an unrecoverable
-          // state. `_ws === ws` guards against stomping on a newer
-          // socket that already replaced this one.
-          this._ws = null;
-          this._setConnected(false);
-          if (event?.code === 1008 && this._core.token !== priorToken) {
-            // Close code 1008 (Policy Violation) is the exact signal
-            // `createAuthenticatedWSS` emits when Auth0 verification
-            // fails or origin is rejected — both strictly pre-accept
-            // paths (`socket.close(1008, "Unauthorized" | "Forbidden
-            // origin")`). Post-accept close paths use 4401 / 4403 / 1000
-            // / 1006, so gating rollback on 1008 restores `_token` ONLY
-            // for tokens the server provably never accepted. An
-            // idle-but-accepted session closing later — network loss,
-            // server restart, intentional disconnect before any client
-            // traffic — keeps the committed token, because a "first
-            // inbound frame" proxy signal would spuriously roll back
-            // those valid sessions (no frame is guaranteed before
-            // `RemoteCoreProxy` sends `{type:"sync"}`).
-            this._core.commitToken(priorToken);
-          }
-        }
-      });
+      // Pass the about-to-be-committed `token` as `committedToken` so
+      // the close handler skips its rollback when a later
+      // `refreshToken()` has overwritten `_core.token` with a fresher
+      // value — the rollback fires only when `_core.token` is still
+      // exactly what THIS handshake committed.
+      this._installCloseHandler(ws, priorToken, token);
 
       // Wait for the connection to open before returning the transport.
       // If the handshake fails we MUST drop `connected` back to false:
@@ -389,17 +500,62 @@ export class AuthShell extends EventTarget {
       // not linger as a dangling reference to a dead socket between calls.
       try {
         await new Promise<void>((resolve, reject) => {
-          ws.addEventListener("open", () => resolve(), { once: true });
-          ws.addEventListener("error", () => {
-            reject(new Error(`[@csbc-dev/auth0] WebSocket connection failed: ${url}`));
-          }, { once: true });
+          // Cross-remove handlers when the race resolves so the loser's
+          // closure (and the captured `reject` / `resolve`) is released
+          // immediately. `{ once: true }` fires only when the matching
+          // event actually arrives — the unfired listener stays
+          // attached for the lifetime of the socket otherwise, holding
+          // this Promise's `reject` reachable and producing a slow leak
+          // in a long-lived authenticated app that opens / closes
+          // sockets across reconnects.
+          const onOpen = (): void => {
+            ws.removeEventListener("error", onError);
+            resolve();
+          };
+          const onError = (): void => {
+            ws.removeEventListener("open", onOpen);
+            reject(new Error(`${ERROR_PREFIX} WebSocket connection failed: ${url}`));
+          };
+          ws.addEventListener("open", onOpen, { once: true });
+          ws.addEventListener("error", onError, { once: true });
         });
       } catch (err) {
         if (this._ws === ws) {
           this._ws = null;
         }
+        // Roll `_url` back so a subsequent `reconnect()` does not
+        // reuse the failed URL — `reconnect()` reads `_url` verbatim
+        // and would otherwise repeat the same DNS / TLS / handshake
+        // failure mode against a URL the caller may have already
+        // identified as bad.
+        this._url = priorUrl;
         this._setConnected(false);
         throw err;
+      }
+
+      // A `disconnect()` / `logout()` that fired between the WebSocket
+      // `open` and this resume point invalidates the session we were
+      // building. Close the freshly-opened socket synchronously and
+      // reject so `connected` cannot be flipped to `true` AFTER the
+      // caller already tore down — the token is by now invalidated
+      // (logout case) or the caller no longer wants the connection
+      // (disconnect case). Without this guard, the caller's
+      // `await connect()` would resolve to a transport tied to a
+      // server-side session that the logout has just dropped.
+      if (this._connectGeneration !== myGeneration) {
+        if (this._ws === ws) {
+          this._ws = null;
+        }
+        try {
+          ws.close(1000, "Superseded by disconnect/logout");
+        } catch {
+          // see _closeWebSocket() — alternative runtimes may throw
+        }
+        // Same `_url` rollback rationale as the handshake-failure
+        // path above — a superseded connect should not poison
+        // `reconnect()` with the to-be-discarded URL.
+        this._url = priorUrl;
+        raiseError("connect(): superseded by disconnect()/logout() during handshake.");
       }
 
       // 101 handshake completed — commit provisionally. Auth0 token
@@ -448,7 +604,12 @@ export class AuthShell extends EventTarget {
       raiseError("Failed to refresh access token.");
     }
 
-    const id = `auth-refresh-${_nextRefreshId++}`;
+    // Use a package-namespaced prefix so a generated refresh id cannot
+    // collide with a `RemoteShellProxy`-issued command id (its scheme
+    // is integer-based and bare). The `__auth0-gate.refresh.` prefix is
+    // long and dotted enough that no realistic id-generation strategy
+    // in the wc-bindable/remote ecosystem will produce a duplicate.
+    const id = `__auth0-gate.refresh.${_nextRefreshId++}`;
     const ws = this._ws;
     const transport = this._transport;
     // The `raiseError(...): never` return type lets TypeScript narrow
@@ -565,6 +726,10 @@ export class AuthShell extends EventTarget {
       );
     }
     this._connectInFlight = true;
+    // See connect(): capture the generation BEFORE the first await
+    // so a concurrent `disconnect()` / `logout()` that bumps the
+    // counter while we're mid-handshake is observable on resume.
+    const myGeneration = this._connectGeneration;
 
     try {
       // Fetch-then-commit: the new token is published to AuthCore only
@@ -574,6 +739,9 @@ export class AuthShell extends EventTarget {
       const token = await this._core.fetchFreshToken();
       if (!token) {
         raiseError("Failed to refresh access token.");
+      }
+      if (this._connectGeneration !== myGeneration) {
+        raiseError("reconnect(): superseded by disconnect()/logout() during token fetch.");
       }
 
       // See connect(): capture the last server-accepted token so we can
@@ -586,23 +754,10 @@ export class AuthShell extends EventTarget {
       const ws = new WebSocket(this._url, [`${PROTOCOL_PREFIX}${token}`]);
       this._ws = ws;
 
-      ws.addEventListener("close", (event: CloseEvent) => {
-        if (this._ws === ws) {
-          // Mirror connect(): null the stale reference so subsequent
-          // `failIfConnected: true` calls are not rejected against a
-          // dead socket. See connect()'s close handler for rationale.
-          this._ws = null;
-          this._setConnected(false);
-          if (event?.code === 1008 && this._core.token !== priorToken) {
-            // Mirror connect(): rollback only on the server's explicit
-            // pre-accept rejection signal (close code 1008). Any other
-            // code (4401 expired, 4403 sub mismatch, 1000 normal, 1006
-            // abnormal) means the session was accepted at some point,
-            // so advancing `_token` was correct and must stand.
-            this._core.commitToken(priorToken);
-          }
-        }
-      });
+      // See connect(): pass the about-to-be-committed `token` so the
+      // close handler skips its rollback when a later `refreshToken()`
+      // has overwritten `_core.token` with a fresher value.
+      this._installCloseHandler(ws, priorToken, token);
 
       // See connect(): the previous socket's close handler is now a no-op,
       // so a handshake failure here would leave `connected` stuck at true
@@ -611,10 +766,21 @@ export class AuthShell extends EventTarget {
       // reference to a dead socket between calls.
       try {
         await new Promise<void>((resolve, reject) => {
-          ws.addEventListener("open", () => resolve(), { once: true });
-          ws.addEventListener("error", () => {
-            reject(new Error(`[@csbc-dev/auth0] WebSocket reconnection failed: ${this._url}`));
-          }, { once: true });
+          // Mirror connect(): cross-remove the loser of the open/error
+          // race so its closure does not stay reachable through the
+          // socket's listener list for the whole lifetime of the
+          // connection. See connect()'s open/error promise for the
+          // detailed rationale.
+          const onOpen = (): void => {
+            ws.removeEventListener("error", onError);
+            resolve();
+          };
+          const onError = (): void => {
+            ws.removeEventListener("open", onOpen);
+            reject(new Error(`${ERROR_PREFIX} WebSocket reconnection failed: ${this._url}`));
+          };
+          ws.addEventListener("open", onOpen, { once: true });
+          ws.addEventListener("error", onError, { once: true });
         });
       } catch (err) {
         if (this._ws === ws) {
@@ -622,6 +788,23 @@ export class AuthShell extends EventTarget {
         }
         this._setConnected(false);
         throw err;
+      }
+
+      // See connect(): a `disconnect()` / `logout()` that fired
+      // between WebSocket `open` and this resume point invalidates the
+      // session we just opened. Close the freshly-opened socket
+      // synchronously and reject so `connected` cannot be flipped to
+      // `true` AFTER teardown.
+      if (this._connectGeneration !== myGeneration) {
+        if (this._ws === ws) {
+          this._ws = null;
+        }
+        try {
+          ws.close(1000, "Superseded by disconnect/logout");
+        } catch {
+          // see _closeWebSocket() — alternative runtimes may throw
+        }
+        raiseError("reconnect(): superseded by disconnect()/logout() during handshake.");
       }
 
       // 101 handshake completed — commit provisionally. See connect():
@@ -639,6 +822,59 @@ export class AuthShell extends EventTarget {
   }
 
   // --- Private helpers ------------------------------------------------------
+
+  /**
+   * Install the shared close handler used by both `connect()` and
+   * `reconnect()`. Both paths need identical behaviour on close:
+   *
+   *   1. Null `_ws` only when this socket is still the live one — a
+   *      newer socket installed by a re-entrant connect/reconnect
+   *      must not be stomped (`_ws === ws` guard).
+   *   2. Publish `connected=false` synchronously so the
+   *      `failIfConnected: true` ownership guard (`_ws !== null ||
+   *      _connected`) cannot reject subsequent reconnects against a
+   *      dead socket.
+   *   3. Roll `_token` back to the last server-accepted value ONLY
+   *      on close code 1008 — `createAuthenticatedWSS` emits 1008
+   *      strictly on the pre-accept paths (`socket.close(1008,
+   *      "Unauthorized" | "Forbidden origin")`). Post-accept closes
+   *      (4401 expired, 4403 sub mismatch, 1000 normal, 1006
+   *      abnormal) leave the committed token in place, because the
+   *      session WAS accepted at some point and a "first inbound
+   *      frame" rollback signal would spuriously roll back valid
+   *      sessions that simply never sent a frame.
+   *
+   * Extracting the handler keeps the two construction paths in lock
+   * step — drift between them would silently bias one path's
+   * rollback semantics relative to the other.
+   *
+   * `committedToken` — the token THIS handshake just committed —
+   * is passed alongside `priorToken` so the rollback can be skipped
+   * when a subsequent `refreshToken()` has overwritten `_core.token`
+   * with a fresher value: rolling back to `priorToken` in that case
+   * would clobber the fresh refresh with a stale connect-time
+   * snapshot. The reference server only emits 1008 pre-accept per
+   * SPEC-REMOTE, so the post-accept-then-1008 path is only reachable
+   * against a non-conformant server, but the guard is cheap.
+   */
+  private _installCloseHandler(
+    ws: WebSocket,
+    priorToken: string | null,
+    committedToken: string | null,
+  ): void {
+    ws.addEventListener("close", (event: CloseEvent) => {
+      if (this._ws !== ws) return;
+      this._ws = null;
+      this._setConnected(false);
+      if (
+        event?.code === 1008 &&
+        this._core.token === committedToken &&
+        this._core.token !== priorToken
+      ) {
+        this._core.commitToken(priorToken);
+      }
+    });
+  }
 
   private _setConnected(value: boolean): void {
     if (this._connected === value) return;

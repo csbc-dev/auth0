@@ -118,6 +118,40 @@ export function setConfig(partialConfig: IWritableConfig): void {
           "customElements.define('') would reject it with SyntaxError.",
         );
       }
+      // Validate against the basic HTML custom-element shape: a name
+      // must start with an ASCII lower-case letter, be lower-case
+      // throughout, and contain at least one ASCII hyphen with at
+      // least one character on either side
+      // (https://html.spec.whatwg.org/#valid-custom-element-name).
+      // Without this, a typo like `tagNames.auth = "Auth0Gate"` only
+      // surfaces inside `customElements.define`, which throws
+      // `SyntaxError: The provided name is not a valid custom element
+      // name` from `registerComponents()` — far from the offending
+      // setConfig call. Catching it here keeps the diagnostic next to
+      // the configuration mistake.
+      //
+      // The regex approximates the spec rather than implementing the
+      // full PCEN (Potentially-Custom-Element-Name) production: it
+      // covers `[a-z][a-z0-9]*(-[a-z0-9]+)+` which is the shape every
+      // realistic deployment uses (`my-component`, `auth0-gate`,
+      // `data-table-row`). Names containing emoji / extended Unicode
+      // are technically PCEN-valid but vanishingly rare here, and the
+      // simpler regex keeps the failure message actionable. A
+      // mismatch falls through to `customElements.define`'s native
+      // error in that edge case — same behaviour as before this
+      // guard, just with the common 95% caught earlier.
+      // Tag-name comparisons in `AuthLogout._findAuth` /
+      // `AuthSession._resolveAuth` / `autoTrigger.handleClick` use
+      // `tagName.toLowerCase() === config.tagNames.<…>`; enforcing
+      // lower-case here at the configuration boundary keeps that
+      // comparison correct without sprinkling defensive
+      // `.toLowerCase()` calls across every consumer.
+      if (!/^[a-z][a-z0-9]*(?:-[a-z0-9]+)+$/.test(value)) {
+        raiseError(
+          `setConfig(): \`tagNames.${key}\` must be a valid lower-case custom element name ` +
+          `(start with a letter, contain at least one hyphen, lower-case ASCII only); got "${value}".`,
+        );
+      }
       _config.tagNames[key] = value;
     }
   }

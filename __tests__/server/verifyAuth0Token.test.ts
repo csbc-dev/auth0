@@ -173,4 +173,26 @@ describe("verifyAuth0Token", () => {
 
     expect(result.roles).toEqual(["admin"]);
   });
+
+  it("pins jwtVerify to algorithms: ['RS256']", async () => {
+    // Defense-in-depth against JWK-confusion. Auth0 access tokens are
+    // RS256-signed under the SPA / API flows this package targets;
+    // jose's default is "any algorithm the resolved key supports",
+    // which leaves the door open to alg-mismatch attacks if a
+    // tampered JWKS or an exotic future tenant config exposes a key
+    // supporting multiple algs. The verifier must opt into a strict
+    // allowlist and pass it through to jwtVerify on every call.
+    jwtVerify.mockResolvedValue({
+      payload: { sub: "auth0|alg-test", permissions: [] },
+    });
+
+    await verifyAuth0Token("alg-token", {
+      domain: `algs-${Date.now()}.auth0.com`,
+      audience: "aud",
+    });
+
+    expect(jwtVerify).toHaveBeenCalled();
+    const optionsArg = jwtVerify.mock.calls[0][2];
+    expect(optionsArg).toMatchObject({ algorithms: ["RS256"] });
+  });
 });
