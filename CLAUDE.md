@@ -1,22 +1,22 @@
 # CLAUDE.md
 
-このリポジトリ (`@csbc-dev/auth0`) は [`@wc-bindable/auth0`](https://github.com/wc-bindable-protocol/wc-bindable-protocol/tree/main/packages/auth0) を起点として、csbc-dev/arch のアーキテクチャ群の一員として再パッケージしたものです。設計思想を理解するうえで前提となる 2 つのドキュメントを以下にまとめます。
+This repository (`@csbc-dev/auth0`) is a re-packaged member of the csbc-dev/arch architecture lineup, originating from [`@wc-bindable/auth0`](https://github.com/wc-bindable-protocol/wc-bindable-protocol/tree/main/packages/auth0). The two foundational documents below provide the design context required to understand the package.
 
 ---
 
-## 1. wc-bindable-protocol の概要
+## 1. wc-bindable-protocol overview
 
-`EventTarget` を継承する任意のクラスが、自身のリアクティブなプロパティを宣言するためのフレームワーク非依存・最小プロトコル。React / Vue / Svelte / Angular / Solid などのリアクティビティシステムが、フレームワーク固有のグルーコードを書かずに任意のコンポーネントに束縛できるようにする。
+A framework-agnostic, minimal protocol that lets any class extending `EventTarget` declare its own reactive properties. It enables reactivity systems in React / Vue / Svelte / Angular / Solid (and others) to bind to arbitrary components without writing framework-specific glue code.
 
-### コアアイデア
+### Core idea
 
-- コンポーネント作者は **何が** バインド可能かを宣言する
-- フレームワーク利用側は **どう** バインドするかを決める
-- 双方は互いを知らなくてよい
+- Component authors declare **what** is bindable
+- Framework consumers decide **how** to bind it
+- Neither side needs to know the other
 
-### 宣言の仕方
+### How to declare
 
-`static wcBindable` フィールドにスキーマを書くだけ。
+Just write a schema in the `static wcBindable` field.
 
 ```javascript
 class MyFetchCore extends EventTarget {
@@ -27,99 +27,187 @@ class MyFetchCore extends EventTarget {
       { name: "value",   event: "my-fetch:value-changed" },
       { name: "loading", event: "my-fetch:loading-changed" },
     ],
-    inputs:   [{ name: "url" }, { name: "method" }],   // 任意
-    commands: [{ name: "fetch", async: true }, { name: "abort" }],  // 任意
+    inputs:   [{ name: "url" }, { name: "method" }],   // optional
+    commands: [{ name: "fetch", async: true }, { name: "abort" }],  // optional
   };
 }
 ```
 
-| フィールド | 必須 | 役割 |
+| Field | Required | Purpose |
 |---|---|---|
-| `properties` | ✅ | 状態変化を `CustomEvent` で通知するプロパティ群（出力） |
-| `inputs` | — | 設定可能なプロパティ（入力。宣言のみで自動同期はしない） |
-| `commands` | — | 呼び出し可能なメソッド（リモートプロキシやツーリング向け） |
+| `properties` | ✅ | Properties whose state changes are notified via `CustomEvent` (outputs) |
+| `inputs` | — | Configurable properties (inputs; declaration only — no automatic syncing) |
+| `commands` | — | Callable methods (intended for remote proxies and tooling) |
 
-### バインドの仕組み
+### How binding works
 
-アダプタは以下を行うだけ：
+An adapter only needs to:
 
-1. `target.constructor.wcBindable` を読む
-2. `protocol === "wc-bindable" && version === 1` を確認
-3. 各 `property` について `target[name]` を即時読み取って初期値を配信し、続いて `event` を購読する
+1. Read `target.constructor.wcBindable`
+2. Verify `protocol === "wc-bindable" && version === 1`
+3. For each `property`, read `target[name]` immediately to deliver the initial value, then subscribe to `event`
 
-`bind()` は実装たかだか 20 行。フレームワークアダプタも数十行で書ける。
+`bind()` is roughly 20 lines of code at most. A framework adapter can be written in a few dozen lines.
 
-### スコープ外（意図的）
+### Out of scope (intentionally)
 
-- 自動双方向同期（入力反映は呼び出し側の責任）
-- フォーム統合
+- Automatic two-way sync (the caller is responsible for writing inputs)
+- Form integration
 - SSR / hydration
-- 値の型検証 / スキーマ検証
+- Value type validation / schema validation
 
-### なぜ EventTarget か
+### Why EventTarget
 
-`HTMLElement` ではなく `EventTarget` を最小要件にしているため、Node.js / Deno / Cloudflare Workers などブラウザ外ランタイムでも同じプロトコルが動作する。`HTMLElement` は `EventTarget` のサブクラスなので Web Components は自動的に互換。
+The minimum requirement is `EventTarget` rather than `HTMLElement`, so the same protocol works in non-browser runtimes such as Node.js / Deno / Cloudflare Workers. Since `HTMLElement` is a subclass of `EventTarget`, Web Components are automatically compatible.
 
-参考: [wc-bindable-protocol/SPEC.md](https://github.com/wc-bindable-protocol/wc-bindable-protocol/blob/main/SPEC.md)
+Reference: [wc-bindable-protocol/SPEC.md](https://github.com/wc-bindable-protocol/wc-bindable-protocol/blob/main/SPEC.md)
 
 ---
 
-## 2. Core/Shell Bindable Component (CSBC) アーキテクチャの概要
+## 2. Core/Shell Bindable Component (CSBC) architecture overview
 
-wc-bindable-protocol を土台に、**業務ロジック（特に非同期処理）をフレームワーク層から Web Component 側に移すこと** で、フレームワークロックインを構造的に解消するアーキテクチャ。
+An architecture built on top of wc-bindable-protocol that **moves business logic (especially asynchronous code) out of the framework layer and into the Web Component**, structurally eliminating framework lock-in.
 
-### 解こうとする問題
+### The problem it solves
 
-フレームワーク移行コストの真の発生源は UI の互換性ではなく、**フレームワーク固有のライフサイクル API（`useEffect` / `onMounted` / `onMount` …）と密結合した async ロジック** である。テンプレートは機械的に書き換えられても、async コードは意味理解を要求するため移植コストが跳ね上がる。
+The true source of framework migration cost is not UI compatibility but **async logic that is tightly coupled to framework-specific lifecycle APIs (`useEffect` / `onMounted` / `onMount`, …)**. Templates can be rewritten mechanically, but async code requires semantic understanding, which inflates the cost of porting it.
 
-### 三層構造
+### Three-layer structure
 
-1. **Headless Web Component 層** — fetch / WebSocket / タイマー等の async 処理と状態 (`value`, `loading`, `error`, …) を内部に封じ込める。UI は持たず、純粋なサービス層として振る舞う。
-2. **Protocol 層 (wc-bindable-protocol)** — 上記の状態を `static wcBindable` + `CustomEvent` で外に開く。
-3. **Framework 層** — 薄いアダプタでプロトコルに接続し、受け取った状態を描画する。**async コードはここに一切書かない**。
+1. **Headless Web Component layer** — encapsulates async work (fetch / WebSocket / timers, etc.) and state (`value`, `loading`, `error`, …). It has no UI and behaves as a pure service layer.
+2. **Protocol layer (wc-bindable-protocol)** — exposes the above state to the outside via `static wcBindable` + `CustomEvent`.
+3. **Framework layer** — connects to the protocol through a thin adapter and renders the received state. **No async code lives here.**
 
-### Core / Shell の分離
+### Core / Shell separation
 
-Headless 層は更に二つに分解される。**唯一の不変条件は「Shell が常に薄い」ことではなく、決定権の所在**：
+The headless layer is further split into two. **The sole invariant is not that "the Shell is always thin" but where authority lives**:
 
-- **Core (`EventTarget`) — 決定を持つ**
-  業務ロジック、ポリシー、状態遷移、認可関連の振る舞い、イベント発火。DOM 非依存にできれば Node.js / Deno / Workers にも持ち運べる。
-- **Shell (`HTMLElement`) — 委譲できない実行のみを持つ**
-  フレームワーク接続、DOM ライフサイクル、ブラウザでしか実行できない処理。
+- **Core (`EventTarget`) — owns decisions**
+  Business logic, policies, state transitions, authorization-related behavior, event dispatch. If kept DOM-free, it is portable to Node.js / Deno / Workers.
+- **Shell (`HTMLElement`) — only owns work that cannot be delegated**
+  Framework wiring, DOM lifecycle, browser-only operations.
 
-設計上の鍵は **target 注入** パターン: Core のコンストラクタが任意の `EventTarget` を受け取り、すべてのイベントをそこへディスパッチする。Shell が `this` を渡せば、Core のイベントが直接 DOM 要素から発火し、再ディスパッチが不要になる。
+The key design pattern is **target injection**: the Core's constructor accepts an arbitrary `EventTarget` and dispatches all events to it. When the Shell passes `this`, Core events fire directly from the DOM element, eliminating the need for re-dispatching.
 
-### 4 つの正準ケース
+### Four canonical cases
 
-| ケース | Core の場所 | Shell の役割 | 例 |
+| Case | Core location | Shell role | Examples |
 |---|---|---|---|
-| A | ブラウザ | ブラウザ依存 Core の薄いラッパ | **`auth0-gate` (local)** |
-| B1 | サーバ | コマンド仲介・プロキシ型の薄い Shell | **`auth0-gate` (remote)**, `ai-agent` |
-| B2 | サーバ | 観測専用の薄い Shell（リモートセッション購読のみ） | `feature-flags` |
-| C | サーバ | ブラウザ固定のデータプレーンを実行する Shell | `s3-uploader`, `passkey-auth`, `stripe-checkout` |
+| A | Browser | Thin wrapper for a browser-bound Core | **`auth0-gate` (local)** |
+| B1 | Server | Command-mediation / proxy-style thin Shell | **`auth0-gate` (remote)**, `ai-agent` |
+| B2 | Server | Observation-only thin Shell (subscribes to a remote session) | `feature-flags` |
+| C | Server | Shell that runs a browser-pinned data plane | `s3-uploader`, `passkey-auth`, `stripe-checkout` |
 
-ケース C は CSBC からの逸脱ではなく **第一級のケース**。ブラウザでしか実行できないデータプレーン（直接アップロード、WebRTC、WebUSB、`File System Access API`、ユーザジェスチャ依存の処理、PCI スコープを避けるための Stripe Elements など）が存在するときに発生する。Shell が太くなっても、**意思決定が Core にある限り** CSBC 違反ではない。
+Case C is not a deviation from CSBC but a **first-class case**. It arises whenever a data plane must run in the browser (direct upload, WebRTC, WebUSB, the `File System Access API`, work that requires a user gesture, Stripe Elements used to stay out of PCI scope, etc.). Even when the Shell becomes thick, **as long as the Core retains decision-making authority**, it does not violate CSBC.
 
-> 不変条件:
-> **Core はすべての決定を持つ。Shell は委譲できない実行だけを持つ。**
+> Invariant:
+> **The Core owns all decisions. The Shell only owns work that cannot be delegated.**
 
-### 横断する 3 つの境界
+### The three boundaries it crosses
 
-| 境界 | 横断する主体 | メカニズム |
+| Boundary | Crossed by | Mechanism |
 |---|---|---|
-| ランタイム境界 | Core (`EventTarget`) | DOM 非依存。Node / Deno / Workers で動作 |
-| フレームワーク境界 | Shell (`HTMLElement`) | 属性マッピング + `ref` バインディング |
-| ネットワーク境界 | `@wc-bindable/remote` | プロキシ EventTarget + JSON ワイヤープロトコル |
+| Runtime boundary | Core (`EventTarget`) | DOM-free; runs on Node / Deno / Workers |
+| Framework boundary | Shell (`HTMLElement`) | Attribute mapping + `ref` binding |
+| Network boundary | `@wc-bindable/remote` | Proxy EventTarget + JSON wire protocol |
 
-`@wc-bindable/remote` は `RemoteShellProxy`（サーバ側）と `RemoteCoreProxy`（クライアント側）のペアで、Core をサーバへ完全に押し出しつつクライアント側の `bind()` を変えずに動かす。トランスポートは WebSocket がデフォルトだが、最小インタフェース (`ClientTransport` / `ServerTransport`) を満たせば MessagePort / BroadcastChannel / WebTransport などに差し替え可能。
+`@wc-bindable/remote` is a pair of `RemoteShellProxy` (server-side) and `RemoteCoreProxy` (client-side) that pushes the Core entirely to the server while letting the client-side `bind()` keep working unchanged. WebSocket is the default transport, but it is swappable for MessagePort / BroadcastChannel / WebTransport / etc., as long as the minimal interfaces (`ClientTransport` / `ServerTransport`) are satisfied.
 
-### 本パッケージにおける位置付け
+### Where this package fits
 
-`@csbc-dev/auth0` は **ケース A と B1 にまたがる**:
+`@csbc-dev/auth0` **straddles cases A and B1**:
 
-- **ローカルモード (ケース A)**: Auth0 認証の決定（SDK 初期化、ログイン/ログアウト、トークン取得・リフレッシュ、セッション状態）を `AuthCore` (Core, `EventTarget`) がブラウザ内で持つ。Auth0 SPA SDK・`globalThis.location` / `globalThis.history`（リダイレクトコールバック）に依存するため、この Core はブラウザに固定される。`<auth0-gate>` (Shell, `HTMLElement`) は `authenticated` / `user` / `loading` / `error` をバインダブル状態として DOM に公開し、`token` だけは安全のため `data-wcs` サーフェスから除外する。
-- **リモートモード (ケース B1)**: アプリケーション本体の Core はサーバ側に置かれ、`<auth0-gate>` は認証付き WebSocket ハンドシェイクのゲートキーパとして振る舞う。アクセストークンは Shell 内部に留まり、ハンドシェイクと in-band `auth:refresh` でのみワイヤーに乗る。アプリケーション JS にはトークンが一切露出しない（`getToken()` は throw、`token` は `null`）。`<auth0-session>` と組み合わせて、認証 → 接続 → 初期同期の三段階レディネスを単一の `ready` シグナルに集約する。
+- **Local mode (Case A)**: Auth0 authentication decisions (SDK initialization, login/logout, token acquisition and refresh, session state) live inside `AuthCore` (Core, `EventTarget`) in the browser. Because it depends on the Auth0 SPA SDK and on `globalThis.location` / `globalThis.history` (redirect callbacks), this Core is browser-pinned. `<auth0-gate>` (Shell, `HTMLElement`) exposes `authenticated` / `user` / `loading` / `error` to the DOM as bindable state, while `token` is intentionally excluded from the `data-wcs` surface for safety.
+- **Remote mode (Case B1)**: The application's own Core lives on the server, and `<auth0-gate>` acts as a gatekeeper for the authenticated WebSocket handshake. The access token stays inside the Shell and only crosses the wire during the handshake and during in-band `auth:refresh`. Application JS never sees the token (`getToken()` throws and `token` is `null`). Combined with `<auth0-session>`, the three-stage readiness sequence (authenticated → connected → initial sync) is collapsed into a single `ready` signal.
 
-サーバ側ヘルパとして `@csbc-dev/auth0/server` (`createAuthenticatedWSS` / `verifyAuth0Token` / `extractTokenFromProtocol` / `UserCore`) を提供し、`@wc-bindable/remote` の `RemoteShellProxy` をラップしてトークン検証・期限管理・宣言的認可ミドルウェアを差し込む。
+A server-side helper bundle is provided as `@csbc-dev/auth0/server` (`createAuthenticatedWSS` / `verifyAuth0Token` / `extractTokenFromProtocol` / `UserCore`), which wraps `@wc-bindable/remote`'s `RemoteShellProxy` and injects token verification, expiry handling, and declarative authorization middleware.
 
-参考: [csbc-dev/arch (旧 hawc)](https://github.com/csbc-dev/arch/blob/main/README.md)
+Reference: [csbc-dev/arch (formerly hawc)](https://github.com/csbc-dev/arch/blob/main/README.md)
+
+---
+
+## 3. Layout of this project (`@csbc-dev/auth0`)
+
+A headless Web Component package for handling Auth0 authentication declaratively. It is not a visual UI widget; it acts as an **I/O node** that connects Auth0 authentication to reactive state.
+
+- **Input / command surface**: `domain`, `client-id`, `trigger`
+- **Output state surface**: `authenticated`, `user`, `loading`, `error` (in remote mode, `connected` is added)
+- **Token**: always excluded from the wcBindable surface for safety. In local mode it is read via `el.token` / `await el.getToken()`; in remote mode it is confined inside the Shell and is invisible to JS.
+
+### Package exports (`package.json`)
+
+| Export | Entry | Purpose |
+|---|---|---|
+| `.` | [src/index.ts](src/index.ts) | Browser-side main: `bootstrapAuth`, `AuthCore`, `AuthShell`, `Auth`, `AuthLogout`, `AuthSession`, `registerCoreDeclaration`, etc. |
+| `./server` | [src/server/index.ts](src/server/index.ts) | Node server: `createAuthenticatedWSS`, `verifyAuth0Token`, `extractTokenFromProtocol`, `UserCore` |
+| `./auto` | [src/auto/auto.min.js](src/auto/auto.min.js) | Standalone build that auto-registers when loaded via a script tag |
+
+### Directory layout
+
+```
+src/
+├── index.ts              Browser-facing barrel export
+├── bootstrapAuth.ts      Entry point for component registration + initial config
+├── registerComponents.ts Custom element registration logic
+├── coreRegistry.ts       Named registration for Core declarations used in remote mode
+├── config.ts             Overridable global settings such as tag names
+├── autoTrigger.ts        Auto-launches login on URL callback detection
+├── jwtPayload.ts         JWT decode / expiry helpers
+├── protocolPrefix.ts     Constant for the WebSocket subprotocol prefix
+├── raiseError.ts         Helper for dispatching error events
+├── core/
+│   └── AuthCore.ts       EventTarget Core that drives the Auth0 SDK (the decision-maker in local mode)
+├── shell/
+│   └── AuthShell.ts      HTMLElement Shell for <auth0-gate>; supports both local and remote modes
+├── components/
+│   ├── Auth.ts           Class that registers <auth0-gate> under the default tag name
+│   ├── AuthLogout.ts     <auth0-logout> action element for logout buttons
+│   └── AuthSession.ts    <auth0-session> readiness element collapsing authenticated→connected→initial-sync
+├── server/               Node-side helpers (the @csbc-dev/auth0/server export)
+└── auto/                 Standalone distribution for script-tag use (auto.js / auto.min.js)
+```
+
+### Component cheat sheet
+
+| Element | Role | wcBindable outputs |
+|---|---|---|
+| `<auth0-gate>` | Authentication gatekeeper; covers both local and remote modes | `authenticated`, `user`, `loading`, `error` (remote also adds `connected`) |
+| `<auth0-logout>` | Action element that triggers Auth0 logout on click | — |
+| `<auth0-session>` | In remote mode, collapses the three-stage readiness (authenticated → WebSocket connection → initial sync) into a single `ready` | `ready` (plus intermediate state) |
+
+### The two modes (recap, from this package's implementation perspective)
+
+- **Local mode (default)**: `mode` is not specified and `remote-url` is unset or an empty string. The Auth0 SPA SDK runs in the browser. `getToken()` returns the token.
+- **Remote mode**: triggered by `mode="remote"` or by a non-empty `remote-url`. The token only crosses the wire during the WebSocket handshake and during in-band `auth:refresh`. `token` is `null`, `getToken()` throws. Only the `exp` claim is exposed via `getTokenExpiry()`.
+
+### Error contract
+
+- Auth0 SDK failures (`initialize` / `login` / `logout` / `getToken`) **do not reject** — they publish to `error` / `auth0-gate:error` and clear `loading`. Consumers should bind the state, not wrap calls in `try/catch`.
+- WebSocket I/O failures in remote mode (`connect` / `reconnect` / `refreshToken`) **do reject**. Wrap them when calling directly, or pick them up from `<auth0-session>`'s state.
+- Precondition violations (missing `domain` / `client-id`, calling `getToken()` in remote mode, etc.) throw synchronously.
+
+### Primary development scripts
+
+| Command | What it does |
+|---|---|
+| `npm run build` | Emits ESM + types into `dist/` via `tsc` (auto-run from `prepack`) |
+| `npm run dev` | `tsc --watch` |
+| `npm test` / `npm run test:unit` | `vitest run __tests__` |
+| `npm run test:watch` | `vitest __tests__` |
+| `npm run test:coverage` | Runs with V8 coverage (`src/types.ts`, `src/index.ts`, `src/server/index.ts`, `src/auto/**/*.d.ts` are excluded) |
+
+The test environment uses `happy-dom` (see [vitest.config.ts](vitest.config.ts) and [__tests__/setup.ts](__tests__/setup.ts)). Unit tests (`authCore.test.ts` / `authShell.test.ts` and others), an E2E test (`e2e.test.ts`), and server-side tests (`__tests__/server/`) live under `__tests__/`.
+
+### Dependency notes
+
+- `@wc-bindable/core` — the wcBindable protocol implementation (runtime dependency)
+- `@wc-bindable/remote` — proxy used by remote mode (**note the local file: reference** to `../../wc-bindable-protocol/wc-bindable-protocol/packages/remote`; the wiring assumes a sibling monorepo for development)
+- `jose` — JWT verification / decoding
+- `@auth0/auth0-spa-js` / `ws` — **peerDependencies (optional)**. The former is required only by local mode and the latter only by the server / remote side, so consumers install whichever matches their mode
+
+### Reference docs
+
+- [README.md](README.md) — package overview and mode-selection criteria
+- [README-LOCAL.md](README-LOCAL.md) — using local mode
+- [README-REMOTE.md](README-REMOTE.md) — using remote mode
+- [SPEC-REMOTE.md](SPEC-REMOTE.md) — remote protocol spec, server handler, error codes, threat model
