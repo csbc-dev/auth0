@@ -18,7 +18,7 @@ Local mode is the default. It is selected when:
 In local mode:
 
 - `authEl.token` returns the current access token (or `null`).
-- `await authEl.getToken()` returns a fresh token.
+- `await authEl.getToken()` returns the current access token via Auth0's `getTokenSilently()` — the SDK serves the cached token when one is available and only performs a silent network refresh when the cache is empty or stale. Use this in your outbound-request bridge; the Auth0 SDK handles the cache-vs-refresh decision internally.
 - The token is **still omitted** from the wcBindable surface — it is JS-only, never reachable via `data-wcs` / `bind()`.
 
 ## Why this exists

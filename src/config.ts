@@ -89,8 +89,8 @@ export function setConfig(partialConfig: IWritableConfig): void {
     // usually far from the offending `setConfig` call. Validate here so
     // the error points at the field the caller actually set.
     //
-    // Cycle 8 (J-001): explicitly skip `undefined` before the empty-string
-    // check AND before the assignment. Sibling fields (`autoTrigger`,
+    // Explicitly skip `undefined` before the empty-string check AND
+    // before the assignment. Sibling fields (`autoTrigger`,
     // `triggerAttribute`) naturally skip `undefined` via their
     // `typeof === "boolean" | "string"` guard; without an explicit skip
     // here, `Object.assign(_config.tagNames, { auth: undefined })` would
@@ -99,14 +99,11 @@ export function setConfig(partialConfig: IWritableConfig): void {
     for (const key of ["auth", "authLogout", "authSession"] as const) {
       const value = partialConfig.tagNames[key];
       if (value === undefined) continue;
-      // Cycle 9 (K-002): non-string values (null, numbers, objects, …)
-      // previously slipped through the `typeof === "string"` empty-check
-      // and were assigned straight onto `_config.tagNames[key]`.
-      // Downstream `customElements.define(null, ...)` would then throw
-      // a TypeError at component-registration time, far from the
-      // offending setConfig call. This mirrors the fail-fast contract
-      // established by I-002 / J-001 — reject non-strings at the
-      // configuration boundary so the diagnostic points at the caller.
+      // Reject non-string values (null, numbers, objects, …) at the
+      // configuration boundary. Without this guard a non-string would
+      // be assigned straight onto `_config.tagNames[key]` and surface
+      // later as a TypeError from `customElements.define`, far from
+      // the offending setConfig call.
       if (typeof value !== "string") {
         raiseError(
           `setConfig(): \`tagNames.${key}\` must be a string; got ${value === null ? "null" : typeof value}.`,

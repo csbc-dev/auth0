@@ -382,6 +382,31 @@ export class AuthShell extends EventTarget {
    * Direct callers that explicitly want to take over an existing
    * transport omit the flag and fall back to the legacy
    * `_closeWebSocket()`-then-reconnect behaviour.
+   *
+   * **WARNING — concurrent connect() without `failIfConnected`:**
+   *
+   * `connect()` and `reconnect()` are intentionally asymmetric here.
+   * `reconnect()` ALWAYS checks `_connectInFlight` and rejects on
+   * concurrent entry; `connect()` only checks when
+   * `failIfConnected: true` is explicitly passed. Without the flag,
+   * two concurrent `connect()` callers both pass the (skipped) guard,
+   * both flip `_connectInFlight = true`, both `await fetchToken()`,
+   * both `_closeWebSocket()`, and both open a new socket — only the
+   * second's reference survives in `_ws`, leaving the first caller
+   * with a returned transport bound to a socket that the second
+   * caller's `_closeWebSocket()` already closed. SPEC-REMOTE §3.7
+   * documents this as "last writer wins"; the actual contract for
+   * direct callers is "concurrent connect() without `failIfConnected`
+   * is undefined behaviour — the returned transports may be dead and
+   * the first caller's `_token` rollback may collide with the
+   * second's commit". Pass `failIfConnected: true` to opt into the
+   * atomic guard, or serialise calls externally if your application
+   * truly needs the legacy take-over semantics.
+   *
+   * `<auth0-session>` always passes `failIfConnected: true`, so the
+   * declarative path is safe by construction; the warning applies
+   * only to applications that call `authEl.connect()` imperatively
+   * from multiple call sites.
    */
   async connect(
     url: string,

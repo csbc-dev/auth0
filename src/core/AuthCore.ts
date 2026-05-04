@@ -64,6 +64,33 @@ export class AuthCore extends EventTarget {
    * that rely on the Core's wcBindable declaration to discover the
    * event name (and the published unit-test contract that this
    * package's `AuthCore` sits across — see __tests__/authCore.test.ts).
+   *
+   * **Direct-Core consumer responsibility (REMOTE MODE):**
+   *
+   * `AuthCore` IS a public package export ([src/index.ts]) so a
+   * downstream caller can construct a Core directly and `bind()` it
+   * via `@wc-bindable/core` — that path receives `token` because this
+   * declaration includes it. The remote-mode "token never reachable
+   * from JS" guarantee published by the README is implemented by:
+   *
+   *   1. `AuthShell`'s relay EventTarget that drops
+   *      `auth0-gate:token-changed` re-dispatch onto the outer
+   *      element when `_mode === "remote"`
+   *      ([src/shell/AuthShell.ts] — search "FORWARDED_EVENT_NAMES").
+   *   2. `<auth0-gate>` proxying `.token` through `AuthShell` which
+   *      returns `null` in remote mode, and `getToken()` throwing.
+   *
+   * Both safeguards live in the **Shell layer**. A consumer that
+   * bypasses the Shell by constructing `new AuthCore()` directly is
+   * outside the Shell's binding surface and therefore outside the
+   * remote-mode token-confinement guarantee — the Shell has no way to
+   * intercept events on a Core instance it does not own. Direct-Core
+   * usage is supported for unit tests, advanced embedders, and
+   * tooling, but the security contract for those callers is "you own
+   * the token, treat it as bearer material accordingly". If you need
+   * Shell-equivalent confinement programmatically, instantiate
+   * `AuthShell` (which constructs its own Core internally) instead of
+   * `AuthCore`.
    */
   static wcBindable: IWcBindable = {
     protocol: "wc-bindable",

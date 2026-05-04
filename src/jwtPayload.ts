@@ -50,6 +50,29 @@ export function base64UrlDecode(input: string): string {
  *
  * Returns the payload as `Record<string, unknown>` so that individual
  * claim access has to `typeof`-check the field before use.
+ *
+ * **Scope: payload-only decode. Does NOT validate the JWT.**
+ *
+ * This function decodes the base64url-encoded payload segment and
+ * deserialises it as JSON. It does not:
+ *
+ *   - parse or inspect the JWT header (`alg`, `kid`, `typ`),
+ *   - verify the signature,
+ *   - check the `exp` / `nbf` / `iat` claims for staleness,
+ *   - validate `iss` / `aud` / `sub`.
+ *
+ * Signature validation, issuer / audience verification, and claim
+ * checks are performed by `jose` on the server side
+ * (`server/createAuthenticatedWSS.ts` → `verifyAuth0Token`). On the
+ * client side, this helper is used purely to read the `exp` claim
+ * for refresh scheduling — the access token has already been
+ * obtained from the Auth0 SDK (which fetched it over TLS from the
+ * Auth0 tenant), so the client trusts the token material as a
+ * provenance-from-Auth0 string and reads `exp` to plan refresh
+ * timing. Do NOT use this function as an authorization gate, or to
+ * make a trust decision about a token from an arbitrary source —
+ * that requires a real verifier with the appropriate JWKS / shared
+ * secret.
  */
 export function parseJwtPayload(token: string): Record<string, unknown> | null {
   const parts = token.split(".");

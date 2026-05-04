@@ -240,8 +240,42 @@ export class AuthSession extends HTMLElement {
   // --- Public imperative API ------------------------------------------------
 
   /**
-   * Manually start a session. Useful when `auto-connect="false"` or when
-   * the session needs to be (re)started after an error.
+   * Manually start (or restart) the session.
+   *
+   * Public re-entrant API: calling `start()` on an already-started
+   * session is supported and triggers a clean restart. The
+   * implementation is `_startWatching()`, which begins by tearing
+   * down any previous cycle (`_unsubscribeAuth()` + `_teardown()`)
+   * and bumping the generation counter — so any in-flight handshake
+   * from the previous cycle drops its work on resume via the
+   * generation guards in `_connect()`.
+   *
+   * Use cases:
+   *
+   *   - **`auto-connect="false"`**: nothing happens automatically;
+   *     call `start()` once when the application is ready to open
+   *     the session.
+   *   - **Mid-life target / core / url change**: `attributeChangedCallback`
+   *     coalesces attribute-driven restarts via a microtask, but only
+   *     while the session is idle (`!_transport && !_connecting`). To
+   *     restart after a transport is established (e.g. switching
+   *     `target` to a different `<auth0-gate>`), call `start()`
+   *     explicitly — the implicit auto-restart deliberately does NOT
+   *     interrupt a live session.
+   *   - **Recovery after an error**: a session that ended in
+   *     `error` state stays inert until either an attribute mutation
+   *     (which the auto-restart picks up while idle) or an explicit
+   *     `start()` call. Use `start()` for application-driven retry
+   *     loops.
+   *   - **`auto-connect` flipped from `false` to `true`**: the
+   *     attribute change is observed but does not trigger an
+   *     auto-start (that path runs only inside `connectedCallback`).
+   *     Call `start()` after the flip.
+   *
+   * `connectedCallbackPromise` does NOT track imperative `start()`
+   * cycles — `await start()` directly when you need to await the
+   * imperative startup. See the `connectedCallbackPromise` JSDoc for
+   * the rationale.
    */
   async start(): Promise<void> {
     return this._startWatching();
@@ -477,8 +511,28 @@ export class AuthSession extends HTMLElement {
       // in SPEC-REMOTE §11 and freeing applications from implementing it.
       // The generation check covers a teardown that lands between bind()
       // registration and the first dispatched event.
+      //
+      // Capture the unbind function in a local BEFORE assigning to
+      // `this._unbind`. `@wc-bindable/core`'s `bind()` may invoke its
+      // callback synchronously during registration (e.g. when the proxy
+      // already has cached initial values to deliver). If a teardown
+      // lands inside that synchronous callback — via `_setReady(true)`
+      // dispatching `ready-changed` and an external listener calling
+      // `_teardown()` re-entrantly — `_teardownProxy()` would observe
+      // `this._unbind === null` (we have not yet returned from bind())
+      // and skip disposal, leaving the bind callback wired against the
+      // dead proxy. Local-variable capture lets us fall back to the
+      // local reference if `_teardownProxy()` runs synchronously inside
+      // bind(), so the disposer is never lost.
+      //
+      // The generation guard inside the callback already prevents
+      // `_setReady(true)` from firing under a stale generation, so
+      // there is no observable misbehaviour TODAY — this is
+      // defense-in-depth against a future refactor that introduces a
+      // synchronous teardown path between bind() entry and assignment.
       let firstBatch = true;
-      this._unbind = bind(proxy, (_name, _value) => {
+      let myUnbind: UnbindFn | null = null;
+      myUnbind = bind(proxy, (_name, _value) => {
         if (firstBatch) {
           firstBatch = false;
           queueMicrotask(() => {
@@ -488,6 +542,17 @@ export class AuthSession extends HTMLElement {
           });
         }
       });
+      // If `_teardown()` ran synchronously inside bind(), the proxy is
+      // already gone but `myUnbind` is still live — call it directly so
+      // the bind callback is not orphaned, and skip the assignment to
+      // `this._unbind` (the next teardown would otherwise re-call a
+      // disposer that has already fired, which `@wc-bindable/core`
+      // tolerates today but the contract does not formally guarantee).
+      if (this._proxy !== proxy || this._generation !== myGen) {
+        myUnbind?.();
+        return;
+      }
+      this._unbind = myUnbind;
     } catch (err) {
       // Swallow errors from a superseded attempt — reporting them would
       // clobber state the active teardown has already reset.
@@ -585,10 +650,23 @@ export class AuthSession extends HTMLElement {
    *     without ever suppressing a real error→error transition
    *     (two different Error instances, even with the same
    *     message, compare unequal).
-   *   - Conversely, "same Error instance set twice" genuinely is
-   *     idempotent — not a legitimate case in current callers, but
-   *     coalescing it keeps `auth0-session:error` from firing
-   *     spurious duplicate payloads.
+   *
+   * **Limitation: same-instance double-call is silently coalesced.**
+   *
+   * The `null === null` suppression above is the load-bearing case;
+   * the same predicate also coalesces "same Error instance set
+   * twice" but that is a side effect, not a contract. If a future
+   * caller path captures one `Error` reference and passes it through
+   * `_setError` twice (e.g. an exception caught at the outer try and
+   * re-set after a retry that also fails with the same captured
+   * reference), the second call is dropped silently and subscribers
+   * never see a "the error is still here" signal. Current callers
+   * always allocate a fresh `Error` per failure, so this is theoretical
+   * — but a future refactor that introduces error capture-and-replay
+   * needs to either allocate a wrapper Error or reset
+   * `this._error = null` between calls. Single-call paths and
+   * legitimate error→error transitions across distinct Error
+   * instances are unaffected.
    */
   private _setError(value: Error | null): void {
     if (this._error === value) return;

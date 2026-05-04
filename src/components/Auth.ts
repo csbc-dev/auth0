@@ -5,6 +5,35 @@ import { AuthShell, DEFAULT_SCOPE } from "../shell/AuthShell.js";
 import { registerAutoTrigger, unregisterAutoTrigger } from "../autoTrigger.js";
 import { ERROR_PREFIX } from "../raiseError.js";
 
+// Attributes whose value the Auth0 SPA SDK consumes ONCE at
+// construction time (`audience`, `scope`, `redirect-uri`, `cache-location`,
+// `use-refresh-tokens`). Mutating any of them post-init does NOT
+// reconfigure the live SDK — the SDK keys its session storage by
+// `audience`, partitions cache by `scope` / `cache-location`, and binds
+// refresh-token usage at construction. The browser still delivers
+// `attributeChangedCallback` for them because they're in
+// `observedAttributes`, so a framework re-stamp or an explicit mid-life
+// `setAttribute` would silently no-op while the operator believes the
+// change took effect; `attributeChangedCallback` warns once when this
+// drift is detected. Hoisted to module scope so the array is allocated
+// once at module-load instead of per-call.
+//
+// `mode` and `remote-url` are intentionally NOT in this list — both are
+// mirrored into the shell on change and the connect()/reconnect() paths
+// re-validate them (e.g. remote-mode audience precondition). However,
+// the inert-attribute warning text below explicitly notes that switching
+// `mode` post-init still leaves the Auth0 SDK constructed with the
+// original `cache-location` / `use-refresh-tokens` values, so a
+// `local`→`remote` flip can leave the SDK partially misaligned with the
+// new mode's expectations even though the shell-side state advances.
+const _INERT_POST_INIT_ATTRIBUTES = [
+  "audience",
+  "scope",
+  "redirect-uri",
+  "cache-location",
+  "use-refresh-tokens",
+];
+
 export class Auth extends HTMLElement {
   static hasConnectedCallbackPromise = true;
   static wcBindable: IWcBindable = {
@@ -36,6 +65,27 @@ export class Auth extends HTMLElement {
   // legitimately have multiple `<auth0-gate>` mounts and a typo on
   // one should not silence a future typo on another.
   private _unknownModeWarned: boolean = false;
+  // One-shot guard for the remote-mode-without-audience warn.
+  // Per-instance because the wrong configuration is per-instance: a
+  // single page can legitimately have multiple `<auth0-gate>` mounts
+  // (different APIs / audiences) and a typo on one should not silence
+  // a future typo on another. Latched after the first warn so a
+  // framework that re-reads `mode` / `audience` repeatedly does not
+  // flood the console with the same message.
+  //
+  // Why a warn (not a synchronous throw):
+  //   The misconfiguration is only visible on the wire — the Auth0
+  //   SPA SDK accepts `getTokenSilently()` without an `audience`
+  //   parameter (it just returns whatever default-audience token Auth0
+  //   chose for the tenant), so a remote-mode element that never
+  //   reaches connect() (e.g. a "loading…" indicator that observes
+  //   `authenticated` / `user` only, awaiting the page's main shell to
+  //   call connect()) would never see the connect()-side raiseError.
+  //   The warn surfaces the issue at attribute-stamp time so
+  //   integrators see it during local dev instead of debugging a 1008
+  //   close in production. Throwing here would be hostile to
+  //   late-binding frameworks that stamp `mode` before `audience`.
+  private _remoteAudienceMissingWarned: boolean = false;
   // One-shot guard for the post-init "inert attribute mutated" warn.
   // The Auth0 SPA SDK is constructed once with `audience` / `scope` /
   // `redirect-uri` / `cache-location` / `use-refresh-tokens` plumbed
@@ -398,6 +448,7 @@ export class Auth extends HTMLElement {
     // Catch mode / remote-url changes that occurred while detached
     // (attributeChangedCallback bails on !isConnected).
     this._shell.mode = this.mode;
+    this._warnIfRemoteWithoutAudience();
     this._tryInitialize();
   }
 
@@ -422,6 +473,18 @@ export class Auth extends HTMLElement {
       this._shell.mode = this.mode;
     }
 
+    // Re-evaluate the remote-mode-without-audience warn whenever an
+    // attribute that participates in the check changes. The latch
+    // (`_remoteAudienceMissingWarned`) keeps this single-shot; calling
+    // on every relevant change just ensures we catch a late-binding
+    // framework that stamps `mode="remote"` BEFORE it stamps
+    // `audience` (or vice-versa) — without re-evaluation the warn
+    // would silently miss the case where `audience` is removed
+    // post-init while staying in remote mode.
+    if (_name === "mode" || _name === "remote-url" || _name === "audience") {
+      this._warnIfRemoteWithoutAudience();
+    }
+
     // `audience`, `scope`, `redirect-uri`, `cache-location`, and
     // `use-refresh-tokens` are all observed (so the browser delivers
     // mutations here) but the Auth0 SPA SDK is already constructed
@@ -438,13 +501,18 @@ export class Auth extends HTMLElement {
     // group — five separate per-attribute warnings would be louder
     // than helpful, and the remediation is identical across them
     // (tear down and remount).
-    const _INERT_POST_INIT_ATTRIBUTES = [
-      "audience",
-      "scope",
-      "redirect-uri",
-      "cache-location",
-      "use-refresh-tokens",
-    ];
+    //
+    // The warn message also calls out `mode` / `remote-url` switches
+    // even though those attributes ARE mirrored into the shell on
+    // change: the shell mirror updates `_mode` and validates audience
+    // at the next connect()/reconnect(), but the underlying Auth0 SDK
+    // was constructed once with the original `cache-location` /
+    // `use-refresh-tokens` / `audience`, so a `local`→`remote` flip
+    // can leave the SDK partially misaligned with the new mode (e.g.
+    // refresh tokens disabled when the remote mode actually needs
+    // them, or vice versa). Mode switches are still legal — they just
+    // share the same "tear down and remount for a clean reconfigure"
+    // remediation as the inert-attribute mutations.
     if (
       _INERT_POST_INIT_ATTRIBUTES.includes(_name) &&
       _oldValue !== null &&
@@ -460,7 +528,10 @@ export class Auth extends HTMLElement {
         `and \`use-refresh-tokens\`; mid-life changes to any of these attributes are NOT ` +
         `applied to the existing client. Tear down and remount <auth0-gate> if you genuinely ` +
         `need to reconfigure. (connect()/reconnect() in remote mode still validates the live ` +
-        `\`audience\` attribute against the server.)`,
+        `\`audience\` attribute against the server. Note: mutating \`mode\` or \`remote-url\` ` +
+        `post-init updates the shell side but leaves the Auth0 SDK's \`cache-location\` / ` +
+        `\`use-refresh-tokens\` / \`audience\` unchanged — verify the cached SDK options still ` +
+        `match the new mode.)`,
       );
     }
 
@@ -488,6 +559,38 @@ export class Auth extends HTMLElement {
         this.initialize().then(resolve, resolve);
       });
     });
+  }
+
+  /**
+   * Emit a one-time `console.warn` when the element is configured for
+   * remote mode but the `audience` attribute is missing or empty.
+   *
+   * Remote mode requires `audience` because the server's
+   * `verifyAuth0Token` enforces an `aud` match and rejects the
+   * handshake on mismatch. `connect()` / `reconnect()` already throw
+   * synchronously on this misconfig, but elements that observe state
+   * only (an "authenticating…" placeholder waiting for the main shell
+   * to call connect()) never reach that path — the misconfig would
+   * stay invisible until the application happens to attempt a
+   * connection. Surfacing it during attribute resolution gives
+   * integrators a dev-time signal at the original mistake site.
+   *
+   * Latched per-instance so attribute re-reads (frameworks that
+   * re-stamp `mode` on every render) do not flood the console.
+   */
+  private _warnIfRemoteWithoutAudience(): void {
+    if (this._remoteAudienceMissingWarned) return;
+    if (this.mode !== "remote") return;
+    if (this.audience) return;
+    this._remoteAudienceMissingWarned = true;
+    console.warn(
+      `${ERROR_PREFIX} <auth0-gate>: remote mode is configured but \`audience\` is missing. ` +
+      `Set the \`audience\` attribute to your API identifier — without it the server's ` +
+      `verifyAuth0Token will reject the handshake on \`aud\` mismatch (close code 1008). ` +
+      `connect() / reconnect() will throw at the call site, but observe-only elements ` +
+      `(e.g. a "loading…" indicator) would otherwise not surface this until the first ` +
+      `connection attempt.`,
+    );
   }
 
   private _tryInitialize(): void {
