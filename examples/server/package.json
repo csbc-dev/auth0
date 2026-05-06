@@ -1,0 +1,14 @@
+{
+  "name": "csbc-auth0-example-server",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node --env-file=.env server.js",
+    "dev": "node --env-file=.env --watch server.js"
+  },
+  "dependencies": {
+    "@csbc-dev/auth0": "^0.4.0",
+    "ws": "^8.18.0"
+  }
+}

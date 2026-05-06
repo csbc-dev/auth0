@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Vanilla — @csbc-dev/auth0 (remote mode)</title>
+    <style>
+      body { font: 14px/1.5 system-ui, sans-serif; max-width: 480px; margin: 2rem auto; padding: 0 1rem; }
+      section { margin: 1rem 0; padding: 1rem; border: 1px solid #ddd; border-radius: 6px; }
+      button { font: inherit; padding: 0.4rem 0.8rem; }
+      .row > * + * { margin-left: 0.5rem; }
+      .muted { color: #666; }
+      .err { color: #b00; }
+      [hidden] { display: none !important; }
+    </style>
+  </head>
+  <body>
+    <h1>Vanilla — remote mode</h1>
+
+    <auth0-gate id="auth"></auth0-gate>
+    <auth0-session id="session" target="auth">
+      <!-- The session adopts this child as its data-plane facade. The class
+           is registered in main.js and carries the wcBindable declaration. -->
+      <app-core-facade id="facade"></app-core-facade>
+    </auth0-session>
+
+    <section>
+      <p id="status" class="muted">Initialising…</p>
+      <p id="error" class="err" hidden></p>
+      <div class="row">
+        <button id="login" hidden>Sign in</button>
+        <button id="logout" hidden>Sign out</button>
+      </div>
+    </section>
+
+    <section id="counter" hidden>
+      <p>Count: <strong id="count">—</strong></p>
+      <p class="muted">Last updated by: <span id="lastUser">—</span></p>
+      <div class="row">
+        <button id="inc">+1</button>
+        <button id="dec">−1</button>
+        <button id="reset">Reset</button>
+      </div>
+    </section>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

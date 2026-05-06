@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>@wcstack/state — @csbc-dev/auth0 (remote mode)</title>
+    <style>
+      body { font: 14px/1.5 system-ui, sans-serif; max-width: 480px; margin: 2rem auto; padding: 0 1rem; }
+      section { margin: 1rem 0; padding: 1rem; border: 1px solid #ddd; border-radius: 6px; }
+      button, auth0-logout { font: inherit; padding: 0.4rem 0.8rem; }
+      auth0-logout { display: inline-block; cursor: pointer; border: 1px solid #888; border-radius: 3px; }
+      .row > * + * { margin-left: 0.5rem; }
+      .muted { color: #666; }
+      .err { color: #b00; }
+    </style>
+
+    <!--
+      Define the payload custom element. The session adopts the first
+      wc-bindable child, looking it up through `child.constructor.wcBindable`
+      — which is independent of which module instance defined it, so we no
+      longer need to import bootstrapAuth ourselves to guarantee a shared
+      instance with @csbc-dev/auth0/auto. The /auto entries below run their
+      own bootstrap calls.
+    -->
+    <script type="module">
+      class AppCoreFacade extends HTMLElement {
+        static wcBindable = {
+          protocol: "wc-bindable",
+          version: 1,
+          properties: [
+            { name: "count",         event: "app-core:count-changed" },
+            { name: "lastUpdatedBy", event: "app-core:last-updated-by-changed" },
+          ],
+          commands: [
+            { name: "increment" },
+            { name: "decrement" },
+            { name: "reset" },
+          ],
+        };
+      }
+      customElements.define("app-core-facade", AppCoreFacade);
+    </script>
+
+    <script type="module" src="https://esm.run/@csbc-dev/auth0/auto"></script>
+    <script type="module" src="https://esm.run/@wcstack/state/auto"></script>
+  </head>
+  <body>
+    <h1>@wcstack/state — remote mode</h1>
+
+    <wcs-state>
+      <script type="module">
+        // Methods on the state read live values from <app-core-facade>'s
+        // own-properties (mirrored by the session) and route command calls
+        // through the forwarders <auth0-session> installed on the same
+        // element. No `bind(session.proxy)` bridge needed.
+        export default {
+          // <auth0-gate> output bindings.
+          isLoggedIn: false,
+          currentUser: null,
+          authLoading: true,
+          authError: null,
+          wsConnected: false,
+          shouldLogin: false,
+
+          // <auth0-session> output bindings.
+          sessionReady: false,
+          sessionConnecting: false,
+          sessionError: null,
+
+          // <app-core-facade> output bindings — declared up-front so the
+          // path strings used in `data-wcs="count: liveCount; ..."` and
+          // the `{{ liveCount }} / {{ liveAuthor }}` mustaches resolve
+          // to real state paths that wcstack tracks reactively.
+          liveCount: 0,
+          liveAuthor: "",
+
+          get authErrorMessage() {
+            const e = this.authError;
+            if (!e) return "";
+            if (typeof e.message === "string") return e.message;
+            if (typeof e.error === "string") return e.error;
+            return String(e);
+          },
+
+          login() { this.shouldLogin = true; },
+
+          increment() { document.querySelector("app-core-facade")?.increment?.(); },
+          decrement() { document.querySelector("app-core-facade")?.decrement?.(); },
+          reset()     { document.querySelector("app-core-facade")?.reset?.(); },
+        };
+      </script>
+
+      <!--
+        EDIT these four attributes for your tenant. They are static HTML
+        attributes (not data-wcs bindings) — same pattern as README-LOCAL.md.
+      -->
+      <auth0-gate
+        id="auth"
+        domain="your-tenant.auth0.com"
+        client-id="your-client-id"
+        audience="https://api.example.com"
+        remote-url="ws://localhost:3000"
+        data-wcs="
+          authenticated: isLoggedIn;
+          user:          currentUser;
+          loading:       authLoading;
+          error:         authError;
+          connected:     wsConnected;
+          trigger:       shouldLogin
+        ">
+      </auth0-gate>
+
+      <auth0-session
+        id="session"
+        target="auth"
+        data-wcs="
+          ready:      sessionReady;
+          connecting: sessionConnecting;
+          error:      sessionError
+        ">
+        <!--
+          Payload child — <auth0-session> mirrors the server-side Core's
+          `count` / `lastUpdatedBy` onto this element, dispatches the
+          declared events on it, and installs `increment` / `decrement` /
+          `reset` as command forwarders. data-wcs reads directly from
+          this element, no extra bridging code in the state.
+        -->
+        <app-core-facade
+          data-wcs="
+            count:         liveCount;
+            lastUpdatedBy: liveAuthor
+          ">
+        </app-core-facade>
+      </auth0-session>
+
+      <section>
+        <template data-wcs="if: authLoading">
+          <p class="muted">Loading Auth0…</p>
+        </template>
+        <template data-wcs="if: !isLoggedIn">
+          <p class="muted">Signed out.</p>
+        </template>
+        <template data-wcs="if: sessionConnecting">
+          <p class="muted">Opening session…</p>
+        </template>
+        <template data-wcs="if: sessionReady">
+          <p class="muted">Session ready.</p>
+        </template>
+
+        <template data-wcs="if: authError">
+          <p class="err">Auth error: {{ authErrorMessage }}</p>
+        </template>
+        <template data-wcs="if: sessionError">
+          <p class="err">Session error: {{ sessionError.message }}</p>
+        </template>
+
+        <template data-wcs="if: !isLoggedIn">
+          <button data-wcs="onclick: login">Sign in</button>
+        </template>
+        <template data-wcs="if: isLoggedIn">
+          <auth0-logout target="auth">Sign out</auth0-logout>
+        </template>
+      </section>
+
+      <template data-wcs="if: sessionReady">
+        <section>
+          <p>Count: <strong>{{ liveCount }}</strong></p>
+          <p class="muted">Last updated by: {{ liveAuthor }}</p>
+          <div class="row">
+            <button data-wcs="onclick: increment">+1</button>
+            <button data-wcs="onclick: decrement">−1</button>
+            <button data-wcs="onclick: reset">Reset</button>
+          </div>
+        </section>
+      </template>
+    </wcs-state>
+  </body>
+</html>
