@@ -2,7 +2,7 @@ import type { ClientTransport } from "@wc-bindable/remote";
 import { createRemoteCoreProxy } from "@wc-bindable/remote";
 import type { RemoteCoreProxy } from "@wc-bindable/remote";
 import type { WcBindableDeclaration, UnbindFn } from "@wc-bindable/core";
-import { bind } from "@wc-bindable/core";
+import { bind, isWcBindable } from "@wc-bindable/core";
 import { config } from "../config.js";
 import { ERROR_PREFIX, OWNERSHIP_ERROR_MARKER, isOwnershipError } from "../raiseError.js";
 import { IWcBindable } from "../types.js";
@@ -16,19 +16,46 @@ import type { Auth } from "./Auth.js";
  * the three-stage readiness sequence (authenticated → WebSocket connected
  * → initial sync complete) into a single declarative signal.
  *
- * Resolves the Core declaration by looking up `core` in the coreRegistry
- * (`registerCoreDeclaration(key, decl)`). When the target's
- * `authenticated` goes `true`, it:
+ * ## Core declaration source
+ *
+ * The Core's `wcBindable` declaration is sourced from one of two
+ * places, in priority order:
+ *
+ *   1. **Child payload element (preferred)** — the first direct
+ *      `HTMLElement` child whose constructor exposes a wc-bindable
+ *      declaration (`isWcBindable(child) === true`). The session
+ *      adopts that element as its data-plane facade: proxy property
+ *      events are mirrored onto the child, declared command names are
+ *      installed as forwarders that delegate to `proxy.invoke()`, and
+ *      `data-wcs` / `bind(child, ...)` work directly against the child.
+ *      The user owns the element class (and thus the schema) — there
+ *      is no string registry indirection.
+ *
+ *   2. **Legacy `core` attribute + registry** — when no wc-bindable
+ *      child is present and the `core` attribute is set, the session
+ *      looks up the declaration via `getCoreDeclaration(this.core)`.
+ *      The proxy is exposed as `.proxy` for applications that want to
+ *      bind to it directly.
+ *
+ * When neither source is available, the session sets `error` and stops.
+ * The `core` attribute and child payload are mutually exclusive: if a
+ * wc-bindable child is found, the `core` attribute is ignored.
+ *
+ * ## Lifecycle
+ *
+ * When the target's `authenticated` goes `true`, the session:
  *   1. Calls `authEl.connect()` to open the authenticated WebSocket.
  *   2. Wraps the returned transport with `createRemoteCoreProxy()`.
  *   3. Subscribes via `bind()` and treats the first callback batch as
- *      "sync complete" — at that point `ready` flips to `true`.
+ *      "sync complete" — at that point `ready` flips to `true`. While
+ *      streaming, each property update is mirrored onto the payload
+ *      child (when present) so that `bind(child, ...)` and `data-wcs`
+ *      observe a live state surface.
  *
- * The resulting proxy is exposed as `.proxy` (JS-only, for applications
- * that want to bind to Core properties directly). The session's own
- * bindable surface is intentionally minimal — `ready`, `connecting`,
- * `error` — so `data-wcs` can gate UI on `ready` without the application
- * having to re-implement "first batch" detection.
+ * The session's own bindable surface is intentionally minimal —
+ * `ready`, `connecting`, `error` — so `data-wcs` can gate UI on
+ * `ready` without applications having to re-implement "first batch"
+ * detection.
  */
 export class AuthSession extends HTMLElement {
   static hasConnectedCallbackPromise = true;
@@ -55,6 +82,12 @@ export class AuthSession extends HTMLElement {
   private _unbind: UnbindFn | null = null;
   private _authEl: Auth | null = null;
   private _coreDecl: WcBindableDeclaration | null = null;
+  private _payload: HTMLElement | null = null;
+  // Tracks property and command names installed as own-properties on
+  // `_payload` during the active session, so `_teardownProxy` can
+  // remove only what we added (and not blast over user-set props).
+  private _payloadInstalledProps: string[] = [];
+  private _payloadInstalledCmds: Array<{ name: string; forwarder: (...args: unknown[]) => unknown }> = [];
   private _authListener: ((e: Event) => void) | null = null;
   private _connectedListener: ((e: Event) => void) | null = null;
   private _connectedCallbackPromise: Promise<void> = Promise.resolve();
@@ -165,6 +198,18 @@ export class AuthSession extends HTMLElement {
    */
   get transport(): ClientTransport | null {
     return this._transport;
+  }
+
+  /**
+   * The wc-bindable child element adopted as the data-plane facade,
+   * or `null` when the session is using the legacy registry path
+   * (`core="..."` + `registerCoreDeclaration`) or has not yet started.
+   *
+   * Same lifecycle as `proxy`: set once `_startWatching` discovers a
+   * matching child, cleared on teardown.
+   */
+  get payload(): HTMLElement | null {
+    return this._payload;
   }
 
   /**
@@ -339,15 +384,56 @@ export class AuthSession extends HTMLElement {
     }
     this._authEl = auth;
 
-    const coreKey = this.core;
-    if (!coreKey) {
-      this._setError(new Error(`${ERROR_PREFIX} <auth0-session>: \`core\` attribute is required.`));
-      return;
+    // Discovery — child payload element (preferred) takes priority over the
+    // legacy `core` attribute + registry path. The session adopts the first
+    // direct child whose constructor declares `wcBindable`; users own the
+    // schema by defining the element class once.
+    //
+    // The discovery returns synchronously when every candidate child is
+    // already upgraded (or there are none). When at least one
+    // custom-element child is still unupgraded, it returns a Promise that
+    // awaits `customElements.whenDefined()` — covering a script-load
+    // order quirk (auth0-session defined before the user's element)
+    // without paying an unconditional microtask tick on the legacy
+    // `core` + registry path.
+    const discovered = this._resolvePayloadChild();
+    let childPayload: HTMLElement | null;
+    if (discovered instanceof Promise) {
+      childPayload = await discovered;
+      if (this._generation !== myGen) return;
+    } else {
+      childPayload = discovered;
     }
-    const decl = getCoreDeclaration(coreKey);
-    if (!decl) {
-      this._setError(new Error(`${ERROR_PREFIX} <auth0-session>: core "${coreKey}" is not registered. Call registerCoreDeclaration("${coreKey}", decl) first.`));
-      return;
+
+    let decl: WcBindableDeclaration | null = null;
+    if (childPayload) {
+      decl = (childPayload.constructor as unknown as { wcBindable?: WcBindableDeclaration }).wcBindable ?? null;
+      if (!decl) {
+        // isWcBindable returned true a moment ago, so this is paranoia —
+        // but a malformed declaration that lost its protocol/version
+        // tags between discovery and read should not silently produce
+        // an unhandled crash later.
+        this._setError(new Error(
+          `${ERROR_PREFIX} <auth0-session>: payload child <${childPayload.localName}> has no wcBindable declaration.`,
+        ));
+        return;
+      }
+      this._payload = childPayload;
+    } else {
+      const coreKey = this.core;
+      if (!coreKey) {
+        this._setError(new Error(
+          `${ERROR_PREFIX} <auth0-session>: no payload source. Either nest a wc-bindable child element inside <auth0-session>, ` +
+          "or set the `core` attribute and call registerCoreDeclaration() at bootstrap.",
+        ));
+        return;
+      }
+      const decl0 = getCoreDeclaration(coreKey);
+      if (!decl0) {
+        this._setError(new Error(`${ERROR_PREFIX} <auth0-session>: core "${coreKey}" is not registered. Call registerCoreDeclaration("${coreKey}", decl) first.`));
+        return;
+      }
+      decl = decl0;
     }
     this._coreDecl = decl;
 
@@ -505,6 +591,14 @@ export class AuthSession extends HTMLElement {
       const proxy = createRemoteCoreProxy(decl, transport);
       this._proxy = proxy;
 
+      // Install command forwarders on the payload child up-front, before
+      // the first sync arrives. Sync timing is server-driven, but commands
+      // can be invoked the moment the transport is open — installing here
+      // rather than from inside the bind callback makes `payload.cmd(...)`
+      // available as soon as `proxy` is set, not just after the first
+      // property event.
+      if (this._payload) this._installPayloadCommandForwarders(this._payload, proxy, decl);
+
       // First bind callback = first event from the proxy's `sync` handler.
       // `queueMicrotask` defers the ready flip to after the whole batch of
       // initial property events has been dispatched — matching the pattern
@@ -532,7 +626,20 @@ export class AuthSession extends HTMLElement {
       // synchronous teardown path between bind() entry and assignment.
       let firstBatch = true;
       let myUnbind: UnbindFn | null = null;
-      myUnbind = bind(proxy, (_name, _value) => {
+      myUnbind = bind(proxy, (name, value) => {
+        // Mirror property updates onto the payload child so that
+        // `bind(payload, ...)` and `data-wcs="prop: ..."` observe a
+        // live state surface without applications having to bridge
+        // the proxy themselves.
+        //
+        // The mirror writes BEFORE re-dispatching the event so that
+        // any listener registered on the payload (including @wc-bindable's
+        // own `bind()`) reads the up-to-date value when it inspects
+        // `payload[name]` after receiving the dispatch.
+        if (this._payload && this._proxy === proxy && this._generation === myGen) {
+          this._mirrorToPayload(this._payload, decl, name, value);
+        }
+
         if (firstBatch) {
           firstBatch = false;
           queueMicrotask(() => {
@@ -584,11 +691,233 @@ export class AuthSession extends HTMLElement {
       this._unbind();
       this._unbind = null;
     }
+    // Restore the payload child to the state it had before adoption.
+    // Removes only the own-properties WE installed (mirrored values and
+    // command forwarders); user-defined own-properties or prototype
+    // members are left untouched. Cleanup runs even when `_proxy` /
+    // `_transport` are already null because we may have installed
+    // command forwarders before the first sync.
+    this._uninstallPayloadForwarders();
+    this._payload = null;
     // NB: we do NOT close the transport here — the transport is owned by
     // AuthShell (via logout() or reconnect()). Dropping our reference is
     // enough; the underlying WebSocket is managed by the auth element.
     this._proxy = null;
     this._transport = null;
+  }
+
+  /**
+   * Find a direct child element that exposes a wc-bindable declaration
+   * on its constructor.
+   *
+   * Returns synchronously (the resolved value, possibly `null`) when
+   * every custom-element child is already upgraded — preserving
+   * exact microtask ordering for the legacy `core` + registry path,
+   * which is timing-sensitive in regression tests for in-flight
+   * teardown races.
+   *
+   * Returns a `Promise<HTMLElement | null>` only when at least one
+   * candidate child is an unupgraded custom element; the promise
+   * awaits `customElements.whenDefined` so a script-load order
+   * mismatch (auth0-session defined before the user's element class)
+   * does not produce a spurious "no payload" error.
+   *
+   * Tie-breaking differs between the two branches:
+   *
+   *   - **Sync branch**: strict DOM order — the first child for which
+   *     `isWcBindable` is true wins.
+   *   - **Async branch**: first wc-bindable *settler* wins, not strict
+   *     DOM order. A faster upgrade outranks a slower one. This trade
+   *     is deliberate so a perpetually-undefined sibling earlier in DOM
+   *     order does not deadlock discovery; see `_resolvePayloadChildAsync`
+   *     for the full rationale.
+   *
+   * Either way, only one child is adopted — SPEC-REMOTE §3.7 caps the
+   * connection at one proxy per session.
+   */
+  private _resolvePayloadChild(): HTMLElement | null | Promise<HTMLElement | null> {
+    let needsAsync = false;
+    for (const child of Array.from(this.children)) {
+      if (!(child instanceof HTMLElement)) continue;
+      if (isWcBindable(child)) return child;
+      const tag = child.localName;
+      if (tag.includes("-") && !customElements.get(tag)) {
+        needsAsync = true;
+      }
+    }
+    if (!needsAsync) return null;
+    return this._resolvePayloadChildAsync();
+  }
+
+  private _resolvePayloadChildAsync(): Promise<HTMLElement | null> {
+    // Wait for all candidates IN PARALLEL — never sequentially. A single
+    // unrelated unupgraded child (e.g. a typo'd or experimental
+    // `<unknown-widget>`) earlier in DOM order would otherwise block
+    // `customElements.whenDefined()` forever (the spec never rejects),
+    // pinning `connectedCallbackPromise` and starving the legacy-core
+    // fallback. Race the lot and resolve as soon as any candidate
+    // upgrades into a wc-bindable element.
+    //
+    // Resolution rules:
+    //   - First wc-bindable settler wins (NOT strict DOM order — a faster
+    //     upgrade outranks a slower one, which mirrors the practical
+    //     "earliest registered first" reality of script-driven defines).
+    //   - When every candidate has settled into a non-wc-bindable state
+    //     (or there are no candidates at all), resolve `null` so the
+    //     legacy `core` + registry path can run.
+    //   - When some candidates remain pending forever (defined-element
+    //     name nobody ever registers), the promise keeps waiting. This
+    //     is the unavoidable corner where "wait for upgrade" semantics
+    //     and "give up cleanly" semantics conflict — see SPEC-REMOTE
+    //     §3.7 for why we accept the stall over silently dropping a
+    //     payload that may legitimately upgrade later.
+    const candidates: HTMLElement[] = [];
+    for (const child of Array.from(this.children)) {
+      if (child instanceof HTMLElement) candidates.push(child);
+    }
+    return new Promise<HTMLElement | null>((resolve) => {
+      if (candidates.length === 0) { resolve(null); return; }
+      let pending = candidates.length;
+      let settled = false;
+      const win = (value: HTMLElement | null): void => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+      const finish = (child: HTMLElement): void => {
+        if (settled) return;
+        if (isWcBindable(child)) { win(child); return; }
+        if (--pending === 0) win(null);
+      };
+      for (const child of candidates) {
+        const tag = child.localName;
+        const isCustom = tag.includes("-");
+        // Already-upgraded (or non-custom) children resolve synchronously
+        // through the same `finish()` accounting so a mixed batch — some
+        // upgraded, some pending — converges correctly.
+        if (!isCustom || customElements.get(tag)) {
+          finish(child);
+          continue;
+        }
+        customElements.whenDefined(tag).then(
+          () => finish(child),
+          () => {
+            // whenDefined() does not reject in the spec, but defensively
+            // treat any failure as "this candidate is out of the running"
+            // so the pending counter still drains.
+            if (settled) return;
+            if (--pending === 0) win(null);
+          },
+        );
+      }
+    });
+  }
+
+  /**
+   * Mirror a single property update onto the payload child:
+   *   - install / overwrite an own data property `child[name] = value`
+   *   - re-dispatch the user's declared event on the child
+   *
+   * The own-property is configurable+writable so the next teardown can
+   * `delete` it to leave the child in a pristine state, and so a
+   * subsequent value can replace it without the noisy
+   * defineProperty-twice warning some engines emit on identical descriptors.
+   */
+  private _mirrorToPayload(
+    payload: HTMLElement,
+    decl: WcBindableDeclaration,
+    name: string,
+    value: unknown,
+  ): void {
+    Object.defineProperty(payload, name, {
+      value,
+      writable: true,
+      configurable: true,
+      enumerable: true,
+    });
+    if (this._payloadInstalledProps.indexOf(name) === -1) {
+      this._payloadInstalledProps.push(name);
+    }
+    const prop = decl.properties.find((p) => p.name === name);
+    if (!prop) return;
+    payload.dispatchEvent(new CustomEvent(prop.event, { detail: value, bubbles: true }));
+  }
+
+  /**
+   * Install one own-property forwarder per declared command.
+   *
+   * `payload.increment(...args)` ends up calling
+   * `proxy.invoke("increment", ...args)`, returning the proxy's promise
+   * so callers can `await` for the server's `return` frame. The
+   * forwarder uses the captured `proxy` reference rather than reading
+   * `this._proxy` so that a teardown that races a pending invocation
+   * still routes the call to the correct (now-disposed) proxy — which
+   * rejects with `_disposedError` rather than silently dropping the
+   * command.
+   *
+   * If the user's element class already defines the same name on its
+   * prototype, our forwarder shadows it via an own-property assignment
+   * for the duration of the session; teardown deletes the own-property
+   * so prototype lookup falls back to the user's method.
+   */
+  private _installPayloadCommandForwarders(
+    payload: HTMLElement,
+    proxy: RemoteCoreProxy,
+    decl: WcBindableDeclaration,
+  ): void {
+    const cmds = decl.commands;
+    if (!cmds) return;
+    for (const cmd of cmds) {
+      const name = cmd.name;
+      const forwarder = (...args: unknown[]) => proxy.invoke(name, ...args);
+      Object.defineProperty(payload, name, {
+        value: forwarder,
+        writable: true,
+        configurable: true,
+        enumerable: false,
+      });
+      this._payloadInstalledCmds.push({ name, forwarder });
+    }
+  }
+
+  private _uninstallPayloadForwarders(): void {
+    const payload = this._payload;
+    if (!payload) {
+      this._payloadInstalledProps.length = 0;
+      this._payloadInstalledCmds.length = 0;
+      return;
+    }
+    // Property mirrors — delete every name we installed (no identity
+    // check). Mirrored values are generic primitives (numbers, strings,
+    // user objects), so an identity check would be unreliable: a user
+    // who writes `payload.count = 5` between two server pushes that
+    // also report `5` would be treated as "still our value" and deleted
+    // anyway, while a user who happens to write a freshly-allocated
+    // object identical in shape to ours would be incorrectly preserved.
+    // The cleaner semantics are "session ends → mirror is reset to the
+    // pre-adoption state"; if a user wants to preserve their own value
+    // across teardown they can re-define the property after `error` /
+    // `ready=false` fires.
+    for (const propName of this._payloadInstalledProps) {
+      const desc = Object.getOwnPropertyDescriptor(payload, propName);
+      if (desc && desc.configurable) {
+        try { delete (payload as unknown as Record<string, unknown>)[propName]; } catch { /* noop */ }
+      }
+    }
+    this._payloadInstalledProps.length = 0;
+
+    // Command forwarders, by contrast, ARE compared by reference — each
+    // session installs a fresh closure (`(...args) => proxy.invoke(...)`)
+    // unique to that proxy instance, so identity is meaningful: a user
+    // who replaced the method with their own function never collides
+    // with our captured forwarder, and we only undo our own writes.
+    for (const { name, forwarder } of this._payloadInstalledCmds) {
+      const desc = Object.getOwnPropertyDescriptor(payload, name);
+      if (desc && desc.configurable && desc.value === forwarder) {
+        try { delete (payload as unknown as Record<string, unknown>)[name]; } catch { /* noop */ }
+      }
+    }
+    this._payloadInstalledCmds.length = 0;
   }
 
   /**

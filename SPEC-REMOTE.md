@@ -691,10 +691,14 @@ export class Auth extends HTMLElement {
 
 ```html
 <auth0-gate id="auth" remote-url="wss://..."></auth0-gate>
-<auth0-session target="auth" core="app-core"></auth0-session>
+<auth0-session target="auth">
+  <app-core-facade></app-core-facade>
+</auth0-session>
 ```
 
 `<auth0-session>` observes `auth0-gate:authenticated-changed`, calls `authEl.connect()` when the target becomes authenticated, wraps the transport with `createRemoteCoreProxy`, and owns the proxy lifecycle. This is the path whose `ready` signal is correct for gating UI (§3.1, §11).
+
+The `wcBindable` declaration is sourced from the **first wc-bindable child** (`<app-core-facade>` here — a user-defined custom element whose class declares `static wcBindable`). Property events from the proxy are mirrored onto that child as own data properties + the user-declared event names, and each declared command is installed on the child as an own-property forwarder that delegates to `proxy.invoke(...)`. The `core="..."` attribute + `registerCoreDeclaration()` registry path is preserved as a fallback for elements with no wc-bindable child but is not preferred for new code.
 
 **Pattern B — fully imperative:**
 

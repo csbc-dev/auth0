@@ -53,45 +53,33 @@ npm install @csbc-dev/auth0 @wc-bindable/remote @auth0/auth0-spa-js
 
 ## Quick Start
 
-The recommended declarative flow uses **two elements**:
+The recommended declarative flow uses **two elements** plus a **user-defined payload child**:
 
 - `<auth0-gate>` — the Auth0 gatekeeper (same element as local mode).
 - `<auth0-session>` — a companion that owns the remote session: calls `connect()` on login, wraps the returned transport with `createRemoteCoreProxy()`, and flips a single `ready` signal when the server's initial `sync` lands.
+- A **child custom element** whose class declares `static wcBindable` matching the server-side Core's surface. The session adopts that child as its data-plane facade.
 
 Without `<auth0-session>`, application code has to manually wire the transport → proxy → "first bind callback batch" → `synced` state machine. The session element collapses that into one declarative `ready` property.
 
-### 1. Register the Core declaration
+### 1. Define your payload element
 
-The session element resolves its Core declaration by string key from a process-wide registry. Register once at bootstrap:
-
-```ts
-import { registerCoreDeclaration } from "@csbc-dev/auth0";
-import { AppCore } from "./my-app-core.js";
-
-registerCoreDeclaration("app-core", AppCore.wcBindable);
-```
-
-Re-registering the same key with an identical reference is idempotent; re-registering with a different declaration throws (to avoid desynchronizing already-mounted session elements).
-
-#### HMR / hot reload
-
-Module reload swaps the declaration object reference, so a naive HMR cycle would hit the "different declaration" throw. The intent is to keep the production desync guard strict; for development, pair the registration with `unregisterCoreDeclaration(key)` in your bundler's HMR dispose hook:
+The Core's `wcBindable` declaration is the contract between client and server. Express it once as `static wcBindable` on a custom element class — same shape as the server-side Core. The element class needs no business logic; the session adopts it as a thin facade and forwards proxy events / commands onto it.
 
 ```ts
-import { registerCoreDeclaration, unregisterCoreDeclaration } from "@csbc-dev/auth0";
-import { AppCore } from "./my-app-core.js";
+import { AppCore } from "./shared/app-core.js";  // shared with the server
 
-// Vite / Webpack module HMR
-registerCoreDeclaration("app-core", AppCore.wcBindable);
-
-if (import.meta.hot) {
-  import.meta.hot.dispose(() => unregisterCoreDeclaration("app-core"));
+class AppCoreFacade extends HTMLElement {
+  // Same declaration as the server-side AppCore.
+  static wcBindable = AppCore.wcBindable;
 }
+customElements.define("app-core-facade", AppCoreFacade);
 ```
 
-This unregisters the prior declaration before the new module re-registers, so the next pass starts from an empty slot and `<auth0-session>` instances re-bind cleanly. Already-mounted sessions keep working against their captured declaration until they re-mount; if you need them to pick up the new declaration immediately, force a session remount in the same dispose hook.
+There is **no string-keyed registry** in this path — the schema lives in one place (the class) and is shared by reference between server and client (e.g. via a `shared/app-core.js` module imported by both). Each session adopts its own facade instance, and `data-wcs` / `bind()` work directly against that instance.
 
 ### 2. Declare the pair in markup
+
+Nest the payload child inside `<auth0-session>`. Bindings on the **payload child** read the Core's properties; bindings on `<auth0-session>` itself read its lifecycle (`ready`, `connecting`, `error`).
 
 ```html
 <script type="module" src="https://esm.run/@csbc-dev/auth0/auto"></script>
@@ -111,31 +99,46 @@ This unregisters the prior declaration before the new module re-registers, so th
 
 <auth0-session
   target="auth"
-  core="app-core"
   data-wcs="
     ready: sessionReady;
     connecting: sessionConnecting;
     error: sessionError
   ">
+  <app-core-facade
+    data-wcs="
+      count: liveCount;
+      lastUpdatedBy: liveAuthor
+    ">
+  </app-core-facade>
 </auth0-session>
 ```
 
-Because `remote-url` is set, `<auth0-gate>`'s `mode` defaults to `"remote"` — `authEl.token` is `null` and `authEl.getToken()` throws. `<auth0-session>` observes the target's `authenticated`, opens the WebSocket via `authEl.connect()`, builds the proxy, and fires `ready-changed` after sync completes.
+Because `remote-url` is set, `<auth0-gate>`'s `mode` defaults to `"remote"` — `authEl.token` is `null` and `authEl.getToken()` throws. `<auth0-session>` observes the target's `authenticated`, opens the WebSocket via `authEl.connect()`, builds the proxy from the **first child whose constructor declares `wcBindable`**, mirrors property events onto that child, and fires `ready-changed` after sync completes.
 
-### 3. Gate UI on `sessionReady`
+### 3. Gate UI on `sessionReady` and command the Core via the payload
 
 ```html
 <template data-wcs="if: sessionReady">
-  <!-- Core-backed UI, safe to render. -->
+  <p>Count: <span data-wcs="textContent: liveCount"></span></p>
+  <button data-wcs="onclick: increment">+1</button>
 </template>
 <template data-wcs="if: sessionConnecting">
   <p>Loading session...</p>
 </template>
 ```
 
-### 4. Access proxy state from JS (or bind it directly)
+`<auth0-session>` installs each declared command as an own-property forwarder on the payload child, so `payload.increment(...args)` resolves to `proxy.invoke("increment", ...args)`. From a state binding system, expose a method that calls the forwarder:
 
-The `RemoteCoreProxy` is exposed on the session element for imperative or framework-level binding:
+```js
+// inside <wcs-state>'s state object
+increment() {
+  document.querySelector("app-core-facade")?.increment();
+}
+```
+
+### 4. Access proxy state from JS (when not using the payload child)
+
+The `RemoteCoreProxy` is also exposed on the session for callers that want imperative access — useful for low-level inspection or when no payload child is in play:
 
 ```ts
 import { bind } from "@wc-bindable/core";
@@ -144,9 +147,26 @@ const session = document.querySelector("auth0-session");
 await session.connectedCallbackPromise;
 
 bind(session.proxy, (name, value) => {
-  // Core property updates — UI renders here.
+  // Same updates as those mirrored onto the payload child, raw from the proxy.
 });
 ```
+
+### Legacy: `core="..."` attribute + registry
+
+Before the payload-child pattern existed, sessions resolved their Core declaration through a **process-wide string registry**. This path still works and is selected when `<auth0-session>` has no wc-bindable child:
+
+```ts
+import { registerCoreDeclaration } from "@csbc-dev/auth0";
+import { AppCore } from "./my-app-core.js";
+
+registerCoreDeclaration("app-core", AppCore.wcBindable);
+```
+
+```html
+<auth0-session target="auth" core="app-core"></auth0-session>
+```
+
+Re-registering the same key with an identical reference is idempotent; a different declaration throws to keep already-mounted sessions consistent. For HMR, pair the registration with `unregisterCoreDeclaration(key)` in `import.meta.hot.dispose`. With the payload-child pattern, none of this is necessary — prefer that path for new code.
 
 ### Alternative: imperative flow (lower-level)
 
@@ -299,7 +319,7 @@ The companion element that turns the three-stage readiness sequence (authenticat
 | Attribute | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `target` | `string` | — | ID of the paired `<auth0-gate>` element. |
-| `core` | `string` | — | Key for a registered Core declaration. Look up via the registry (`registerCoreDeclaration`). |
+| `core` | `string` | — | **Legacy fallback.** Key for a registered Core declaration. Used only when no wc-bindable child is nested inside the session. New code should prefer the [payload-child pattern](#1-define-your-payload-element). |
 | `url` | `string` | — | WebSocket URL override. Falls back to the target's `remote-url`. **Read once per `_startWatching()` cycle.** Dynamic changes to either `<auth0-session>`'s `url` or the target `<auth0-gate>`'s `remote-url` AFTER the session has connected are NOT observed — the URL must be set before the session begins watching, or you must `start()` the session manually after the change. (`<auth0-session>`'s `attributeChangedCallback` re-runs `_startWatching()` only when the session is idle — `target` / `core` / `url` / `auto-connect` mutations against an already-open transport are coalesced but ignored until teardown.) |
 | `auto-connect` | `boolean` | `true` | Start the session automatically on `connectedCallback`. Set `auto-connect="false"` to defer and call `.start()` imperatively. |
 
@@ -309,26 +329,62 @@ The companion element that turns the three-stage readiness sequence (authenticat
 |----------|------|-------------|
 | `ready` | `boolean` | `true` once the proxy has delivered its first batch of sync values — the true "session ready" signal. |
 | `connecting` | `boolean` | `true` between `connect()` start and either `ready=true` or `error`. |
-| `error` | `Error \| null` | Any error from target resolution, registry lookup, transport handshake, or proxy construction. |
+| `error` | `Error \| null` | Any error from target resolution, payload resolution, transport handshake, or proxy construction. |
 
 ### JS-only accessors
 
 | Property / Method | Description |
 |-------------------|-------------|
-| `.proxy` | `RemoteCoreProxy \| null` — the bound proxy. Use `bind(session.proxy, ...)` to subscribe to Core properties. |
+| `.proxy` | `RemoteCoreProxy \| null` — the bound proxy. Use `bind(session.proxy, ...)` to subscribe to Core properties when no payload child is present. |
 | `.transport` | `ClientTransport \| null` — the transport returned by `authEl.connect()`. |
+| `.payload` | `HTMLElement \| null` — the wc-bindable child element adopted as the data-plane facade. `null` when the session is using the legacy `core="..."` registry path or has not yet started. |
 | `.start()` | Manually start the session (when `auto-connect="false"`, or to retry after an error). |
 
 ### Lifecycle
 
 1. On `connectedCallback`, defers one microtask so sibling `<auth0-gate>` has a chance to upgrade.
-2. Resolves `target` by ID and the core declaration by string key. Failure on either path sets `.error` and stops.
-3. Awaits the target's `connectedCallbackPromise`, then listens for `auth0-gate:authenticated-changed`.
-4. When the target is (or becomes) authenticated: calls `authEl.connect(url || target.remoteUrl)`, wraps the transport with `createRemoteCoreProxy(declaration, transport)`, and subscribes via `bind()`.
-5. The first bind callback queues a microtask that flips `ready` to `true` — this defers to the end of the initial sync batch, matching the `firstBatch` pattern from [SPEC-REMOTE §11](SPEC-REMOTE.md).
-6. When `authenticated` flips back to `false` (logout): tears down the proxy / bind subscription and clears `ready`. The WebSocket itself is owned by the target `<auth0-gate>`.
+2. Resolves `target` by ID. Failure sets `.error` and stops.
+3. **Discovery — payload child first**: scans direct light-DOM children for the first element where `isWcBindable(child)` is true. If at least one custom-element child has not yet been upgraded, awaits `customElements.whenDefined()` for it. The first wc-bindable child wins (SPEC-REMOTE §3.7 caps the connection at one proxy).
+4. **Discovery fallback — `core` attribute**: when no wc-bindable child is present and `core` is set, looks up the declaration in the process-wide registry. With neither source available, sets `.error` and stops.
+5. Awaits the target's `connectedCallbackPromise`, then listens for `auth0-gate:authenticated-changed`.
+6. When the target is (or becomes) authenticated: calls `authEl.connect(url || target.remoteUrl)`, wraps the transport with `createRemoteCoreProxy(declaration, transport)`, installs command forwarders on the payload child (when present), and subscribes via `bind()`.
+7. Each property update arriving on the proxy is mirrored onto the payload child as both an own data property (`child[name] = value`) and a re-dispatch of the user's declared event — so `data-wcs="prop: ..."` and `bind(child, ...)` observe a live state surface.
+8. The first bind callback queues a microtask that flips `ready` to `true` — this defers to the end of the initial sync batch, matching the `firstBatch` pattern from [SPEC-REMOTE §11](SPEC-REMOTE.md).
+9. When `authenticated` flips back to `false` (logout): tears down the proxy / bind subscription, removes the own-properties / forwarders we installed on the payload child, clears `ready`, and clears `.payload`. The WebSocket itself is owned by the target `<auth0-gate>`.
 
-### Core declaration registry
+### Payload child contract
+
+The session adopts the **first direct child** for which `target.constructor.wcBindable.protocol === "wc-bindable" && version === 1`. The schema lives once in the user's element class:
+
+```ts
+class MyPayload extends HTMLElement {
+  static wcBindable = {
+    protocol: "wc-bindable",
+    version: 1,
+    properties: [
+      { name: "count",         event: "my-payload:count-changed" },
+      { name: "lastUpdatedBy", event: "my-payload:last-updated-by-changed" },
+    ],
+    commands: [{ name: "increment" }, { name: "decrement" }, { name: "reset" }],
+  };
+}
+customElements.define("my-payload", MyPayload);
+```
+
+What `<auth0-session>` does to the adopted child while the session is live:
+
+| Mechanism | Effect |
+|-----------|--------|
+| Property mirror | `child[propName] = value` is written as a configurable, writable, enumerable own data property each time the proxy fires that property's event. The mirror happens BEFORE the re-dispatch so any listener that reads `child[name]` after receiving the dispatch sees the up-to-date value. |
+| Event re-dispatch | The user's declared `event` name (NOT the proxy's synthetic per-property event) is dispatched on the child — so `bind(child, ...)` from `@wc-bindable/core` and `data-wcs="prop: ..."` work directly against the child. |
+| Command forwarder | For each declared command, `child[cmdName]` is installed as a non-enumerable own-property function that delegates to `proxy.invoke(cmdName, ...args)` and returns the proxy's promise. Installed up-front (before the first sync) so callers can invoke commands as soon as the transport is open. |
+| Teardown cleanup | On logout / disconnect / element removal, every own-property the session installed is deleted via identity comparison — values mirrored from the proxy and command forwarders are removed only when the descriptor still matches what the session wrote. A user replacement made mid-session is left untouched. |
+
+The user's element class is intentionally **schema-only** — no methods, no constructor logic, no shadow DOM are required. If users add their own methods of the same name as a declared command, the session's forwarder shadows them as an own-property for the duration of the session and lifts the shadow on teardown so the prototype method comes back.
+
+### Legacy registry path
+
+When no wc-bindable child is present, the session falls back to looking up the declaration by string key:
 
 | Function | Description |
 |----------|-------------|
@@ -336,7 +392,7 @@ The companion element that turns the three-stage readiness sequence (authenticat
 | `getCoreDeclaration(key)` | Look up a declaration. Returns `undefined` if not registered. |
 | `unregisterCoreDeclaration(key)` | Remove an entry. Already-mounted sessions keep their captured declarations. |
 
-The registry is process-wide. Declarations are referenced by string so markup stays declarative; the JS object reference lives at bootstrap time only.
+The registry is process-wide. Prefer the payload-child pattern for new code: it removes the string-keyed indirection, the HMR dispose dance, and the same-module-instance gotcha that bites CDN deployments where `/auto` and the main entry can resolve to different module instances.
 
 ### Why `token` is absent from both surfaces
 

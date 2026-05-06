@@ -367,7 +367,7 @@ describe("AuthSession (auth0-session)", () => {
       expect(el.error?.message).toContain('target "missing" not found');
     });
 
-    it("sets error when core attribute is missing", async () => {
+    it("sets error when no payload source is provided", async () => {
       const authEl = document.createElement("auth0-gate") as Auth;
       authEl.id = "auth";
       authEl.setAttribute("domain", "d.auth0.com");
@@ -377,11 +377,16 @@ describe("AuthSession (auth0-session)", () => {
 
       const el = document.createElement("auth0-session") as AuthSession;
       el.target = "auth";
-      // no core attribute
+      // no `core` attribute and no wc-bindable child
       document.body.appendChild(el);
       await el.connectedCallbackPromise;
 
-      expect(el.error?.message).toContain("`core` attribute is required");
+      expect(el.error).toBeInstanceOf(Error);
+      // Error message names both supported sources so the developer sees
+      // which knobs are available (child element OR registry).
+      expect(el.error?.message).toContain("no payload source");
+      expect(el.error?.message).toContain("wc-bindable child");
+      expect(el.error?.message).toContain("`core` attribute");
     });
 
     it("sets error when core key is not registered", async () => {
@@ -1500,6 +1505,337 @@ describe("AuthSession (auth0-session)", () => {
       }));
       await new Promise((r) => setTimeout(r, 0));
       expect(connectSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("child payload pattern", () => {
+    // Counter to keep each test's custom-element tag unique — registering the
+    // same name twice throws, and `customElements` has no public unregister.
+    let payloadTagSeq = 0;
+    function definePayloadTag(decl: WcBindableDeclaration): string {
+      const tag = `test-payload-${++payloadTagSeq}`;
+      class PayloadEl extends HTMLElement {
+        static wcBindable = decl;
+      }
+      customElements.define(tag, PayloadEl);
+      return tag;
+    }
+
+    async function setupAuthenticated() {
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently: vi.fn().mockResolvedValue("jwt-token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const authEl = document.createElement("auth0-gate") as Auth;
+      authEl.id = "auth";
+      authEl.setAttribute("domain", "d.auth0.com");
+      authEl.setAttribute("client-id", "c");
+      authEl.setAttribute("remote-url", "wss://example.com/ws");
+      document.body.appendChild(authEl);
+      await authEl.connectedCallbackPromise;
+
+      const fakeTransport = { send: vi.fn(), onMessage: vi.fn(), onClose: vi.fn() };
+      vi.spyOn((authEl as any)._shell, "connect").mockResolvedValue(fakeTransport);
+
+      return { authEl, fakeTransport };
+    }
+
+    const PAYLOAD_DECL: WcBindableDeclaration = {
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [
+        { name: "count",         event: "test-payload:count-changed" },
+        { name: "lastUpdatedBy", event: "test-payload:last-updated-by-changed" },
+      ],
+      commands: [
+        { name: "increment" },
+        { name: "decrement" },
+        { name: "reset" },
+      ],
+    };
+
+    it("adopts the first wc-bindable child as the payload (no `core` attribute needed)", async () => {
+      await setupAuthenticated();
+      const tag = definePayloadTag(PAYLOAD_DECL);
+
+      const el = document.createElement("auth0-session") as AuthSession;
+      el.target = "auth";
+      // No `core` attribute, no registry entry — the child carries the schema.
+      const child = document.createElement(tag);
+      el.appendChild(child);
+      document.body.appendChild(el);
+
+      await el.connectedCallbackPromise;
+
+      expect(el.error).toBeNull();
+      expect(el.proxy).not.toBeNull();
+      expect(el.payload).toBe(child);
+    });
+
+    it("mirrors proxy property updates onto the payload child (own-property + event)", async () => {
+      await setupAuthenticated();
+      const tag = definePayloadTag(PAYLOAD_DECL);
+
+      const el = document.createElement("auth0-session") as AuthSession;
+      el.target = "auth";
+      const child = document.createElement(tag);
+      el.appendChild(child);
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      // Capture events dispatched on the child (not on the proxy or session).
+      const countEvents: number[] = [];
+      const userEvents: string[] = [];
+      child.addEventListener("test-payload:count-changed",
+        (e) => countEvents.push((e as CustomEvent).detail));
+      child.addEventListener("test-payload:last-updated-by-changed",
+        (e) => userEvents.push((e as CustomEvent).detail));
+
+      (el.proxy as any)._simulateSync({ count: 5, lastUpdatedBy: "alice@example.com" });
+
+      // Properties land on the child as own data properties.
+      expect((child as any).count).toBe(5);
+      expect((child as any).lastUpdatedBy).toBe("alice@example.com");
+
+      // Original event names from the user's declaration are dispatched on
+      // the child — NOT the proxy's synthetic names.
+      expect(countEvents).toEqual([5]);
+      expect(userEvents).toEqual(["alice@example.com"]);
+    });
+
+    it("installs command forwarders on the payload that route to proxy.invoke()", async () => {
+      await setupAuthenticated();
+      const tag = definePayloadTag(PAYLOAD_DECL);
+
+      const el = document.createElement("auth0-session") as AuthSession;
+      el.target = "auth";
+      const child = document.createElement(tag);
+      el.appendChild(child);
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      // Command names are own-properties on the child after connect.
+      expect(typeof (child as any).increment).toBe("function");
+      expect(typeof (child as any).decrement).toBe("function");
+      expect(typeof (child as any).reset).toBe("function");
+
+      // Spy on the proxy's invoke() to confirm forwarding.
+      const invokeSpy = vi.fn().mockResolvedValue(undefined);
+      (el.proxy as any).invoke = invokeSpy;
+
+      (child as any).increment(1, 2);
+      (child as any).reset();
+
+      expect(invokeSpy).toHaveBeenNthCalledWith(1, "increment", 1, 2);
+      expect(invokeSpy).toHaveBeenNthCalledWith(2, "reset");
+    });
+
+    it("`bind(child, ...)` from @wc-bindable/core observes mirrored updates", async () => {
+      const { bind } = await import("@wc-bindable/core");
+      await setupAuthenticated();
+      const tag = definePayloadTag(PAYLOAD_DECL);
+
+      const el = document.createElement("auth0-session") as AuthSession;
+      el.target = "auth";
+      const child = document.createElement(tag);
+      el.appendChild(child);
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      const updates: Array<[string, unknown]> = [];
+      const unbind = bind(child, (name, value) => {
+        updates.push([name, value]);
+      });
+
+      // bind() skips the initial-value callback when `target[name]` is
+      // undefined (see `@wc-bindable/core`'s `bind`). At this point, no
+      // sync has arrived so child[name] is undefined — `updates` stays
+      // empty until a property event fires.
+      expect(updates).toEqual([]);
+
+      // Now simulate the server sync — bind's listener fires for each prop.
+      (el.proxy as any)._simulateSync({ count: 7, lastUpdatedBy: "bob@example.com" });
+
+      expect(updates).toContainEqual(["count", 7]);
+      expect(updates).toContainEqual(["lastUpdatedBy", "bob@example.com"]);
+
+      unbind();
+    });
+
+    it("child payload takes precedence over a registered `core` key", async () => {
+      await setupAuthenticated();
+      const tag = definePayloadTag(PAYLOAD_DECL);
+
+      // Register a different decl in the registry; child should win.
+      registerCoreDeclaration("legacy-core", SAMPLE_DECL);
+
+      const el = document.createElement("auth0-session") as AuthSession;
+      el.target = "auth";
+      el.core = "legacy-core";
+      const child = document.createElement(tag);
+      el.appendChild(child);
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      expect(el.payload).toBe(child);
+      // The child's wcBindable (count, lastUpdatedBy) should be in effect —
+      // not the legacy registry's (currentUser, items). Verify by checking
+      // a count event mirrors but a currentUser event does not (the proxy
+      // only knows about properties from the active declaration).
+      (el.proxy as any)._simulateSync({ count: 42 });
+      expect((child as any).count).toBe(42);
+      expect((child as any).currentUser).toBeUndefined();
+    });
+
+    it("does not deadlock when an unrelated unupgraded custom element precedes the payload child", async () => {
+      // Regression: a sequential `await whenDefined(tag)` over children
+      // would block forever on a perpetually-undefined sibling and
+      // starve both the payload pickup and the legacy fallback. Verify
+      // the parallel-race resolution lets the real payload win.
+      await setupAuthenticated();
+      const payloadTag = definePayloadTag(PAYLOAD_DECL);
+
+      const el = document.createElement("auth0-session") as AuthSession;
+      el.target = "auth";
+
+      // Stranger first — `<perma-undefined-...>` is never registered.
+      const stranger = document.createElement(`perma-undefined-${++payloadTagSeq}`);
+      const child = document.createElement(payloadTag);
+      el.appendChild(stranger);
+      el.appendChild(child);
+
+      document.body.appendChild(el);
+
+      // If the discovery were sequential, this await would never resolve.
+      // Race against a generous timeout to fail loudly instead of hanging.
+      const timeout = new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 250));
+      const winner = await Promise.race([
+        el.connectedCallbackPromise.then(() => "ok" as const),
+        timeout,
+      ]);
+
+      expect(winner).toBe("ok");
+      expect(el.error).toBeNull();
+      expect(el.payload?.localName).toBe(payloadTag);
+    });
+
+    it("waits for an unupgraded custom-element child via customElements.whenDefined", async () => {
+      await setupAuthenticated();
+
+      // Use a tag name that is not yet defined when the session connects.
+      const tag = `test-payload-late-${++payloadTagSeq}`;
+      const child = document.createElement(tag);
+      // The child is HTMLUnknownElement at this point — isWcBindable is false.
+
+      const el = document.createElement("auth0-session") as AuthSession;
+      el.target = "auth";
+      el.appendChild(child);
+      document.body.appendChild(el);
+
+      // Define the element AFTER appending. The session's discovery should
+      // await whenDefined and pick the child up once it upgrades.
+      class LatePayload extends HTMLElement {
+        static wcBindable = PAYLOAD_DECL;
+      }
+      customElements.define(tag, LatePayload);
+
+      await el.connectedCallbackPromise;
+
+      // Identity comparison can be brittle across DOM upgrade paths
+      // (some implementations swap the element instance on upgrade
+      // rather than its prototype). Verify by tag and proxy presence
+      // instead, which is what callers actually care about.
+      expect(el.error).toBeNull();
+      expect(el.payload).not.toBeNull();
+      expect(el.payload!.localName).toBe(tag);
+      expect(el.proxy).not.toBeNull();
+    });
+
+    it("teardown removes mirrored properties and command forwarders from the child", async () => {
+      const { authEl } = await setupAuthenticated();
+      const tag = definePayloadTag(PAYLOAD_DECL);
+
+      const el = document.createElement("auth0-session") as AuthSession;
+      el.target = "auth";
+      const child = document.createElement(tag);
+      el.appendChild(child);
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      (el.proxy as any)._simulateSync({ count: 9, lastUpdatedBy: "u@e.com" });
+      expect((child as any).count).toBe(9);
+      expect(typeof (child as any).increment).toBe("function");
+
+      // Tear down via authenticated-changed: false.
+      authEl.dispatchEvent(new CustomEvent("auth0-gate:authenticated-changed", {
+        detail: false,
+      }));
+
+      // After teardown, the own-properties WE installed are gone.
+      expect(Object.prototype.hasOwnProperty.call(child, "count")).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(child, "lastUpdatedBy")).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(child, "increment")).toBe(false);
+      expect(el.payload).toBeNull();
+      expect(el.proxy).toBeNull();
+    });
+
+    it("teardown deletes mirrored property values even when the user overwrote them mid-session (intentional)", async () => {
+      // The mirror writes generic values (numbers / strings), so identity
+      // comparison would be unreliable — a user write of `payload.count = 5`
+      // between two server pushes that also report 5 is indistinguishable
+      // from "still ours". The session opts for "session ends → mirror is
+      // reset" instead of trying to preserve user writes.
+      const { authEl } = await setupAuthenticated();
+      const tag = definePayloadTag(PAYLOAD_DECL);
+
+      const el = document.createElement("auth0-session") as AuthSession;
+      el.target = "auth";
+      const child = document.createElement(tag);
+      el.appendChild(child);
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      (el.proxy as any)._simulateSync({ count: 1 });
+      // User overwrites the mirrored value.
+      (child as any).count = 99;
+      expect((child as any).count).toBe(99);
+
+      authEl.dispatchEvent(new CustomEvent("auth0-gate:authenticated-changed", {
+        detail: false,
+      }));
+
+      // Documented behaviour: teardown removes the own-property regardless
+      // of whether we wrote 1 or the user wrote 99 — the mirror is reset.
+      expect(Object.prototype.hasOwnProperty.call(child, "count")).toBe(false);
+    });
+
+    it("preserves a user-replaced command forwarder on teardown (identity match required)", async () => {
+      const { authEl } = await setupAuthenticated();
+      const tag = definePayloadTag(PAYLOAD_DECL);
+
+      const el = document.createElement("auth0-session") as AuthSession;
+      el.target = "auth";
+      const child = document.createElement(tag);
+      el.appendChild(child);
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      (el.proxy as any)._simulateSync({ count: 1 });
+      expect((child as any).count).toBe(1);
+
+      // User replaces our forwarder mid-session.
+      const userIncrement = vi.fn();
+      (child as any).increment = userIncrement;
+
+      authEl.dispatchEvent(new CustomEvent("auth0-gate:authenticated-changed", {
+        detail: false,
+      }));
+
+      // Our identity check sees the user's replacement and leaves it alone.
+      expect((child as any).increment).toBe(userIncrement);
     });
   });
 
