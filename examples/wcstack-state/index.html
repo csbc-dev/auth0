@@ -16,11 +16,9 @@
 
     <!--
       Define the payload custom element. The session adopts the first
-      wc-bindable child, looking it up through `child.constructor.wcBindable`
-      — which is independent of which module instance defined it, so we no
-      longer need to import bootstrapAuth ourselves to guarantee a shared
-      instance with @csbc-dev/auth0/auto. The /auto entries below run their
-      own bootstrap calls.
+      wc-bindable child via `child.constructor.wcBindable`, which is
+      module-instance agnostic — no need to share the bootstrap call
+      with @csbc-dev/auth0/auto.
     -->
     <script type="module">
       class AppCoreFacade extends HTMLElement {
@@ -49,11 +47,33 @@
 
     <wcs-state>
       <script type="module">
-        // Methods on the state read live values from <app-core-facade>'s
-        // own-properties (mirrored by the session) and route command calls
-        // through the forwarders <auth0-session> installed on the same
-        // element. No `bind(session.proxy)` bridge needed.
+        // Single hardcoded value — the URL of the example server's
+        // /auth-config endpoint. Everything else (Auth0 domain /
+        // client-id / audience / WebSocket URL) is fetched at boot
+        // and pushed into <auth0-gate> via wcstack/state's attribute
+        // bindings (`attr.<name>: <stateProp>`).
+        //
+        // <auth0-gate> waits for `domain` + `client-id` before calling
+        // initialize(): until they arrive the element sits inert and
+        // the data-wcs `loading: authLoading` binding shows the
+        // "Loading Auth0…" template.
+        //
+        // See ../../docs/patterns/server-config-discovery.md for the
+        // full pattern + threat model.
+        const CONFIG_URL = "http://localhost:3000/auth-config";
+
         export default {
+          // Auth0 config — populated by $connectedCallback below, then
+          // mirrored onto <auth0-gate> via attr.* bindings. Empty
+          // strings are intentional: <auth0-gate>'s mode inference
+          // treats `remote-url=""` as unset (does not flip into remote
+          // mode prematurely while config is loading).
+          auth0Domain:   "",
+          auth0ClientId: "",
+          auth0Audience: "",
+          remoteUrl:     "",
+          redirectUri:   window.location.origin,
+
           // <auth0-gate> output bindings.
           isLoggedIn: false,
           currentUser: null,
@@ -67,12 +87,28 @@
           sessionConnecting: false,
           sessionError: null,
 
-          // <app-core-facade> output bindings — declared up-front so the
-          // path strings used in `data-wcs="count: liveCount; ..."` and
-          // the `{{ liveCount }} / {{ liveAuthor }}` mustaches resolve
-          // to real state paths that wcstack tracks reactively.
+          // <app-core-facade> output bindings.
           liveCount: 0,
           liveAuthor: "",
+
+          // wcstack/state lifecycle hook — fires once after the
+          // <wcs-state> element is connected and the state has been
+          // wired to the DOM. We do the config fetch here and push
+          // values into state; the attr.* bindings propagate to
+          // <auth0-gate> automatically.
+          async $connectedCallback() {
+            const res = await fetch(CONFIG_URL);
+            if (!res.ok) {
+              this.authError = new Error(`config fetch failed: HTTP ${res.status}`);
+              this.authLoading = false;
+              return;
+            }
+            const cfg = await res.json();
+            this.auth0Domain   = cfg.domain;
+            this.auth0ClientId = cfg.clientId;
+            this.auth0Audience = cfg.audience;
+            this.remoteUrl     = cfg.remoteUrl;
+          },
 
           get authErrorMessage() {
             const e = this.authError;
@@ -90,23 +126,20 @@
         };
       </script>
 
-      <!--
-        EDIT these four attributes for your tenant. They are static HTML
-        attributes (not data-wcs bindings) — same pattern as README-LOCAL.md.
-      -->
       <auth0-gate
         id="auth"
-        domain="your-tenant.auth0.com"
-        client-id="your-client-id"
-        audience="https://api.example.com"
-        remote-url="ws://localhost:3000"
         data-wcs="
-          authenticated: isLoggedIn;
-          user:          currentUser;
-          loading:       authLoading;
-          error:         authError;
-          connected:     wsConnected;
-          trigger:       shouldLogin
+          attr.domain:       auth0Domain;
+          attr.client-id:    auth0ClientId;
+          attr.audience:     auth0Audience;
+          attr.remote-url:   remoteUrl;
+          attr.redirect-uri: redirectUri;
+          authenticated:     isLoggedIn;
+          user:              currentUser;
+          loading:           authLoading;
+          error:             authError;
+          connected:         wsConnected;
+          trigger:           shouldLogin
         ">
       </auth0-gate>
 

@@ -43,7 +43,7 @@ npm install
 npm run dev
 ```
 
-For `wcstack-state/` see its [README](wcstack-state/README.md) — it has no bundler and you edit the constants in `index.html` directly.
+For `wcstack-state/` see its [README](wcstack-state/README.md) — it has no bundler. Tenant values come from the example server's `/auth-config` endpoint at boot (see [docs/patterns/server-config-discovery.md](../docs/patterns/server-config-discovery.md)), so the only constant in the HTML is `CONFIG_URL` (defaults to `http://localhost:3000/auth-config`).
 
 ## Port assignments
 

@@ -14,6 +14,14 @@ For the WebSocket-backed deployment where the token never reaches application co
 
 Each guide is ~5 minutes end-to-end. They share the same Auth0 setup below; do that once first.
 
+## Patterns
+
+Cross-cutting recipes that apply on top of any framework / mode.
+
+| Pattern | Doc |
+|---|---|
+| Server-hosted Auth0 config (no env in static HTML) | [patterns/server-config-discovery.md](patterns/server-config-discovery.md) |
+
 ## When to pick Local vs Remote
 
 | | Local mode (these docs) | Remote mode ([README-REMOTE.md](../README-REMOTE.md)) |
