@@ -91,6 +91,14 @@
           liveCount: 0,
           liveAuthor: "",
 
+          // Command tokens delivered to <app-core-facade> by wcstack/state.
+          // The facade element exposes increment / decrement / reset in its
+          // `static wcBindable.commands`, and <auth0-session> installs them
+          // as own-property forwarders that call `proxy.invoke(...)`. The
+          // `command.<name>: <token>` bindings below subscribe each forwarder
+          // to its token, so emitting the token fires the proxy command.
+          $commandTokens: ["increment", "decrement", "reset"],
+
           // wcstack/state lifecycle hook — fires once after the
           // <wcs-state> element is connected and the state has been
           // wired to the DOM. We do the config fetch here and push
@@ -120,9 +128,16 @@
 
           login() { this.shouldLogin = true; },
 
-          increment() { document.querySelector("app-core-facade")?.increment?.(); },
-          decrement() { document.querySelector("app-core-facade")?.decrement?.(); },
-          reset()     { document.querySelector("app-core-facade")?.reset?.(); },
+          // Button click handlers — each emits to a command token. The
+          // matching `command.<name>:` binding on <app-core-facade> routes
+          // the emit to the proxy forwarder, which in turn calls
+          // `proxy.invoke(...)` over the WebSocket. No `document.querySelector`
+          // / element lookup needed: state and element are decoupled by the
+          // token, so reordering or duplicating the facade does not break
+          // these handlers.
+          incrementClick() { this.$command.increment.emit(); },
+          decrementClick() { this.$command.decrement.emit(); },
+          resetClick()     { this.$command.reset.emit(); },
         };
       </script>
 
@@ -157,11 +172,21 @@
           declared events on it, and installs `increment` / `decrement` /
           `reset` as command forwarders. data-wcs reads directly from
           this element, no extra bridging code in the state.
+
+          The `command.<name>: <token>` lines subscribe each forwarder to
+          a wcstack/state command token. When state calls
+          `this.$command.increment.emit()`, wcstack/state invokes the
+          facade's `increment` forwarder, which routes to `proxy.invoke()`.
+          `command.<name>` is validated against `static wcBindable.commands`
+          on the facade at binding time.
         -->
         <app-core-facade
           data-wcs="
-            count:         liveCount;
-            lastUpdatedBy: liveAuthor
+            count:             liveCount;
+            lastUpdatedBy:     liveAuthor;
+            command.increment: increment;
+            command.decrement: decrement;
+            command.reset:     reset
           ">
         </app-core-facade>
       </auth0-session>
@@ -200,9 +225,9 @@
           <p>Count: <strong>{{ liveCount }}</strong></p>
           <p class="muted">Last updated by: {{ liveAuthor }}</p>
           <div class="row">
-            <button data-wcs="onclick: increment">+1</button>
-            <button data-wcs="onclick: decrement">−1</button>
-            <button data-wcs="onclick: reset">Reset</button>
+            <button data-wcs="onclick: incrementClick">+1</button>
+            <button data-wcs="onclick: decrementClick">−1</button>
+            <button data-wcs="onclick: resetClick">Reset</button>
           </div>
         </section>
       </template>
