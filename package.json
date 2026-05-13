@@ -1,6 +1,6 @@
 {
   "name": "@csbc-dev/auth0",
-  "version": "0.4.0",
+  "version": "0.1.0",
   "description": "Declarative Auth0 authentication component for Web Components. Framework-agnostic auth via wc-bindable-protocol.",
   "type": "module",
   "main": "dist/index.js",
@@ -67,8 +67,7 @@
   "author": "mogera551",
   "repository": {
     "type": "git",
-    "url": "https://github.com/wc-bindable-protocol/wc-bindable-protocol.git",
-    "directory": "packages/auth0"
+    "url": "https://github.com/csbc-dev/auth0.git"
   },
   "license": "MIT",
   "devDependencies": {
