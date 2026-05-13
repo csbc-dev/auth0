@@ -1,6 +1,6 @@
 {
   "name": "@csbc-dev/auth0",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Declarative Auth0 authentication component for Web Components. Framework-agnostic auth via wc-bindable-protocol.",
   "type": "module",
   "main": "dist/index.js",
@@ -48,8 +48,8 @@
     "framework-agnostic"
   ],
   "dependencies": {
-    "@wc-bindable/core": "^0.4.0",
-    "@wc-bindable/remote": "file:../../wc-bindable-protocol/wc-bindable-protocol/packages/remote",
+    "@wc-bindable/core": "^0.5.0",
+    "@wc-bindable/remote": "^0.5.0",
     "jose": "^6.0.0"
   },
   "peerDependencies": {
