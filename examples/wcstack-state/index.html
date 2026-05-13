@@ -184,9 +184,9 @@
           data-wcs="
             count:             liveCount;
             lastUpdatedBy:     liveAuthor;
-            command.increment: increment;
-            command.decrement: decrement;
-            command.reset:     reset
+            command.increment: $command.increment;
+            command.decrement: $command.decrement;
+            command.reset:     $command.reset
           ">
         </app-core-facade>
       </auth0-session>
@@ -195,7 +195,7 @@
         <template data-wcs="if: authLoading">
           <p class="muted">Loading Auth0…</p>
         </template>
-        <template data-wcs="if: !isLoggedIn">
+        <template data-wcs="if: isLoggedIn|not">
           <p class="muted">Signed out.</p>
         </template>
         <template data-wcs="if: sessionConnecting">
@@ -212,7 +212,7 @@
           <p class="err">Session error: {{ sessionError.message }}</p>
         </template>
 
-        <template data-wcs="if: !isLoggedIn">
+        <template data-wcs="if: isLoggedIn|not">
           <button data-wcs="onclick: login">Sign in</button>
         </template>
         <template data-wcs="if: isLoggedIn">
