@@ -6,6 +6,19 @@
 // This file deliberately does NOT reference `HTMLElement` or `customElements`,
 // so it loads safely under Node (where the example server imports it).
 // The browser-only payload facade lives in `./appCoreFacade.js`.
+//
+// LIFETIME / STATE PERSISTENCE — IMPORTANT FOR ANYONE BUILDING ON THIS.
+// `AppCore` is instantiated by `createCores: user => new AppCore(user)` on
+// the server, ONCE per authenticated WebSocket connection. The `count`
+// field lives in JS memory inside the instance and is GC'd when the
+// WebSocket closes (logout, browser reload, network drop, server restart).
+// Reconnection — `AuthShell.reconnect()` or `<auth0-session>`'s
+// auto-restart — opens a fresh socket, which gets a fresh `AppCore`, so
+// the wire is restored but the count resets to 0. Demo behaviour is
+// intentional and matches the architecture diagram ("server-side Core
+// per session"). Anything beyond a demo needs an explicit persistence
+// layer — typically: write to Redis / Postgres on each command, hydrate
+// in `createCores` from the user's `sub`.
 
 export const appCoreDeclaration = {
   protocol: "wc-bindable",

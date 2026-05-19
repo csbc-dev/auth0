@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import type { ReactNode } from "react";
 import { useWcBindable } from "@wc-bindable/react";
 import type { Auth, AuthSession, AuthValues } from "@csbc-dev/auth0";
 
@@ -15,6 +15,15 @@ interface FacadeValues {
 }
 interface FacadeElement extends HTMLElement, FacadeValues {
   // Command forwarders installed by <auth0-session> at connect time.
+  // Marked optional because they do NOT exist on the element before the
+  // session connects (own-property assignments happen inside
+  // AuthSession._installPayloadCommandForwarders). Once
+  // `sessionValues.ready === true` they are guaranteed to be present —
+  // AuthSession installs forwarders synchronously BEFORE registering
+  // `bind()`, and `ready` only flips after `bind()` has dispatched its
+  // first batch (see src/components/AuthSession.ts:594-651). The
+  // `ready && ...` render guard below is therefore the contract that
+  // makes the `.increment?.()` call safe.
   increment?: (...args: unknown[]) => Promise<unknown>;
   decrement?: (...args: unknown[]) => Promise<unknown>;
   reset?: (...args: unknown[]) => Promise<unknown>;
@@ -37,17 +46,9 @@ export default function App() {
   // Bind directly on the payload child — the session mirrors property
   // updates onto it as own data properties + the user-declared events,
   // so `useWcBindable` against the facade sees the live Core surface
-  // with no manual proxy bridging.
+  // with no manual proxy bridging. The same ref is what we call command
+  // forwarders through in the click handlers below; no second ref needed.
   const [facadeRef, facadeValues] = useWcBindable<FacadeElement, FacadeValues>();
-
-  // Snapshot of the latest facade ref, used by command-button click handlers.
-  // The command forwarders (increment / decrement / reset) are own-properties
-  // installed by <auth0-session> after connect — call them through the ref.
-  const facade = useRef<FacadeElement | null>(null);
-  // Keep `facade` in sync with `facadeRef`. useWcBindable's ref is mutated
-  // synchronously when the underlying element mounts; mirror it so command
-  // handlers can read it without going through useWcBindable's hook output.
-  facade.current = facadeRef.current;
 
   const status =
     authValues.loading           ? "Loading Auth0…" :
@@ -93,9 +94,9 @@ export default function App() {
           <p>Count: <strong>{facadeValues.count ?? 0}</strong></p>
           <p style={{ color: "#666" }}>Last updated by: {facadeValues.lastUpdatedBy ?? ""}</p>
           <Row>
-            <button onClick={() => facade.current?.increment?.()}>+1</button>
-            <button onClick={() => facade.current?.decrement?.()}>−1</button>
-            <button onClick={() => facade.current?.reset?.()}>Reset</button>
+            <button onClick={() => facadeRef.current?.increment?.()}>+1</button>
+            <button onClick={() => facadeRef.current?.decrement?.()}>−1</button>
+            <button onClick={() => facadeRef.current?.reset?.()}>Reset</button>
           </Row>
         </Section>
       )}
@@ -103,9 +104,9 @@ export default function App() {
   );
 }
 
-function Section({ children }: { children: React.ReactNode }) {
+function Section({ children }: { children: ReactNode }) {
   return <section style={{ margin: "1rem 0", padding: "1rem", border: "1px solid #ddd", borderRadius: 6 }}>{children}</section>;
 }
-function Row({ children }: { children: React.ReactNode }) {
+function Row({ children }: { children: ReactNode }) {
   return <div style={{ display: "flex", gap: "0.5rem" }}>{children}</div>;
 }

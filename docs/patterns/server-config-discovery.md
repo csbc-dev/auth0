@@ -46,27 +46,22 @@ A `GET /auth-config` endpoint is therefore a **delivery convenience**, not a sec
       │                                            │   per SPEC-REMOTE.md)
 ```
 
-## Server side (~30 lines)
+## Server side (~50 lines)
 
-The example server wires this on top of `createAuthenticatedWSS` by replacing the underlying `http.Server`'s default 426 response handler. The server already exists — `ws` creates one when you pass `port` — and we just route one extra path through it.
+The example server owns its `http.Server` directly and attaches `ws` via `noServer: true`, so the `/auth-config` route is just an `http` handler on a server we created. The token verification + Core construction stack from `@csbc-dev/auth0/server` (`verifyAuth0Token` / `extractTokenFromProtocol` / `handleConnection`) is wired into the upgrade event by hand. This composition is the same pattern documented for production deployments — no reliance on `ws` internals.
 
 ```js
-// examples/server/server.js (excerpt — see file for full version)
-import { createAuthenticatedWSS } from "@csbc-dev/auth0/server";
+// examples/server/server.js (excerpt — see file for the full version)
+import { createServer } from "node:http";
+import { WebSocketServer } from "ws";
+import {
+  handleConnection,
+  verifyAuth0Token,
+  extractTokenFromProtocol,
+} from "@csbc-dev/auth0/server";
 
-const wss = await createAuthenticatedWSS({
-  port,
-  auth0Domain,
-  auth0Audience,
-  allowedOrigins,
-  createCores: (user) => new AppCore(user),
-  // ...
-});
-
-const httpServer = wss._server;             // http.Server that ws created
-httpServer.removeAllListeners("request");
-httpServer.on("request", (req, res) => {
-  // CORS: reuse the same allowlist as verifyClient.
+const httpServer = createServer((req, res) => {
+  // CORS — reuse the same allowlist that gates the WebSocket upgrade.
   const origin = req.headers.origin;
   if (allowedOrigins.length === 0) {
     res.setHeader("Access-Control-Allow-Origin", "*");
@@ -74,13 +69,7 @@ httpServer.on("request", (req, res) => {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
   }
-
-  if (req.method === "OPTIONS") {
-    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-    res.statusCode = 204;
-    res.end();
-    return;
-  }
+  // …OPTIONS preflight…
 
   if (req.method === "GET" && req.url === "/auth-config") {
     res.setHeader("Content-Type", "application/json; charset=utf-8");
@@ -89,22 +78,44 @@ httpServer.on("request", (req, res) => {
       domain:    auth0Domain,
       clientId:  auth0ClientId,
       audience:  auth0Audience,
-      remoteUrl: `ws://localhost:${port}`,
+      remoteUrl: resolveRemoteUrl(req),   // ← derived from Host / X-Forwarded-Proto
     }));
     return;
   }
 
-  // ws's default response for non-upgrade traffic.
-  const body = "Upgrade Required";
-  res.writeHead(426, { "Content-Type": "text/plain", "Content-Length": String(body.length) });
-  res.end(body);
+  res.writeHead(426, { "Content-Type": "text/plain" });
+  res.end("Upgrade Required");
 });
+
+const wss = new WebSocketServer({ noServer: true, /* …maxPayload, handleProtocols… */ });
+
+httpServer.on("upgrade", (req, socket, head) => {
+  // origin check + verifyAuth0Token BEFORE handleUpgrade — bad tokens
+  // never get a 101 response.
+  // …rejectUpgrade(socket, 401, "Unauthorized") on failure…
+  const token = extractTokenFromProtocol(req.headers["sec-websocket-protocol"]);
+  verifyAuth0Token(token, { domain: auth0Domain, audience: auth0Audience })
+    .then((user) => wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req, user)));
+});
+
+wss.on("connection", (ws, req, preVerifiedUser) => {
+  handleConnection(ws, req.headers["sec-websocket-protocol"], {
+    auth0Domain,
+    auth0Audience,
+    createCores: (user) => new AppCore(user),
+    onTokenRefresh: (core, user) => core.updateUser(user),
+    preVerifiedUser,
+  });
+});
+
+httpServer.listen(port);
 ```
 
 Notes:
 
-- `wss._server` is a private-but-stable property of the `ws` library when you construct with `{ port }`. It has been the same name across `ws@7` / `ws@8` and is widely used by the ecosystem. Production deployments that want a fully public API surface should construct `WebSocketServer({ noServer: true, ... })` against an http.Server / Express / Fastify instance they own and apply this package's `verifyClient` and `handleConnection` directly.
+- The example owns the `http.Server`, so additional routes (`/healthz`, an Express / Fastify mount) plug in by editing the same `httpServer` — no overwriting of internal listeners, no dependence on private `ws` fields. The previous version of this snippet reached into `wss._server` and called `removeAllListeners("request")`, which would have broken silently the moment ws or any middleware attached another request listener; the noServer composition removes that fragility.
 - The same `allowedOrigins` list gates the WebSocket upgrade AND the HTTP CORS response. A request that would have been allowed to open a WebSocket is also allowed to read the config.
+- `remoteUrl` is derived per request from `req.headers.host` and (when present) `X-Forwarded-Proto` so the config endpoint advertises the actual reachable URL — works unchanged on localhost, behind a reverse proxy, and on any non-localhost host. A `PUBLIC_WS_URL` env var overrides the derivation when the WS endpoint lives on a different host than the config endpoint.
 - `Cache-Control: max-age=60` is short on purpose — too long would slow recovery from a tenant rotation.
 
 ## Client side — pick the variant that matches your stack
