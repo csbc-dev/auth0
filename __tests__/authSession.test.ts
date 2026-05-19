@@ -21,6 +21,16 @@ vi.mock("@auth0/auth0-spa-js", () => ({
 // that matches the real proxy's shape: the declaration is rewritten with
 // synthetic event names per property — but for bind() semantics we only
 // need the property list and events to match.
+//
+// `@wc-bindable/core` v0.7.0 changed `bind()` initial sync from a
+// `target[name] !== undefined` check to a `name in target` check, and the
+// real `RemoteCoreProxy` answers `has` true ONLY for declared properties
+// whose value has already been cached (i.e. arrived via a prior sync or
+// update). The mock mirrors that contract by installing the property as an
+// own data-property only on `_simulateSync`; before the first sync,
+// `name in proxy` is false, so `bind()` does not deliver a phantom initial
+// `undefined` value to subscribers.
+//
 // Note: createRemoteCoreProxy is mocked as a plain function (NOT vi.fn()) so
 // that vi.restoreAllMocks() in afterEach does not wipe its implementation
 // between tests.
@@ -37,15 +47,14 @@ vi.mock("@wc-bindable/remote", async (importActual) => {
       properties: decl.properties.map((p) => ({ name: p.name, event: EVENT_PREFIX + p.name })),
     };
     Object.defineProperty(proxy.constructor, "wcBindable", { value: proxyDecl, configurable: true });
-    for (const p of decl.properties) {
-      Object.defineProperty(proxy, p.name, {
-        configurable: true,
-        get: () => (proxy as any)[`__${p.name}`],
-      });
-    }
     proxy._simulateSync = (values) => {
       for (const [name, value] of Object.entries(values)) {
-        (proxy as any)[`__${name}`] = value;
+        Object.defineProperty(proxy, name, {
+          configurable: true,
+          writable: true,
+          enumerable: true,
+          value,
+        });
         proxy.dispatchEvent(new CustomEvent(EVENT_PREFIX + name, { detail: value }));
       }
     };
