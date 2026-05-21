@@ -11,19 +11,18 @@ interface SessionValues {
 // Properties + commands declared on AppCoreFacade (server-mirrored).
 interface FacadeValues {
   count: number;
-  lastUpdatedBy: string;
+  connectedUser: string;
 }
 interface FacadeElement extends HTMLElement, FacadeValues {
   // Command forwarders installed by <auth0-session> at connect time.
   // Marked optional because they do NOT exist on the element before the
-  // session connects (own-property assignments happen inside
-  // AuthSession._installPayloadCommandForwarders). Once
+  // session connects: <auth0-session> writes them as own-property
+  // forwarders on the payload child once the proxy is built. Once
   // `sessionValues.ready === true` they are guaranteed to be present —
-  // AuthSession installs forwarders synchronously BEFORE registering
-  // `bind()`, and `ready` only flips after `bind()` has dispatched its
-  // first batch (see src/components/AuthSession.ts:594-651). The
-  // `ready && ...` render guard below is therefore the contract that
-  // makes the `.increment?.()` call safe.
+  // <auth0-session> installs the forwarders synchronously BEFORE
+  // registering `bind()`, and `ready` only flips after `bind()` has
+  // dispatched its first batch. The `ready && ...` render guard below is
+  // therefore the contract that makes the `.increment?.()` call safe.
   increment?: (...args: unknown[]) => Promise<unknown>;
   decrement?: (...args: unknown[]) => Promise<unknown>;
   reset?: (...args: unknown[]) => Promise<unknown>;
@@ -67,7 +66,7 @@ export default function App() {
         domain={env.VITE_AUTH0_DOMAIN}
         client-id={env.VITE_AUTH0_CLIENT_ID}
         audience={env.VITE_AUTH0_AUDIENCE}
-        remote-url={env.VITE_REMOTE_URL ?? "ws://localhost:3000"}
+        remote-url={env.VITE_REMOTE_URL || "ws://localhost:3000"}
         redirect-uri={window.location.origin}
       />
       <auth0-session ref={sessionRef} target="auth">
@@ -92,7 +91,7 @@ export default function App() {
       {sessionValues.ready && (
         <Section>
           <p>Count: <strong>{facadeValues.count ?? 0}</strong></p>
-          <p style={{ color: "#666" }}>Last updated by: {facadeValues.lastUpdatedBy ?? ""}</p>
+          <p style={{ color: "#666" }}>Connected as: {facadeValues.connectedUser ?? ""}</p>
           <Row>
             <button onClick={() => facadeRef.current?.increment?.()}>+1</button>
             <button onClick={() => facadeRef.current?.decrement?.()}>−1</button>

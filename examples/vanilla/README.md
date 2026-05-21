@@ -18,7 +18,7 @@ Make sure the [example server](../server/) is running first (`npm run dev` from 
 
 - Remote-mode gate (`mode` is inferred from `remote-url`).
 - Two-element pattern + payload child: `<auth0-gate>` + `<auth0-session>` containing `<app-core-facade>`.
-- `<app-core-facade>` is a **schema-only** custom element (just `static wcBindable = AppCore.wcBindable`); the session installs property mirrors and command forwarders on it for the lifetime of the connection.
+- `<app-core-facade>` is a **schema-only** custom element (`static wcBindable = appCoreDeclaration` — the same declaration constant the server-side `AppCore` uses, imported from `shared/appCore.js`); the session installs property mirrors and command forwarders on it for the lifetime of the connection.
 - `bind(facade, ...)` subscribes to mirrored property events directly — no `bind(session.proxy, ...)` bridge.
-- `facade.increment()` / `facade.decrement()` / `facade.reset()` — command forwarders installed by the session route to `proxy.invoke(...)`.
+- `facade.increment?.()` / `facade.decrement?.()` / `facade.reset?.()` — command forwarders route to `proxy.invoke(...)`. They are installed by `<auth0-session>` as own-properties only after the connection is established, so they are `undefined` before connect; the optional-chaining call (`?.()`) keeps a pre-connect click from throwing. (The buttons are only meaningfully used once the session is ready.)
 - No `registerCoreDeclaration` / `core="..."` registry indirection.

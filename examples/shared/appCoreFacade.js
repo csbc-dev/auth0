@@ -5,7 +5,7 @@
 // that <auth0-session> can adopt it as the data-plane child. <auth0-session>
 // installs:
 //
-//   - own-property mirrors for `count` / `lastUpdatedBy` (updated on every
+//   - own-property mirrors for `count` / `connectedUser` (updated on every
 //     proxy event) plus a re-dispatch of the user-declared events on the
 //     element, so `bind(facade, ...)` and `data-wcs="prop: ..."` work
 //     directly against the element with no proxy bridging.

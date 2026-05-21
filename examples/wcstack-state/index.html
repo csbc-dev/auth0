@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ja">
+<html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -19,15 +19,25 @@
       wc-bindable child via `child.constructor.wcBindable`, which is
       module-instance agnostic — no need to share the bootstrap call
       with @csbc-dev/auth0/auto.
+
+      IMPORTANT — this schema is a HAND-WRITTEN DUPLICATE of the one in
+      ../shared/appCore.js (`appCoreDeclaration`). The other examples
+      (vanilla / react / vue) import that single source of truth; this
+      CDN / no-bundler page cannot import from ../shared without a build
+      step, so the declaration is copied here. KEEP THE TWO IN SYNC:
+      property names, command names, AND every `event` string must match
+      ../shared/appCore.js exactly, or the server-side mirrors will not
+      line up with this facade.
     -->
     <script type="module">
       class AppCoreFacade extends HTMLElement {
+        // Must match `appCoreDeclaration` in ../shared/appCore.js verbatim.
         static wcBindable = {
           protocol: "wc-bindable",
           version: 1,
           properties: [
             { name: "count",         event: "app-core:count-changed" },
-            { name: "lastUpdatedBy", event: "app-core:last-updated-by-changed" },
+            { name: "connectedUser", event: "app-core:connected-user-changed" },
           ],
           commands: [
             { name: "increment" },
@@ -89,7 +99,7 @@
 
           // <app-core-facade> output bindings.
           liveCount: 0,
-          liveAuthor: "",
+          liveConnectedUser: "",
 
           // Command tokens delivered to <app-core-facade> by wcstack/state.
           // The facade element exposes increment / decrement / reset in its
@@ -126,7 +136,20 @@
             return String(e);
           },
 
-          login() { this.shouldLogin = true; },
+          // Pulse the trigger: set it true so the `trigger: shouldLogin`
+          // binding pushes `true` onto <auth0-gate> (which starts the
+          // redirect login), then reset to false on the next microtask so
+          // the one-shot edge can be re-armed. The happy path navigates away
+          // before the reset matters; the reset only matters on a FAILURE
+          // path (e.g. Auth0 misconfig with no redirect), where leaving
+          // shouldLogin stuck at true would stop a second click from
+          // producing a fresh state change. <auth0-gate> ignores a redundant
+          // `trigger=true` while a login is already in flight, so the brief
+          // true -> false pulse is safe.
+          login() {
+            this.shouldLogin = true;
+            queueMicrotask(() => { this.shouldLogin = false; });
+          },
 
           // Button click handlers — each emits to a command token. The
           // matching `command.<name>:` binding on <app-core-facade> routes
@@ -168,7 +191,7 @@
         ">
         <!--
           Payload child — <auth0-session> mirrors the server-side Core's
-          `count` / `lastUpdatedBy` onto this element, dispatches the
+          `count` / `connectedUser` onto this element, dispatches the
           declared events on it, and installs `increment` / `decrement` /
           `reset` as command forwarders. data-wcs reads directly from
           this element, no extra bridging code in the state.
@@ -183,7 +206,7 @@
         <app-core-facade
           data-wcs="
             count:             liveCount;
-            lastUpdatedBy:     liveAuthor;
+            connectedUser:     liveConnectedUser;
             command.increment: $command.increment;
             command.decrement: $command.decrement;
             command.reset:     $command.reset
@@ -216,14 +239,25 @@
           <button data-wcs="onclick: login">Sign in</button>
         </template>
         <template data-wcs="if: isLoggedIn">
-          <auth0-logout target="auth">Sign out</auth0-logout>
+          <!--
+            <auth0-logout> is a bare HTMLElement that only wires a `click`
+            listener (no native button semantics). Add `role="button"` so
+            assistive tech announces it as a button and `tabindex="0"` so it
+            is keyboard-focusable — the other examples use a real <button>,
+            which gets both for free. NOTE: focus + announce only; the
+            element does not translate Enter/Space into a click, so full
+            keyboard activation would need a real <button> or a keydown
+            handler. For an a11y-critical app prefer a <button> that calls
+            the gate's logout() directly.
+          -->
+          <auth0-logout target="auth" role="button" tabindex="0">Sign out</auth0-logout>
         </template>
       </section>
 
       <template data-wcs="if: sessionReady">
         <section>
           <p>Count: <strong>{{ liveCount }}</strong></p>
-          <p class="muted">Last updated by: {{ liveAuthor }}</p>
+          <p class="muted">Connected as: {{ liveConnectedUser }}</p>
           <div class="row">
             <button data-wcs="onclick: incrementClick">+1</button>
             <button data-wcs="onclick: decrementClick">−1</button>

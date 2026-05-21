@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ja">
+<html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -26,7 +26,8 @@
 
     <section>
       <p id="status" class="muted">Initialising…</p>
-      <p id="error" class="err" hidden></p>
+      <p id="authError" class="err" hidden></p>
+      <p id="sessionError" class="err" hidden></p>
       <div class="row">
         <button id="login" hidden>Sign in</button>
         <button id="logout" hidden>Sign out</button>
@@ -35,7 +36,7 @@
 
     <section id="counter" hidden>
       <p>Count: <strong id="count">—</strong></p>
-      <p class="muted">Last updated by: <span id="lastUser">—</span></p>
+      <p class="muted">Connected as: <span id="connectedUser">—</span></p>
       <div class="row">
         <button id="inc">+1</button>
         <button id="dec">−1</button>

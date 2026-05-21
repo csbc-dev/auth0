@@ -166,8 +166,8 @@ wss.on("connection", async (ws, req, preVerifiedUser) => {
     // AFTER `open` with a freshly-issued token the pre-handshake
     // verify cannot have seen) re-verifies using the same tenant
     // parameters. The "no double verify on the initial handshake"
-    // guarantee is a documented contract of `handleConnection`
-    // (see src/server/createAuthenticatedWSS.ts:200-220) — this
+    // guarantee is the documented contract of `handleConnection`'s
+    // `preVerifiedUser` option (see @csbc-dev/auth0/server) — this
     // composition depends on it being honoured.
     await handleConnection(ws, req.headers["sec-websocket-protocol"], {
       auth0Domain,
@@ -185,8 +185,11 @@ wss.on("connection", async (ws, req, preVerifiedUser) => {
 httpServer.listen(port, () => {
   console.log(`@csbc-dev/auth0 example server listening on ws://localhost:${port}`);
   console.log(`  config endpoint: http://localhost:${port}/auth-config`);
+  // domain / audience are enough to confirm the tenant + API the server
+  // verifies against. The SPA client-id is not a secret (it ships to every
+  // client via /auth-config), but the server never authenticates with it, so
+  // it has little confirmation value here and is left out of the startup log.
   console.log(`  domain:    ${auth0Domain}`);
-  console.log(`  client-id: ${auth0ClientId}`);
   console.log(`  audience:  ${auth0Audience}`);
   console.log(`  origins:   ${allowedOrigins.length ? allowedOrigins.join(", ") : "(any — dev only)"}`);
   console.log(`  remoteUrl: ${publicWsUrl || "(derived per request from Host / X-Forwarded-Proto)"}`);

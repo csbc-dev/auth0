@@ -16,9 +16,9 @@ The shared server lives at [`server/`](server/) and is built on `@csbc-dev/auth0
 In your Auth0 tenant:
 
 1. Create a **Single Page Application**.
-   - **Allowed Callback URLs**: `http://localhost:5173, http://localhost:5174, http://localhost:5175`
-   - **Allowed Logout URLs**: `http://localhost:5173, http://localhost:5174, http://localhost:5175`
-   - **Allowed Web Origins**: `http://localhost:5173, http://localhost:5174, http://localhost:5175`
+   - **Allowed Callback URLs**: `http://localhost:5173, http://localhost:5174, http://localhost:5175, http://localhost:5176`
+   - **Allowed Logout URLs**: `http://localhost:5173, http://localhost:5174, http://localhost:5175, http://localhost:5176`
+   - **Allowed Web Origins**: `http://localhost:5173, http://localhost:5174, http://localhost:5175, http://localhost:5176`
 2. Create an **API**. The **API Identifier** value (e.g. `https://api.example.com`) is what you set as `audience` in every example, and as `AUTH0_AUDIENCE` on the server.
 3. Note your tenant **Domain** (e.g. `your-tenant.auth0.com`) and the SPA's **Client ID**.
 
@@ -53,15 +53,15 @@ For `wcstack-state/` see its [README](wcstack-state/README.md) — it has no bun
 | `vanilla`           | 5173 |
 | `react`             | 5174 |
 | `vue`               | 5175 |
-| `wcstack-state`     | 5175 (or any static server you choose) |
+| `wcstack-state`     | 5176 (static server — pass the port to your chosen tool) |
 
-Note: `wcstack-state` and `vue` both default to 5175. Run only one at a time, or change the port. Adjust `ALLOWED_ORIGINS` in `examples/server/.env` to match.
+All four client ports are distinct, so every example can run simultaneously against the one server. The default `ALLOWED_ORIGINS` in `examples/server/.env.example` already lists `5173`–`5176`. `wcstack-state` has no bundler, so its port is whatever you pass to the static server you run (the [wcstack-state README](wcstack-state/README.md) uses `5176`); pick another port only if you also add it to `ALLOWED_ORIGINS` and your Auth0 application's allowed URLs.
 
 ## What all four clients demonstrate
 
 - Remote mode: token never reaches application JS.
 - **Payload child pattern**: `<auth0-gate>` (auth) + `<auth0-session>` (transport) + a user-defined `<app-core-facade>` child (data-plane). The schema lives once on the facade class as `static wcBindable` and is shared with the server — no string registry, no `registerCoreDeclaration`.
-- Per-user `AppCore` on the server with `count` / `lastUpdatedBy` properties and `increment` / `decrement` / `reset` commands; mirrored onto `<app-core-facade>` on each client.
+- Per-user `AppCore` on the server with `count` / `connectedUser` properties and `increment` / `decrement` / `reset` commands; mirrored onto `<app-core-facade>` on each client.
 - Each client binds **directly on `<app-core-facade>`** (the session writes property mirrors and command forwarders onto it).
 - Login / logout flow with redirect callback handled automatically by `<auth0-gate>`.
 

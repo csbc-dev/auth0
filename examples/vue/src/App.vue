@@ -11,7 +11,7 @@ interface SessionValues {
 
 interface FacadeValues {
   count: number;
-  lastUpdatedBy: string;
+  connectedUser: string;
 }
 interface FacadeElement extends HTMLElement, FacadeValues {
   increment?: (...args: unknown[]) => Promise<unknown>;
@@ -69,7 +69,7 @@ function reset()     { facadeBinding.ref.value?.reset?.(); }
       :domain="env.VITE_AUTH0_DOMAIN"
       :client-id="env.VITE_AUTH0_CLIENT_ID"
       :audience="env.VITE_AUTH0_AUDIENCE"
-      :remote-url="env.VITE_REMOTE_URL ?? 'ws://localhost:3000'"
+      :remote-url="env.VITE_REMOTE_URL || 'ws://localhost:3000'"
       :redirect-uri="redirectUri"
     />
     <auth0-session :ref="sessionBinding.ref" target="auth">
@@ -87,7 +87,7 @@ function reset()     { facadeBinding.ref.value?.reset?.(); }
 
     <section v-if="session.ready">
       <p>Count: <strong>{{ facade.count ?? 0 }}</strong></p>
-      <p class="muted">Last updated by: {{ facade.lastUpdatedBy ?? "" }}</p>
+      <p class="muted">Connected as: {{ facade.connectedUser ?? "" }}</p>
       <div class="row">
         <button @click="increment">+1</button>
         <button @click="decrement">−1</button>

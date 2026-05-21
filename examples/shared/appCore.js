@@ -25,7 +25,12 @@ export const appCoreDeclaration = {
   version: 1,
   properties: [
     { name: "count",         event: "app-core:count-changed" },
-    { name: "lastUpdatedBy", event: "app-core:last-updated-by-changed" },
+    // The authenticated user this per-connection Core belongs to. Set once at
+    // construction and refreshed only when the user's claims change via an
+    // in-band auth:refresh (see `updateUser`). It is NOT "who last touched the
+    // count" — each connection has its own Core, so this is always the
+    // connected user. Hence the name `connectedUser`, not `lastUpdatedBy`.
+    { name: "connectedUser", event: "app-core:connected-user-changed" },
   ],
   commands: [
     { name: "increment" },
@@ -42,15 +47,15 @@ export class AppCore extends EventTarget {
   static wcBindable = appCoreDeclaration;
 
   #count = 0;
-  #lastUpdatedBy;
+  #connectedUser;
 
   constructor(user) {
     super();
-    this.#lastUpdatedBy = userLabel(user);
+    this.#connectedUser = userLabel(user);
   }
 
   get count() { return this.#count; }
-  get lastUpdatedBy() { return this.#lastUpdatedBy; }
+  get connectedUser() { return this.#connectedUser; }
 
   increment() { this.#count += 1; this.#publishCount(); }
   decrement() { this.#count -= 1; this.#publishCount(); }
@@ -60,9 +65,9 @@ export class AppCore extends EventTarget {
   // changes propagate to the client without rebuilding the Core.
   updateUser(user) {
     const next = userLabel(user);
-    if (next === this.#lastUpdatedBy) return;
-    this.#lastUpdatedBy = next;
-    this.dispatchEvent(new CustomEvent("app-core:last-updated-by-changed", { detail: next }));
+    if (next === this.#connectedUser) return;
+    this.#connectedUser = next;
+    this.dispatchEvent(new CustomEvent("app-core:connected-user-changed", { detail: next }));
   }
 
   #publishCount() {
