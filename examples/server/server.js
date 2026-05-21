@@ -7,7 +7,20 @@ import {
 } from "@csbc-dev/auth0/server";
 import { AppCore } from "../shared/appCore.js";
 
-const port = Number(process.env.PORT ?? 3000);
+// PORT validation. `Number(process.env.PORT ?? 3000)` is too lenient:
+// `PORT=""` (a common "set but empty" shape in .env files) is NOT caught
+// by `??` (only null/undefined are) and `Number("")` is 0, which silently
+// binds an OS-chosen ephemeral port — a confusing failure to debug.
+// (`PORT=abc` is the less dangerous case: it does NOT behave like 0 —
+// Node's listen() runs the port through validatePort and rejects NaN with
+// a thrown ERR_SOCKET_BAD_PORT, crashing loudly.) Validate explicitly and
+// fail fast either way, matching the AUTH0_* precondition check below.
+const rawPort = process.env.PORT?.trim() || "3000";
+const port = Number.parseInt(rawPort, 10);
+if (!Number.isInteger(port) || port < 0 || port > 65535) {
+  console.error(`Invalid PORT: "${rawPort}" (expected an integer 0–65535)`);
+  process.exit(1);
+}
 const auth0Domain = process.env.AUTH0_DOMAIN;
 const auth0ClientId = process.env.AUTH0_CLIENT_ID;
 const auth0Audience = process.env.AUTH0_AUDIENCE;
@@ -64,6 +77,20 @@ const httpServer = createServer((req, res) => {
   }
 
   if (req.method === "GET" && req.url === "/auth-config") {
+    // Apply the SAME origin policy as the WebSocket upgrade below, so the
+    // two surfaces share one rule instead of diverging. NOTE: this is for
+    // behavioural symmetry, not secrecy — domain / clientId / audience are
+    // not secrets (they ship to every browser via this very endpoint), and
+    // a non-browser client (curl) can spoof the Origin header anyway, so
+    // this 403 adds no real protection on its own. The CORS headers set
+    // above are what actually stop a *browser* on a disallowed origin from
+    // reading the response; this check just keeps the dev/prod behaviour
+    // consistent with the WS path (any-origin in dev, allow-list in prod).
+    if (allowedOrigins.length > 0 && (!origin || !allowedOrigins.includes(origin))) {
+      res.statusCode = 403;
+      res.end();
+      return;
+    }
     res.setHeader("Content-Type", "application/json; charset=utf-8");
     res.setHeader("Cache-Control", "public, max-age=60");
     res.end(
@@ -142,12 +169,22 @@ httpServer.on("upgrade", (req, socket, head) => {
     audience: auth0Audience,
   })
     .then((user) => {
+      // Verify resolved, so the abort guards have done their job. Detach
+      // them before the socket is handed to `ws` so the `markAborted`
+      // closures don't ride along on a socket nobody reads `aborted` from
+      // anymore. They're `once` (max one fire, auto-removed) so this is
+      // about making the intent — "pre-verify-only state guards" — explicit
+      // rather than fixing a leak.
+      socket.off("error", markAborted);
+      socket.off("close", markAborted);
       if (aborted || socket.destroyed) return;
       wss.handleUpgrade(req, socket, head, (ws) => {
         wss.emit("connection", ws, req, user);
       });
     })
     .catch((err) => {
+      socket.off("error", markAborted);
+      socket.off("close", markAborted);
       onAuthEvent({ type: "auth:failure", error: normalize(err) });
       // `rejectUpgrade` is itself destroyed-socket-safe (see helper),
       // but skipping here also avoids the spurious 401 log when the
@@ -177,7 +214,17 @@ wss.on("connection", async (ws, req, preVerifiedUser) => {
       onEvent: onAuthEvent,
       preVerifiedUser,
     });
-  } catch {
+  } catch (err) {
+    // Reaching here is a failure DURING connection setup that
+    // `onAuthEvent` does NOT already cover: `createCores`
+    // (`new AppCore(user)`) throwing, or the RemoteShellProxy
+    // construction failing. The pre-handshake auth failures are reported
+    // by the upgrade handler above, and in-band `auth:refresh` failures
+    // are handled inside `handleConnection` and surface through `onEvent`
+    // — neither rejects this await. So an empty `catch {}` here would
+    // close the socket with 1008 and erase exactly the class of fault an
+    // operator most needs to see. Log it before closing.
+    console.error("[ws] connection setup failed:", normalize(err));
     try { ws.close(1008, "Unauthorized"); } catch { /* socket may already be gone */ }
   }
 });

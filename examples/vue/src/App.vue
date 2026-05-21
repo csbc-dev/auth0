@@ -54,9 +54,14 @@ function login() { authBinding.ref.value?.login(); }
 function logout() {
   authBinding.ref.value?.logout({ logoutParams: { returnTo: redirectUri } });
 }
-function increment() { facadeBinding.ref.value?.increment?.(); }
-function decrement() { facadeBinding.ref.value?.decrement?.(); }
-function reset()     { facadeBinding.ref.value?.reset?.(); }
+// Command forwarders return a Promise that rejects if the proxy can't
+// reach the server — e.g. a click that races a disconnect, in the window
+// before the `ready` guard removes the buttons. Swallow-and-log so it
+// doesn't bubble up as an unhandledrejection.
+function reportCmdError(err: unknown) { console.warn("command failed:", err); }
+function increment() { facadeBinding.ref.value?.increment?.()?.catch(reportCmdError); }
+function decrement() { facadeBinding.ref.value?.decrement?.()?.catch(reportCmdError); }
+function reset()     { facadeBinding.ref.value?.reset?.()?.catch(reportCmdError); }
 </script>
 
 <template>

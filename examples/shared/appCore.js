@@ -39,8 +39,19 @@ export const appCoreDeclaration = {
   ],
 };
 
+// `sub` is a guaranteed claim on a verified Auth0 token, and AppCore is
+// only ever built from one (createCores runs after verifyAuth0Token). The
+// only way to reach this without a `sub` is a Core constructed without a
+// verified user — a contract violation. A silent "anonymous" fallback
+// would dress that bug up as a healthy session whose `connectedUser` is
+// "anonymous", delaying discovery; fail fast instead. The throw is safe in
+// both call sites: in the constructor it surfaces as a createCores failure
+// (caught by the server's connection handler, which now logs it), and in
+// updateUser it is caught by handleConnection's onTokenRefresh rollback.
+// `||` (not `??`) so an empty-string `email` still falls through to `sub`.
 function userLabel(user) {
-  return user?.email || user?.sub || "anonymous";
+  if (!user?.sub) throw new Error("AppCore: user.sub is required");
+  return user.email || user.sub;
 }
 
 export class AppCore extends EventTarget {

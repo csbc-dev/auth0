@@ -28,6 +28,14 @@ interface FacadeElement extends HTMLElement, FacadeValues {
   reset?: (...args: unknown[]) => Promise<unknown>;
 }
 
+// Command forwarders return a Promise that rejects if the proxy can't
+// reach the server — e.g. a click that races a disconnect, in the window
+// before the `ready` render guard removes the buttons. Swallow-and-log so
+// it doesn't bubble up as an unhandledrejection.
+function reportCmdError(err: unknown) {
+  console.warn("command failed:", err);
+}
+
 function errorText(err: unknown): string {
   if (!err) return "";
   if (err instanceof Error) return err.message;
@@ -93,9 +101,9 @@ export default function App() {
           <p>Count: <strong>{facadeValues.count ?? 0}</strong></p>
           <p style={{ color: "#666" }}>Connected as: {facadeValues.connectedUser ?? ""}</p>
           <Row>
-            <button onClick={() => facadeRef.current?.increment?.()}>+1</button>
-            <button onClick={() => facadeRef.current?.decrement?.()}>−1</button>
-            <button onClick={() => facadeRef.current?.reset?.()}>Reset</button>
+            <button onClick={() => facadeRef.current?.increment?.()?.catch(reportCmdError)}>+1</button>
+            <button onClick={() => facadeRef.current?.decrement?.()?.catch(reportCmdError)}>−1</button>
+            <button onClick={() => facadeRef.current?.reset?.()?.catch(reportCmdError)}>Reset</button>
           </Row>
         </Section>
       )}
