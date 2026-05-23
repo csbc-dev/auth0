@@ -52,7 +52,7 @@ The fetch is wired through `<wcs-state>`'s `$connectedCallback` lifecycle hook a
      the data-wcs bindings → UI re-renders
 ```
 
-The empty initial values are deliberate: `<auth0-gate>` treats empty `remote-url=""` as "unset" (mode stays in inference mode rather than flipping into remote prematurely), and `_tryInitialize()` requires both `domain` AND `client-id` to be truthy before calling Auth0. Until the fetch completes, the gate sits inert and `data-wcs="loading: authLoading"` shows the "Loading Auth0…" template.
+The empty initial values are deliberate: `<auth0-gate>` treats empty `remote-url=""` as "unset" (mode stays in inference mode rather than flipping into remote prematurely), and `_tryInitialize()` requires both `domain` AND `client-id` to be truthy before calling Auth0. Until the fetch completes, the gate sits inert with `loading` true, and `data-wcs="loading: authLoading"` keeps the `statusMessage` line on "Loading Auth0…". (Status is a single `{{ statusMessage }}` getter, not one `if:` template per state — `data-wcs`'s `if:` has no `&&`/`||`, so independent conditions could not be made mutually exclusive.)
 
 ## What this example demonstrates
 

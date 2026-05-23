@@ -35,4 +35,10 @@ export function defineAppCoreFacade(tag = "app-core-facade") {
   if (!customElements.get(tag)) {
     customElements.define(tag, AppCoreFacade);
   }
+  // HMR caveat: `customElements.define` is one-shot per tag — a name cannot be
+  // re-registered. After an HMR update this module re-evaluates and produces a
+  // *new* `AppCoreFacade` class, but the tag stays bound to the *original*
+  // class from first registration. The facade is schema-only (no logic), so
+  // this rarely matters; if you do add behaviour to it, edits won't take
+  // effect until a full page reload.
 }

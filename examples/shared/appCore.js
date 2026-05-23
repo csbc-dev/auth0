@@ -70,7 +70,11 @@ export class AppCore extends EventTarget {
 
   increment() { this.#count += 1; this.#publishCount(); }
   decrement() { this.#count -= 1; this.#publishCount(); }
-  reset()     { this.#count  = 0; this.#publishCount(); }
+  // Skip the publish when already at 0 — re-asserting the same value would
+  // send a redundant frame over the wire and trigger a wasteful re-render.
+  // Mirrors the no-op guard in `updateUser` below. (increment/decrement always
+  // change the value, so they need no such guard.)
+  reset()     { if (this.#count === 0) return; this.#count = 0; this.#publishCount(); }
 
   // Called by the server's onTokenRefresh hook so refreshed RBAC / email
   // changes propagate to the client without rebuilding the Core.

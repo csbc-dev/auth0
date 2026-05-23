@@ -64,13 +64,25 @@
         // bindings (`attr.<name>: <stateProp>`).
         //
         // <auth0-gate> waits for `domain` + `client-id` before calling
-        // initialize(): until they arrive the element sits inert and
-        // the data-wcs `loading: authLoading` binding shows the
-        // "Loading Auth0…" template.
+        // initialize(): until they arrive the element sits inert with
+        // `loading` true, so the `loading: authLoading` binding keeps the
+        // `statusMessage` line on "Loading Auth0…".
         //
         // See ../../docs/patterns/server-config-discovery.md for the
         // full pattern + threat model.
         const CONFIG_URL = "http://localhost:3000/auth-config";
+
+        // Normalize an unknown error-ish value to a display string. Auth0 SDK
+        // failures are Error instances (use `.message`); WebSocket / proxy
+        // failures may be plain `{ error: "..." }` shapes (use `.error`);
+        // anything else falls back to String(). Shared by the authError and
+        // sessionError getters so the two render symmetrically.
+        function formatErr(e) {
+          if (!e) return "";
+          if (typeof e.message === "string") return e.message;
+          if (typeof e.error === "string") return e.error;
+          return String(e);
+        }
 
         export default {
           // Auth0 config — populated by $connectedCallback below, then
@@ -115,26 +127,45 @@
           // values into state; the attr.* bindings propagate to
           // <auth0-gate> automatically.
           async $connectedCallback() {
-            const res = await fetch(CONFIG_URL);
-            if (!res.ok) {
-              this.authError = new Error(`config fetch failed: HTTP ${res.status}`);
+            // Route EVERY failure mode to the same authError path: a non-OK
+            // HTTP status, a fetch rejection (server not started / DNS / CORS
+            // / network drop), AND a res.json() parse failure. The `!res.ok`
+            // check alone left the latter two as unhandled promise rejections,
+            // which leaves the page stuck on "Loading Auth0…" forever:
+            // <auth0-gate> never receives domain/client-id, so it never flips
+            // `loading` to false on its own — we have to do it here.
+            try {
+              const res = await fetch(CONFIG_URL);
+              if (!res.ok) throw new Error(`config fetch failed: HTTP ${res.status}`);
+              const cfg = await res.json();
+              this.auth0Domain   = cfg.domain;
+              this.auth0ClientId = cfg.clientId;
+              this.auth0Audience = cfg.audience;
+              this.remoteUrl     = cfg.remoteUrl;
+            } catch (err) {
+              this.authError   = err instanceof Error ? err : new Error(String(err));
               this.authLoading = false;
-              return;
             }
-            const cfg = await res.json();
-            this.auth0Domain   = cfg.domain;
-            this.auth0ClientId = cfg.clientId;
-            this.auth0Audience = cfg.audience;
-            this.remoteUrl     = cfg.remoteUrl;
           },
 
-          get authErrorMessage() {
-            const e = this.authError;
-            if (!e) return "";
-            if (typeof e.message === "string") return e.message;
-            if (typeof e.error === "string") return e.error;
-            return String(e);
+          // Single status line — exclusive ladder mirroring the React example.
+          // A getter, not four independent `if:` templates, because data-wcs
+          // `if:` has no `&&` / `||` operators: four separate conditions can't
+          // be made mutually exclusive in the template (at boot `authLoading`
+          // AND `isLoggedIn|not` are both true; the authenticated-but-not-yet-
+          // connected gap matches none). The getter reads several reactive
+          // props and wcstack/state's dependency tracking re-renders
+          // {{ statusMessage }} whenever any of them changes.
+          get statusMessage() {
+            if (this.authLoading)       return "Loading Auth0…";
+            if (!this.isLoggedIn)       return "Signed out.";
+            if (this.sessionReady)      return "Session ready.";
+            if (this.sessionConnecting) return "Opening session…";
+            return "Authenticated, waiting for session…";
           },
+
+          get authErrorMessage()    { return formatErr(this.authError); },
+          get sessionErrorMessage() { return formatErr(this.sessionError); },
 
           // Pulse the trigger: set it true so the `trigger: shouldLogin`
           // binding pushes `true` onto <auth0-gate> (which starts the
@@ -215,24 +246,21 @@
       </auth0-session>
 
       <section>
-        <template data-wcs="if: authLoading">
-          <p class="muted">Loading Auth0…</p>
-        </template>
-        <template data-wcs="if: isLoggedIn|not">
-          <p class="muted">Signed out.</p>
-        </template>
-        <template data-wcs="if: sessionConnecting">
-          <p class="muted">Opening session…</p>
-        </template>
-        <template data-wcs="if: sessionReady">
-          <p class="muted">Session ready.</p>
-        </template>
+        <!--
+          Single status line. data-wcs `if:` has no boolean operators
+          (`&&` / `||`), so four independent `if:` templates can't be made
+          mutually exclusive: at boot `authLoading` AND `isLoggedIn|not` are
+          both true (two lines at once) and the authenticated-but-not-yet-
+          connected gap matches none (blank line). The exclusive ladder lives
+          in the `statusMessage` getter above; {{ }} re-renders reactively.
+        -->
+        <p class="muted">{{ statusMessage }}</p>
 
         <template data-wcs="if: authError">
           <p class="err">Auth error: {{ authErrorMessage }}</p>
         </template>
         <template data-wcs="if: sessionError">
-          <p class="err">Session error: {{ sessionError.message }}</p>
+          <p class="err">Session error: {{ sessionErrorMessage }}</p>
         </template>
 
         <template data-wcs="if: isLoggedIn|not">

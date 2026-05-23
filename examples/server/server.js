@@ -76,7 +76,13 @@ const httpServer = createServer((req, res) => {
     return;
   }
 
-  if (req.method === "GET" && req.url === "/auth-config") {
+  // Route on the pathname, not the raw `req.url`, so a trailing query string
+  // (a cache-buster like `/auth-config?t=…`, a `?debug=1`, etc.) still
+  // resolves the endpoint instead of falling through to 426. Base is a dummy
+  // origin — only the path is used.
+  const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+
+  if (req.method === "GET" && pathname === "/auth-config") {
     // Apply the SAME origin policy as the WebSocket upgrade below, so the
     // two surfaces share one rule instead of diverging. NOTE: this is for
     // behavioural symmetry, not secrecy — domain / clientId / audience are
@@ -92,7 +98,15 @@ const httpServer = createServer((req, res) => {
       return;
     }
     res.setHeader("Content-Type", "application/json; charset=utf-8");
-    res.setHeader("Cache-Control", "public, max-age=60");
+    // `private`, not `public`: the body's `remoteUrl` is derived per request
+    // from `Host` / `X-Forwarded-Proto` (see resolveRemoteUrl), and the CORS
+    // `Access-Control-Allow-Origin` above is request-dependent too. A
+    // compliant shared cache keys on the host, but `X-Forwarded-Proto` is not
+    // part of the cache key and not all proxies are compliant — `private`
+    // keeps shared caches (CDN / forward proxy) out of it entirely while
+    // still letting the browser cache for a minute (so a tenant rotation
+    // propagates within `max-age`).
+    res.setHeader("Cache-Control", "private, max-age=60");
     res.end(
       JSON.stringify({
         domain: auth0Domain,
@@ -228,6 +242,35 @@ wss.on("connection", async (ws, req, preVerifiedUser) => {
     try { ws.close(1008, "Unauthorized"); } catch { /* socket may already be gone */ }
   }
 });
+
+// WebSocket keepalive (ping/pong heartbeat). Neither `handleConnection` /
+// RemoteShellProxy nor `ws` itself runs a WS-level heartbeat by default. An
+// idle authenticated session sends no application traffic (e.g. the demo
+// counter left untouched), so an intermediary with an idle timeout — AWS ALB
+// defaults to 60s — silently drops the TCP connection. Without a heartbeat the
+// server keeps a half-open socket until OS-level TCP keepalive notices (~2h)
+// and the client only finds out on its next send. Canonical `ws` fix: ping
+// every client on an interval and terminate any that did not pong since the
+// previous tick. `terminate()` fires the socket's `close`, so handleConnection's
+// teardown (and the connection:close event) still runs.
+const HEARTBEAT_MS = 30_000;
+wss.on("connection", (ws) => {
+  ws.isAlive = true;
+  ws.on("pong", () => { ws.isAlive = true; });
+});
+const heartbeat = setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) {
+      ws.terminate();
+      continue;
+    }
+    ws.isAlive = false;
+    ws.ping();
+  }
+}, HEARTBEAT_MS);
+// Don't let the heartbeat timer alone keep the process alive.
+heartbeat.unref?.();
+wss.on("close", () => clearInterval(heartbeat));
 
 httpServer.listen(port, () => {
   console.log(`@csbc-dev/auth0 example server listening on ws://localhost:${port}`);

@@ -73,7 +73,7 @@ const httpServer = createServer((req, res) => {
 
   if (req.method === "GET" && req.url === "/auth-config") {
     res.setHeader("Content-Type", "application/json; charset=utf-8");
-    res.setHeader("Cache-Control", "public, max-age=60");
+    res.setHeader("Cache-Control", "private, max-age=60"); // body is request-derived — keep out of shared caches
     res.end(JSON.stringify({
       domain:    auth0Domain,
       clientId:  auth0ClientId,
@@ -116,7 +116,7 @@ Notes:
 - The example owns the `http.Server`, so additional routes (`/healthz`, an Express / Fastify mount) plug in by editing the same `httpServer` — no overwriting of internal listeners, no dependence on private `ws` fields. The previous version of this snippet reached into `wss._server` and called `removeAllListeners("request")`, which would have broken silently the moment ws or any middleware attached another request listener; the noServer composition removes that fragility.
 - The same `allowedOrigins` list gates the WebSocket upgrade AND the HTTP CORS response. A request that would have been allowed to open a WebSocket is also allowed to read the config.
 - `remoteUrl` is derived per request from `req.headers.host` and (when present) `X-Forwarded-Proto` so the config endpoint advertises the actual reachable URL — works unchanged on localhost, behind a reverse proxy, and on any non-localhost host. A `PUBLIC_WS_URL` env var overrides the derivation when the WS endpoint lives on a different host than the config endpoint.
-- `Cache-Control: max-age=60` is short on purpose — too long would slow recovery from a tenant rotation.
+- `Cache-Control: private, max-age=60` — `private` (not `public`) because the body's `remoteUrl` is derived per request from `Host` / `X-Forwarded-Proto`, so it must not land in a shared CDN / forward-proxy cache that could serve one host's URL to another; the browser may still cache it. `max-age=60` is short on purpose — too long would slow recovery from a tenant rotation.
 
 ## Client side — pick the variant that matches your stack
 

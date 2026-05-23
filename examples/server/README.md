@@ -25,7 +25,7 @@ npm run dev
 ## What this server does
 
 - **WebSocket**: verifies every incoming upgrade — origin check + Auth0 token verification — **before** sending the `101 Switching Protocols` response, so bad tokens never see `open`. Reads the access token from the `Sec-WebSocket-Protocol` header. Constructs a fresh `AppCore` per connection (`createCores: user => new AppCore(user)`). Wires `onTokenRefresh` so `core.updateUser(user)` runs when the client performs in-band `auth:refresh`. Logs auth lifecycle events (`auth:success` / `auth:failure` / `auth:refresh` / `connection:close`).
-- **HTTP `/auth-config`**: returns `{ domain, clientId, audience, remoteUrl }` as JSON. CORS-gated by `ALLOWED_ORIGINS`. `Cache-Control: public, max-age=60` so a tenant rotation propagates within a minute. `remoteUrl` is derived from the request's `Host` (and `X-Forwarded-Proto` for TLS-aware scheme selection) unless `PUBLIC_WS_URL` is set. Other HTTP requests fall through to the standard `426 Upgrade Required` response.
+- **HTTP `/auth-config`**: returns `{ domain, clientId, audience, remoteUrl }` as JSON. CORS-gated by `ALLOWED_ORIGINS`. `Cache-Control: private, max-age=60` — browser cache only, kept out of shared caches because the body's `remoteUrl` is request-derived; still lets a tenant rotation propagate within a minute. `remoteUrl` is derived from the request's `Host` (and `X-Forwarded-Proto` for TLS-aware scheme selection) unless `PUBLIC_WS_URL` is set. Other HTTP requests fall through to the standard `426 Upgrade Required` response.
 
 ## Notes
 

@@ -40,7 +40,9 @@ function errorText(err: unknown): string {
   if (!err) return "";
   if (err instanceof Error) return err.message;
   if (typeof err === "object" && err !== null && "error" in err) {
-    return String((err as { error: string }).error);
+    // `"error" in err` proves the key exists, not that its value is a string —
+    // assert `unknown` and let `String(...)` do the coercion honestly.
+    return String((err as { error: unknown }).error);
   }
   return String(err);
 }
@@ -87,10 +89,10 @@ export default function App() {
         {sessionValues.error && <p style={{ color: "#b00" }}>Session error: {errorText(sessionValues.error)}</p>}
 
         {!authValues.loading && !authValues.authenticated && (
-          <button onClick={() => authRef.current?.login()}>Sign in</button>
+          <button type="button" onClick={() => authRef.current?.login()}>Sign in</button>
         )}
         {authValues.authenticated && (
-          <button onClick={() => authRef.current?.logout({ logoutParams: { returnTo: window.location.origin } })}>
+          <button type="button" onClick={() => authRef.current?.logout({ logoutParams: { returnTo: window.location.origin } })}>
             Sign out
           </button>
         )}
@@ -101,9 +103,9 @@ export default function App() {
           <p>Count: <strong>{facadeValues.count ?? 0}</strong></p>
           <p style={{ color: "#666" }}>Connected as: {facadeValues.connectedUser ?? ""}</p>
           <Row>
-            <button onClick={() => facadeRef.current?.increment?.()?.catch(reportCmdError)}>+1</button>
-            <button onClick={() => facadeRef.current?.decrement?.()?.catch(reportCmdError)}>−1</button>
-            <button onClick={() => facadeRef.current?.reset?.()?.catch(reportCmdError)}>Reset</button>
+            <button type="button" onClick={() => facadeRef.current?.increment?.()?.catch(reportCmdError)}>+1</button>
+            <button type="button" onClick={() => facadeRef.current?.decrement?.()?.catch(reportCmdError)}>−1</button>
+            <button type="button" onClick={() => facadeRef.current?.reset?.()?.catch(reportCmdError)}>Reset</button>
           </Row>
         </Section>
       )}
