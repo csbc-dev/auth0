@@ -120,7 +120,7 @@ Case C is not a deviation from CSBC but a **first-class case**. It arises whenev
 - **Local mode (Case A)**: Auth0 authentication decisions (SDK initialization, login/logout, token acquisition and refresh, session state) live inside `AuthCore` (Core, `EventTarget`) in the browser. Because it depends on the Auth0 SPA SDK and on `globalThis.location` / `globalThis.history` (redirect callbacks), this Core is browser-pinned. `<auth0-gate>` (Shell, `HTMLElement`) exposes `authenticated` / `user` / `loading` / `error` to the DOM as bindable state, while `token` is intentionally excluded from the `data-wcs` surface for safety.
 - **Remote mode (Case B1)**: The application's own Core lives on the server, and `<auth0-gate>` acts as a gatekeeper for the authenticated WebSocket handshake. The access token stays inside the Shell and only crosses the wire during the handshake and during in-band `auth:refresh`. Application JS never sees the token (`getToken()` throws and `token` is `null`). Combined with `<auth0-session>`, the three-stage readiness sequence (authenticated → connected → initial sync) is collapsed into a single `ready` signal.
 
-A server-side helper bundle is provided as `@csbc-dev/auth0/server` (`createAuthenticatedWSS` / `verifyAuth0Token` / `extractTokenFromProtocol` / `UserCore`), which wraps `@wc-bindable/remote`'s `RemoteShellProxy` and injects token verification, expiry handling, and declarative authorization middleware.
+A server-side helper bundle is provided as `@csbc-dev/auth0/server` (`createAuthenticatedWSS` / `handleConnection` / `verifyAuth0Token` / `extractTokenFromProtocol` / `createAuthConfigHandler` / `UserCore`), which wraps `@wc-bindable/remote`'s `RemoteShellProxy` and injects token verification, expiry handling, and declarative authorization middleware. `createAuthenticatedWSS` can either own its port or attach to an existing `http.Server` via `{ server }` (alongside your own HTTP routes), optionally mount config discovery via `exposeAuthConfig`, and run an opt-in WS keepalive via `heartbeatMs`; `createAuthConfigHandler` is the framework-agnostic primitive behind config discovery (see [docs/patterns/server-config-discovery.md](docs/patterns/server-config-discovery.md)).
 
 Reference: [csbc-dev/arch (formerly hawc)](https://github.com/csbc-dev/arch/blob/main/README.md)
 
@@ -139,7 +139,7 @@ A headless Web Component package for handling Auth0 authentication declaratively
 | Export | Entry | Purpose |
 |---|---|---|
 | `.` | [src/index.ts](src/index.ts) | Browser-side main: `bootstrapAuth`, `AuthCore`, `AuthShell`, `Auth`, `AuthLogout`, `AuthSession`, `registerCoreDeclaration`, etc. |
-| `./server` | [src/server/index.ts](src/server/index.ts) | Node server: `createAuthenticatedWSS`, `verifyAuth0Token`, `extractTokenFromProtocol`, `UserCore` |
+| `./server` | [src/server/index.ts](src/server/index.ts) | Node server: `createAuthenticatedWSS` (supports `{ server }` attach, `exposeAuthConfig`, `heartbeatMs`), `handleConnection`, `verifyAuth0Token`, `extractTokenFromProtocol`, `createAuthConfigHandler`, `UserCore` |
 | `./auto` | [src/auto/auto.min.js](src/auto/auto.min.js) | Standalone build that auto-registers when loaded via a script tag |
 
 ### Directory layout

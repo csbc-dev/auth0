@@ -7,6 +7,7 @@ vi.mock("jose", () => ({
 
 class MockWebSocketServer {
   handlers: Record<string, (...args: any[]) => void> = {};
+  handlerLists: Record<string, ((...args: any[]) => void)[]> = {};
   options: any;
 
   constructor(options: any) {
@@ -14,7 +15,12 @@ class MockWebSocketServer {
   }
 
   on(event: string, handler: (...args: any[]) => void): void {
-    this.handlers[event] = handler;
+    (this.handlerLists[event] ??= []).push(handler);
+    this.handlers[event] = (...args: any[]) => {
+      for (const listener of this.handlerLists[event] ?? []) {
+        listener(...args);
+      }
+    };
   }
 }
 
@@ -23,7 +29,11 @@ const wsServers: MockWebSocketServer[] = [];
 vi.mock("ws", () => ({
   WebSocketServer: class {
     handlers: Record<string, (...args: any[]) => void> = {};
+    handlerLists: Record<string, ((...args: any[]) => void)[]> = {};
     options: any;
+    // Real `ws` exposes the live client set; the heartbeat loop iterates
+    // it. Tests populate this directly to drive the interval callback.
+    clients = new Set<any>();
 
     constructor(options: any) {
       this.options = options;
@@ -31,7 +41,16 @@ vi.mock("ws", () => ({
     }
 
     on(event: string, handler: (...args: any[]) => void): void {
-      this.handlers[event] = handler;
+      (this.handlerLists[event] ??= []).push(handler);
+      this.handlers[event] = (...args: any[]) => {
+        for (const listener of this.handlerLists[event] ?? []) {
+          listener(...args);
+        }
+      };
+    }
+
+    emit(event: string, ...args: any[]): void {
+      this.handlers[event]?.(...args);
     }
   },
 }));
@@ -464,5 +483,271 @@ describe("createAuthenticatedWSS", () => {
     expect(createCores).toHaveBeenCalledTimes(1);
     const passedUser = createCores.mock.calls[0][0];
     expect(passedUser.roles).toEqual(["editor", "admin"]);
+  });
+
+  // --- (1) server mode -----------------------------------------------------
+
+  it("attaches to an existing http.Server in { server } mode (no port)", async () => {
+    const fakeServer = { __id: "my-server" } as any;
+    const wss: any = await createAuthenticatedWSS({
+      auth0Domain: "test.auth0.com",
+      auth0Audience: "aud",
+      createCores: () => new EventTarget(),
+      server: fakeServer,
+    });
+
+    // ws is constructed with `server`, not `port`, and the pre-handshake
+    // security hooks are still wired in this mode.
+    expect(wss.options.server).toBe(fakeServer);
+    expect(wss.options.port).toBeUndefined();
+    expect(typeof wss.options.verifyClient).toBe("function");
+    expect(typeof wss.options.handleProtocols).toBe("function");
+  });
+
+  it("throws when both server and port are provided", async () => {
+    await expect(
+      createAuthenticatedWSS({
+        auth0Domain: "test.auth0.com",
+        auth0Audience: "aud",
+        createCores: () => new EventTarget(),
+        server: {} as any,
+        port: 3000,
+      }),
+    ).rejects.toThrow(/either `server` or `port`/);
+  });
+
+  // --- (2b) exposeAuthConfig sugar -----------------------------------------
+
+  it("throws when exposeAuthConfig is combined with a caller-owned server", async () => {
+    await expect(
+      createAuthenticatedWSS({
+        auth0Domain: "test.auth0.com",
+        auth0Audience: "aud",
+        createCores: () => new EventTarget(),
+        server: {} as any,
+        exposeAuthConfig: { clientId: "spa-123" },
+      }),
+    ).rejects.toThrow(/exposeAuthConfig.*only valid/s);
+  });
+
+  it("exposeAuthConfig: owns an http.Server that serves the config JSON and attaches ws via { server }", async () => {
+    const wss: any = await createAuthenticatedWSS({
+      auth0Domain: "test.auth0.com",
+      auth0Audience: "aud",
+      createCores: () => new EventTarget(),
+      port: 0, // ephemeral — avoids clashing with other tests
+      exposeAuthConfig: { clientId: "spa-client-123" },
+    });
+
+    const server = wss.options.server as import("http").Server;
+    expect(server).toBeDefined();
+    expect(wss.options.port).toBeUndefined();
+
+    // The factory's startListening() bound the ephemeral port. Wait for it.
+    await new Promise<void>((resolve) => {
+      if ((server as any).listening) resolve();
+      else server.once("listening", () => resolve());
+    });
+    const addr = server.address() as import("net").AddressInfo;
+
+    const { request } = await import("node:http");
+    const result = await new Promise<{ status?: number; body: any }>((resolve, reject) => {
+      const req = request(
+        { host: "127.0.0.1", port: addr.port, path: "/auth-config", method: "GET" },
+        (res) => {
+          let data = "";
+          res.on("data", (c) => (data += c));
+          res.on("end", () =>
+            resolve({ status: res.statusCode, body: JSON.parse(data) }),
+          );
+        },
+      );
+      req.on("error", reject);
+      req.end();
+    });
+
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({
+      domain: "test.auth0.com",
+      clientId: "spa-client-123",
+      audience: "aud",
+    });
+
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it("exposeAuthConfig: closes the owned http.Server when wss closes", async () => {
+    const wss: any = await createAuthenticatedWSS({
+      auth0Domain: "test.auth0.com",
+      auth0Audience: "aud",
+      createCores: () => new EventTarget(),
+      port: 0,
+      exposeAuthConfig: { clientId: "spa-client-123" },
+    });
+
+    const server = wss.options.server as import("http").Server;
+    await new Promise<void>((resolve) => {
+      if ((server as any).listening) resolve();
+      else server.once("listening", () => resolve());
+    });
+
+    const closeSpy = vi.spyOn(server, "close");
+    wss.handlers.close?.();
+
+    expect(closeSpy).toHaveBeenCalledTimes(1);
+
+    await new Promise<void>((resolve) => server.once("close", () => resolve()));
+  });
+
+  it("exposeAuthConfig: forwards owned http.Server errors to wss error listeners", async () => {
+    const wss: any = await createAuthenticatedWSS({
+      auth0Domain: "test.auth0.com",
+      auth0Audience: "aud",
+      createCores: () => new EventTarget(),
+      port: 0,
+      exposeAuthConfig: { clientId: "spa-client-123" },
+    });
+
+    const server = wss.options.server as import("http").Server;
+    const onError = vi.fn();
+    wss.on("error", onError);
+
+    const boom = new Error("EADDRINUSE-ish");
+    server.emit("error", boom);
+
+    expect(onError).toHaveBeenCalledWith(boom);
+
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it("exposeAuthConfig + heartbeat: close dispatch runs both owned-server shutdown and heartbeat cleanup", async () => {
+    vi.useFakeTimers();
+    try {
+      const wss: any = await createAuthenticatedWSS({
+        auth0Domain: "test.auth0.com",
+        auth0Audience: "aud",
+        createCores: () => new EventTarget(),
+        port: 0,
+        heartbeatMs: 30_000,
+        exposeAuthConfig: { clientId: "spa-client-123" },
+      });
+
+      const server = wss.options.server as import("http").Server;
+      await new Promise<void>((resolve) => {
+        if ((server as any).listening) resolve();
+        else server.once("listening", () => resolve());
+      });
+
+      const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
+      const closeSpy = vi.spyOn(server, "close");
+
+      wss.emit("close");
+
+      expect(closeSpy).toHaveBeenCalledTimes(1);
+      expect(clearIntervalSpy).toHaveBeenCalled();
+
+      await new Promise<void>((resolve) => server.once("close", () => resolve()));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // --- (3) heartbeat (opt-in) ----------------------------------------------
+
+  it("no heartbeat by default: no close handler, socket not marked", async () => {
+    jwtVerify.mockResolvedValue({ payload: { sub: "auth0|123", permissions: [] } });
+    const core = new EventTarget();
+    (core.constructor as any).wcBindable = {
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [],
+    };
+
+    const wss: any = await createAuthenticatedWSS({
+      auth0Domain: "test.auth0.com",
+      auth0Audience: "aud",
+      allowedOrigins: ["https://allowed.example.com"],
+      createCores: () => core,
+    });
+
+    // Heartbeat off → no `close` listener registered for clearInterval.
+    expect(wss.handlers.close).toBeUndefined();
+
+    const socket = createSocket();
+    await wss.handlers.connection(socket, {
+      headers: {
+        origin: "https://allowed.example.com",
+        "sec-websocket-protocol": "auth0-gate.bearer." + makeJwt({ sub: "auth0|123" }),
+      },
+    });
+    expect((socket as any).isAlive).toBeUndefined();
+  });
+
+  it("heartbeat: marks the socket alive on connect and wires pong", async () => {
+    jwtVerify.mockResolvedValue({ payload: { sub: "auth0|123", permissions: [] } });
+    const core = new EventTarget();
+    (core.constructor as any).wcBindable = {
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [],
+    };
+
+    const wss: any = await createAuthenticatedWSS({
+      auth0Domain: "test.auth0.com",
+      auth0Audience: "aud",
+      allowedOrigins: ["https://allowed.example.com"],
+      createCores: () => core,
+      port: 3011,
+      heartbeatMs: 30_000,
+    });
+
+    const socket = createSocket();
+    await wss.handlers.connection(socket, {
+      headers: {
+        origin: "https://allowed.example.com",
+        "sec-websocket-protocol": "auth0-gate.bearer." + makeJwt({ sub: "auth0|123" }),
+      },
+    });
+
+    expect((socket as any).isAlive).toBe(true);
+    // pong handler resets the liveness flag.
+    (socket as any).isAlive = false;
+    socket._emit("pong");
+    expect((socket as any).isAlive).toBe(true);
+
+    // Release the interval registered by the heartbeat.
+    wss.handlers.close?.();
+  });
+
+  it("heartbeat: pings live clients and terminates dead ones each tick", async () => {
+    vi.useFakeTimers();
+    try {
+      const wss: any = await createAuthenticatedWSS({
+        auth0Domain: "test.auth0.com",
+        auth0Audience: "aud",
+        createCores: () => new EventTarget(),
+        port: 3012,
+        heartbeatMs: 30_000,
+      });
+
+      const live = { isAlive: true, ping: vi.fn(), terminate: vi.fn() };
+      const dead = { isAlive: false, ping: vi.fn(), terminate: vi.fn() };
+      wss.clients.add(live);
+      wss.clients.add(dead);
+
+      vi.advanceTimersByTime(30_000);
+
+      // Dead client (never ponged since last tick) is terminated, not pinged.
+      expect(dead.terminate).toHaveBeenCalledTimes(1);
+      expect(dead.ping).not.toHaveBeenCalled();
+      // Live client is flipped to "awaiting pong" and pinged.
+      expect(live.terminate).not.toHaveBeenCalled();
+      expect(live.ping).toHaveBeenCalledTimes(1);
+      expect(live.isAlive).toBe(false);
+
+      wss.handlers.close?.();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

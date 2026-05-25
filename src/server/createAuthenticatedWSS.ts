@@ -2,10 +2,15 @@ import { RemoteShellProxy, WebSocketServerTransport } from "@wc-bindable/remote"
 import type { ServerTransport } from "@wc-bindable/remote";
 import { verifyAuth0Token } from "./verifyAuth0Token.js";
 import { extractTokenFromProtocol } from "./extractTokenFromProtocol.js";
+import { createAuthConfigHandler } from "./createAuthConfigHandler.js";
 import { base64UrlDecode, parseJwtPayload } from "../jwtPayload.js";
 import { PROTOCOL_PREFIX } from "../protocolPrefix.js";
 import { ERROR_PREFIX } from "../raiseError.js";
-import type { AuthenticatedConnectionOptions, UserContext } from "../types.js";
+import type {
+  AuthenticatedConnectionOptions,
+  ExposeAuthConfigOptions,
+  UserContext,
+} from "../types.js";
 
 /**
  * WebSocket-like interface accepted by `WebSocketServerTransport`.
@@ -700,6 +705,34 @@ function _getExpFromToken(
  *
  * Requires the `ws` package as a peer dependency.
  *
+ * **Server ownership — `port` vs `server`.**
+ * Provide exactly one:
+ * - `port`: the factory creates and owns an `http.Server` bound to that
+ *   port (the classic standalone mode).
+ * - `server`: the factory attaches to an existing `http.Server` /
+ *   `https.Server` you own (ws `{ server }` mode). Use this to mount the
+ *   WebSocket alongside your own HTTP routes (`/auth-config`, `/_shared/`,
+ *   `/healthz`) on the same port. The pre-handshake `verifyClient` token
+ *   check still runs — `{ server }` keeps the same security ordering as
+ *   `{ port }` (only ws's `{ noServer }` mode skips `verifyClient`; if you
+ *   need per-path WebSocket routing, drop to `handleConnection` + manual
+ *   `handleUpgrade`). Passing both `port` and `server` throws.
+ *
+ * **`exposeAuthConfig`** (sugar, `port` mode only): when set, the factory
+ * creates the `http.Server` itself, mounts a `GET {path}` endpoint that
+ * serves the non-secret client config via `createAuthConfigHandler`, and
+ * 426s every other path. Combining it with `server` throws — when you own
+ * the server, mount `createAuthConfigHandler()` in your own request
+ * handler instead (a second `request` listener would race yours).
+ *
+ * **`heartbeatMs`** (opt-in): when `> 0`, runs a WS-level ping/pong
+ * keepalive across `wss.clients`, terminating any client that did not
+ * pong since the previous tick. Defends against intermediaries with idle
+ * timeouts (e.g. AWS ALB's 60s) silently dropping an otherwise-idle
+ * authenticated session. Unset / `0` disables it (default — backward
+ * compatible). Lives at the server level, not in `handleConnection`,
+ * which stays transport-agnostic.
+ *
  * **Token-refresh / Core user propagation contract.**
  * `createCores(user)` is invoked exactly ONCE per WebSocket connection,
  * with the `UserContext` derived from the initial handshake token.
@@ -721,12 +754,40 @@ function _getExpFromToken(
 export async function createAuthenticatedWSS(
   options: AuthenticatedConnectionOptions & {
     port?: number;
+    server?: import("node:http").Server | import("node:https").Server;
     onEvent?: (event: AuthEvent) => void;
     sessionGraceMs?: number;
     expParseFailurePolicy?: "allow" | "close";
+    heartbeatMs?: number;
+    exposeAuthConfig?: ExposeAuthConfigOptions;
   },
 ) {
   const { WebSocketServer } = await import("ws");
+  let attachedServer:
+    | import("node:http").Server
+    | import("node:https").Server
+    | undefined;
+  let ownedServer: import("node:http").Server | undefined;
+
+  // `port` (factory owns an http.Server) and `server` (attach to one you
+  // own) are mutually exclusive — passing both is ambiguous about which
+  // port actually binds, so fail fast.
+  if (options.server && options.port != null) {
+    throw new Error(
+      `${ERROR_PREFIX} createAuthenticatedWSS: pass either \`server\` or \`port\`, not both.`,
+    );
+  }
+  // `exposeAuthConfig` mounts a config route on a server the factory
+  // owns. When you bring your own `server` we must NOT attach a second
+  // `request` listener (it would race yours and double-write `res`);
+  // mount `createAuthConfigHandler()` in your own handler instead.
+  if (options.server && options.exposeAuthConfig) {
+    throw new Error(
+      `${ERROR_PREFIX} createAuthenticatedWSS: \`exposeAuthConfig\` is only valid when the ` +
+        "factory owns the HTTP server (use `port`, not `server`). When you provide your own " +
+        "`server`, mount `createAuthConfigHandler()` inside your request handler instead.",
+    );
+  }
 
   // Plumb the pre-handshake Auth0 verify result to the connection
   // handler. A WeakMap keyed on the request avoids mutating the
@@ -742,8 +803,9 @@ export async function createAuthenticatedWSS(
   // semantics ws itself implements.
   const maxPayload = options.maxPayload ?? 256 * 1024;
 
-  const wss = new WebSocketServer({
-    port: options.port,
+  const heartbeatMs = options.heartbeatMs ?? 0;
+
+  const wssOptions: Record<string, unknown> = {
     maxPayload,
     handleProtocols(protocols: Set<string>) {
       for (const proto of protocols) {
@@ -804,9 +866,83 @@ export async function createAuthenticatedWSS(
           cb(false, 401, "Unauthorized");
         });
     },
-  } as any);
+  };
+
+  // Decide how the WebSocketServer binds. Three paths:
+  //   - `server`: attach to the caller's http(s).Server (ws `{ server }`).
+  //   - `exposeAuthConfig`: the factory creates its own http.Server,
+  //     mounts the config route, 426s everything else, then attaches ws
+  //     via `{ server }`. The server is started AFTER `new
+  //     WebSocketServer` so the upgrade listener is in place before the
+  //     first connection can arrive.
+  //   - otherwise: classic `{ port }` mode (ws owns and listens).
+  let startListening: (() => void) | undefined;
+  if (options.server) {
+    wssOptions.server = options.server;
+    attachedServer = options.server;
+  } else if (options.exposeAuthConfig) {
+    const { createServer } = await import("node:http");
+    const serveConfig = createAuthConfigHandler({
+      domain: options.auth0Domain,
+      audience: options.auth0Audience,
+      clientId: options.exposeAuthConfig.clientId,
+      remoteUrl: options.exposeAuthConfig.remoteUrl,
+      path: options.exposeAuthConfig.path,
+      cacheControl: options.exposeAuthConfig.cacheControl,
+      extend: options.exposeAuthConfig.extend,
+      allowedOrigins: options.allowedOrigins,
+    });
+    const ownServer = createServer((req, res) => {
+      if (serveConfig(req, res)) return;
+      const body = "Upgrade Required";
+      res.writeHead(426, {
+        "Content-Type": "text/plain",
+        "Content-Length": String(body.length),
+      });
+      res.end(body);
+    });
+    ownedServer = ownServer;
+    attachedServer = ownServer;
+    wssOptions.server = ownServer;
+    startListening = () => ownServer.listen(options.port);
+  } else {
+    wssOptions.port = options.port;
+  }
+
+  const wss = new WebSocketServer(wssOptions as any);
+
+  if (ownedServer) {
+    // `ws` treats `{ server }` as caller-owned and does not close it when
+    // `wss.close()` runs. For the `exposeAuthConfig` sugar path the factory
+    // created that http.Server itself, so close ownership needs to be wired
+    // back explicitly to preserve parity with classic `{ port }` mode.
+    let ownedServerClosed = false;
+    ownedServer.once("close", () => {
+      ownedServerClosed = true;
+    });
+    ownedServer.on("error", (err) => {
+      (wss as { emit?: (event: string, error: Error) => void }).emit?.("error", err);
+    });
+    wss.on("close", () => {
+      if (ownedServerClosed) return;
+      ownedServer!.close((err) => {
+        if (!err || (err as NodeJS.ErrnoException).code === "ERR_SERVER_NOT_RUNNING") return;
+        (wss as { emit?: (event: string, error: Error) => void }).emit?.("error", err);
+      });
+    });
+  }
 
   wss.on("connection", async (socket, req) => {
+    // WS-level keepalive bookkeeping (opt-in via `heartbeatMs`). Mark
+    // the socket alive on connect and on every pong; the interval below
+    // terminates any socket still flagged dead at the next tick.
+    if (heartbeatMs > 0) {
+      (socket as { isAlive?: boolean }).isAlive = true;
+      socket.on?.("pong", () => {
+        (socket as { isAlive?: boolean }).isAlive = true;
+      });
+    }
+
     // Origin check retained as defense-in-depth. When verifyClient runs
     // (the normal path under this factory), a disallowed origin has
     // already been rejected pre-handshake, so this branch is a no-op.
@@ -844,6 +980,44 @@ export async function createAuthenticatedWSS(
       socket.close(1008, "Unauthorized");
     }
   });
+
+  // WS-level ping/pong heartbeat (opt-in). Neither `handleConnection` /
+  // RemoteShellProxy nor `ws` runs a heartbeat by default, so an idle
+  // authenticated session (no application traffic) can be silently
+  // dropped by an intermediary with an idle timeout (AWS ALB defaults to
+  // 60s) while the server keeps a half-open socket until OS-level TCP
+  // keepalive notices (~2h). Ping every client each tick and terminate
+  // any that did not pong since the previous one. `terminate()` fires the
+  // socket's `close`, so handleConnection's teardown (and the
+  // connection:close event) still runs. Lives here, not in
+  // `handleConnection`, because it iterates `wss.clients` — a
+  // server-level concept — keeping the per-connection handler
+  // transport-agnostic.
+  if (heartbeatMs > 0) {
+    const heartbeat = setInterval(() => {
+      for (const client of wss.clients as Set<{
+        isAlive?: boolean;
+        terminate: () => void;
+        ping: () => void;
+      }>) {
+        if (client.isAlive === false) {
+          client.terminate();
+          continue;
+        }
+        client.isAlive = false;
+        client.ping();
+      }
+    }, heartbeatMs);
+    // Don't let the heartbeat timer alone keep the process alive.
+    heartbeat.unref?.();
+    const clearHeartbeat = () => clearInterval(heartbeat);
+    wss.on("close", clearHeartbeat);
+    attachedServer?.on?.("close", clearHeartbeat);
+  }
+
+  // For the `exposeAuthConfig` path, start listening only AFTER the
+  // WebSocketServer has attached its upgrade handler to `ownServer`.
+  startListening?.();
 
   return wss;
 }

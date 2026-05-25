@@ -2,9 +2,15 @@
 
 Authenticated WebSocket server for the example clients (vanilla / wcstack-state / react / vue), built on `@csbc-dev/auth0/server`.
 
-This example uses the **low-level `handleConnection` API composed with a self-owned `http.Server`** (via `ws`'s `noServer: true` + manual `upgrade` handling), rather than the all-in-one `createAuthenticatedWSS` helper. That keeps the example in control of its own HTTP layer so it can also serve `/auth-config` on the same port. `RemoteShellProxy` is not constructed directly — it is the value `handleConnection` returns; the example forwards property events / command invocations through it implicitly.
+This example composes three primitives from `@csbc-dev/auth0/server` on an `http.Server` it owns:
 
-It instantiates one [`AppCore`](../shared/appCore.js) per authenticated WebSocket — a tiny per-user counter — and forwards property events / command invocations through the `RemoteShellProxy` that `handleConnection` builds.
+- **`createAuthenticatedWSS({ server })`** — attaches the authenticated WebSocket to the example's own `http.Server` instead of owning a bare port, so the same port also serves HTTP routes. `{ server }` keeps the pre-handshake `verifyClient` token check (bad tokens never get a `101`), so no hand-written `upgrade` / `rejectUpgrade` plumbing is needed.
+- **`createAuthConfigHandler(...)`** — serves `GET /auth-config` (config discovery), owning its own CORS / cache-control / per-request `remoteUrl` derivation.
+- **`heartbeatMs`** — opt-in WS ping/pong keepalive so an idle authenticated session is not silently dropped by an intermediary's idle timeout.
+
+The wiring lives in [`createExampleServer.js`](./createExampleServer.js) (env validation + CORS + the `/_shared/` static mount — the non-package glue); [`server.js`](./server.js) is a thin entry point that only supplies the Core factory.
+
+It instantiates one [`AppCore`](../shared/appCore.js) per authenticated WebSocket — a tiny per-user counter. `RemoteShellProxy` is not constructed directly; `createAuthenticatedWSS` builds it per connection and forwards property events / command invocations through it.
 
 It also serves a small **`GET /auth-config`** endpoint on the same port so static / no-bundler clients (notably [`../wcstack-state/`](../wcstack-state/)) can bootstrap without baking tenant values into HTML. See [docs/patterns/server-config-discovery.md](../../docs/patterns/server-config-discovery.md) for the rationale and threat model.
 
@@ -29,7 +35,7 @@ npm run dev
 
 ## Notes
 
-- The HTTP layer is small by design — one route plus the default 426 fallback. The server explicitly owns its `http.Server` and attaches `ws` via `noServer: true` + manual `upgrade` handling, so adding routes (`/healthz`, an Express / Fastify mount, additional config paths) is a matter of editing the existing `httpServer` rather than reaching into a `ws` internal. Production deployments that already have an HTTP server should follow the same composition pattern with `handleConnection` + `verifyAuth0Token` + `extractTokenFromProtocol` from `@csbc-dev/auth0/server`.
+- The HTTP layer is small by design — `/auth-config`, the `/_shared/` static mount, plus the default 426 fallback. The server owns its `http.Server` and attaches the WebSocket via `createAuthenticatedWSS({ server })`, so adding routes (`/healthz`, an Express / Fastify mount, additional config paths) is a matter of editing the existing `httpServer`. `createAuthConfigHandler` writes to `res` only for the config path, so it co-exists with whatever routing you add. Production deployments that already have an HTTP server follow this same `{ server }` composition; for per-path WebSocket routing (multiple WS endpoints on one server) drop to `handleConnection` + `verifyAuth0Token` + `extractTokenFromProtocol`.
 - **State is per-connection.** `createCores: user => new AppCore(user)` constructs a fresh `AppCore` for each authenticated WebSocket. `count` lives in JS memory on the server and is lost on disconnect (logout, page reload, network drop, server restart). The demo is intentional — it shows the wire shape without dragging in a database — but anything beyond a demo needs an explicit persistence layer (write to Redis / Postgres on each command and re-hydrate inside `createCores`). Re-connection (`AuthShell.reconnect` / `<auth0-session>`'s auto-restart) restores the wire but not the state.
 - **Observing auth:refresh failures.** When an in-band `auth:refresh` is rejected, this server logs it (`[ws] auth:refresh-failure ...` via the `onEvent` hook) AND the client observes it as the `error` state on `<auth0-session>` (and, in this example, the per-client "Session error: ..." line). So the failure is visible on both sides without extra wiring.
 - For production, add `sessionGraceMs` / `expParseFailurePolicy: "close"` per [README-REMOTE.md §Session expiry hardening](../../README-REMOTE.md#session-expiry-hardening).

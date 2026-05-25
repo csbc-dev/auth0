@@ -4,7 +4,16 @@ A documented pattern for **remote-mode** deployments where the static client sho
 
 The server (`createAuthenticatedWSS`) already holds the same tenant values it needs to verify tokens. This pattern lets the static client fetch those values at boot from a small **`GET /auth-config`** endpoint mounted on the same port as the WebSocket, then stamp them onto `<auth0-gate>` before the custom element is upgraded.
 
-> Status: **documented pattern, not a built-in feature** of `@csbc-dev/auth0`. Each application's HTTP layer and config schema differ enough that a one-size-fits-all `exposeAuthConfig` option would lock in too many decisions. If your usage matches this pattern closely, copy it into your server / static client; if you need richer discovery (multiple tenants, feature flags, RBAC defaults), extend the JSON shape on your side.
+> Status: **partially built-in.** `@csbc-dev/auth0/server` now ships
+> `createAuthConfigHandler(...)` — a framework-agnostic request-handler
+> factory that serves the config JSON (CORS, cache-control, per-request
+> `remoteUrl` derivation, and an `extend()` hook for extra fields). You
+> still own your HTTP layer and JSON shape; the package just removes the
+> hand-written boilerplate. For the pure standalone case there is also a
+> one-line `exposeAuthConfig` sugar on `createAuthenticatedWSS` (port mode
+> only — see below). Each application's HTTP layer and config schema still
+> differ enough that the handler is a primitive you compose, not a blessed
+> end-to-end schema.
 
 ## Why this is OK security-wise
 
@@ -46,77 +55,71 @@ A `GET /auth-config` endpoint is therefore a **delivery convenience**, not a sec
       │                                            │   per SPEC-REMOTE.md)
 ```
 
-## Server side (~50 lines)
+## Server side
 
-The example server owns its `http.Server` directly and attaches `ws` via `noServer: true`, so the `/auth-config` route is just an `http` handler on a server we created. The token verification + Core construction stack from `@csbc-dev/auth0/server` (`verifyAuth0Token` / `extractTokenFromProtocol` / `handleConnection`) is wired into the upgrade event by hand. This composition is the same pattern documented for production deployments — no reliance on `ws` internals.
+You own the `http.Server`; mount `createAuthConfigHandler()` as one route on it and attach the authenticated WebSocket with `createAuthenticatedWSS({ server })`. The factory's `{ server }` mode keeps the pre-handshake `verifyClient` token check (bad tokens never get a `101`), so no hand-written `upgrade` / `rejectUpgrade` plumbing is needed.
 
 ```js
-// examples/server/server.js (excerpt — see file for the full version)
+// Composable form — full control over your HTTP layer.
 import { createServer } from "node:http";
-import { WebSocketServer } from "ws";
 import {
-  handleConnection,
-  verifyAuth0Token,
-  extractTokenFromProtocol,
+  createAuthenticatedWSS,
+  createAuthConfigHandler,
 } from "@csbc-dev/auth0/server";
 
+// Owns its own CORS, 403 gate, Cache-Control, and per-request remoteUrl
+// derivation. Returns true once it has handled the request.
+const serveAuthConfig = createAuthConfigHandler({
+  domain: auth0Domain,
+  clientId: auth0ClientId,
+  audience: auth0Audience,
+  allowedOrigins,                 // mirror the WS allowlist
+  remoteUrl: process.env.PUBLIC_WS_URL || undefined, // else derive from Host
+  // extend: (req) => ({ featureFlags, ... }),        // optional extra fields
+});
+
 const httpServer = createServer((req, res) => {
-  // CORS — reuse the same allowlist that gates the WebSocket upgrade.
-  const origin = req.headers.origin;
-  if (allowedOrigins.length === 0) {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-  } else if (origin && allowedOrigins.includes(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Vary", "Origin");
-  }
-  // …OPTIONS preflight…
-
-  if (req.method === "GET" && req.url === "/auth-config") {
-    res.setHeader("Content-Type", "application/json; charset=utf-8");
-    res.setHeader("Cache-Control", "private, max-age=60"); // body is request-derived — keep out of shared caches
-    res.end(JSON.stringify({
-      domain:    auth0Domain,
-      clientId:  auth0ClientId,
-      audience:  auth0Audience,
-      remoteUrl: resolveRemoteUrl(req),   // ← derived from Host / X-Forwarded-Proto
-    }));
-    return;
-  }
-
+  if (serveAuthConfig(req, res)) return;  // GET /auth-config + its OPTIONS
+  // …your own routes (/_shared/, /healthz)…
   res.writeHead(426, { "Content-Type": "text/plain" });
   res.end("Upgrade Required");
 });
 
-const wss = new WebSocketServer({ noServer: true, /* …maxPayload, handleProtocols… */ });
-
-httpServer.on("upgrade", (req, socket, head) => {
-  // origin check + verifyAuth0Token BEFORE handleUpgrade — bad tokens
-  // never get a 101 response.
-  // …rejectUpgrade(socket, 401, "Unauthorized") on failure…
-  const token = extractTokenFromProtocol(req.headers["sec-websocket-protocol"]);
-  verifyAuth0Token(token, { domain: auth0Domain, audience: auth0Audience })
-    .then((user) => wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req, user)));
-});
-
-wss.on("connection", (ws, req, preVerifiedUser) => {
-  handleConnection(ws, req.headers["sec-websocket-protocol"], {
-    auth0Domain,
-    auth0Audience,
-    createCores: (user) => new AppCore(user),
-    onTokenRefresh: (core, user) => core.updateUser(user),
-    preVerifiedUser,
-  });
+const wss = await createAuthenticatedWSS({
+  server: httpServer,             // ← attach, don't own the port
+  auth0Domain,
+  auth0Audience,
+  allowedOrigins,
+  createCores: (user) => new AppCore(user),
+  onTokenRefresh: (core, user) => core.updateUser(user),
+  heartbeatMs: 30_000,            // opt-in WS keepalive
 });
 
 httpServer.listen(port);
 ```
 
+For the pure standalone case (no other HTTP routes), skip the manual `http.Server` entirely with the `exposeAuthConfig` sugar — the factory creates and owns the server, mounts `/auth-config`, and 426s everything else:
+
+```js
+const wss = await createAuthenticatedWSS({
+  port,
+  auth0Domain,
+  auth0Audience,
+  allowedOrigins,
+  createCores: (user) => new AppCore(user),
+  exposeAuthConfig: { clientId: auth0ClientId }, // domain/audience reused
+});
+```
+
+> `exposeAuthConfig` is valid in **`port` mode only**. When you bring your own `server`, mount `createAuthConfigHandler()` in your request handler instead (a second `request` listener would race yours) — `createAuthenticatedWSS` throws if you combine `server` with `exposeAuthConfig`.
+
 Notes:
 
-- The example owns the `http.Server`, so additional routes (`/healthz`, an Express / Fastify mount) plug in by editing the same `httpServer` — no overwriting of internal listeners, no dependence on private `ws` fields. The previous version of this snippet reached into `wss._server` and called `removeAllListeners("request")`, which would have broken silently the moment ws or any middleware attached another request listener; the noServer composition removes that fragility.
-- The same `allowedOrigins` list gates the WebSocket upgrade AND the HTTP CORS response. A request that would have been allowed to open a WebSocket is also allowed to read the config.
-- `remoteUrl` is derived per request from `req.headers.host` and (when present) `X-Forwarded-Proto` so the config endpoint advertises the actual reachable URL — works unchanged on localhost, behind a reverse proxy, and on any non-localhost host. A `PUBLIC_WS_URL` env var overrides the derivation when the WS endpoint lives on a different host than the config endpoint.
-- `Cache-Control: private, max-age=60` — `private` (not `public`) because the body's `remoteUrl` is derived per request from `Host` / `X-Forwarded-Proto`, so it must not land in a shared CDN / forward-proxy cache that could serve one host's URL to another; the browser may still cache it. `max-age=60` is short on purpose — too long would slow recovery from a tenant rotation.
+- You own the `http.Server`, so additional routes (`/healthz`, an Express / Fastify mount) plug in by editing the same `httpServer`. `createAuthConfigHandler` writes to `res` **only** for the config path (and its `OPTIONS`), so it co-exists with any routing you already have.
+- The same `allowedOrigins` list gates the WebSocket upgrade AND the config CORS response. A request that would have been allowed to open a WebSocket is also allowed to read the config.
+- `remoteUrl` is derived per request from `req.headers.host` and (when present) `X-Forwarded-Proto` so the config endpoint advertises the actual reachable URL — works unchanged on localhost, behind a reverse proxy, and on any non-localhost host. Pass a string (e.g. `PUBLIC_WS_URL`) to pin it, or a `(req) => string` function for custom derivation.
+- `Cache-Control` defaults to `private, max-age=60` — `private` (not `public`) because the body's `remoteUrl` is derived per request from `Host` / `X-Forwarded-Proto`, so it must not land in a shared CDN / forward-proxy cache that could serve one host's URL to another; the browser may still cache it. `max-age=60` is short on purpose — too long would slow recovery from a tenant rotation. Override via the `cacheControl` option.
+- For per-path WebSocket routing (multiple WS endpoints on one server), `{ server }` is too coarse — drop to `verifyAuth0Token` + `handleConnection` with your own `noServer` `handleUpgrade`, as the reference `handleConnection` is transport-agnostic.
 
 ## Client side — pick the variant that matches your stack
 
@@ -241,6 +244,7 @@ The HTTP round-trip is small (~5 KB JSON, single TCP/TLS) compared to the WebSoc
 
 ## Reference implementation
 
-- Server: [examples/server/server.js](../../examples/server/server.js)
+- Server entry: [examples/server/server.js](../../examples/server/server.js) (thin — just the Core factory)
+- Server composition: [examples/server/createExampleServer.js](../../examples/server/createExampleServer.js) (env / CORS / `/_shared/` glue wrapping the three package primitives)
 - Client: [examples/wcstack-state/index.html](../../examples/wcstack-state/index.html)
 - README walkthrough: [examples/wcstack-state/README.md](../../examples/wcstack-state/README.md)

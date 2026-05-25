@@ -312,6 +312,78 @@ export interface AuthenticatedConnectionOptions {
 }
 
 /**
+ * Options for `createAuthConfigHandler` — a framework-agnostic factory
+ * that builds an HTTP request handler serving the **non-secret** Auth0
+ * client config (`domain` / `clientId` / `audience` / `remoteUrl`) as
+ * JSON.
+ *
+ * Intended for static / buildless clients that fetch their config at
+ * boot (`GET /auth-config`) instead of baking tenant values into HTML —
+ * see docs/patterns/server-config-discovery.md. None of these values is
+ * a credential (an Auth0 SPA has no client secret); CORS gates *who*
+ * can read the endpoint, but the body is designed to ship to clients.
+ */
+export interface AuthConfigHandlerOptions {
+  domain: string;
+  /**
+   * SPA client id. Required here because the server otherwise never
+   * holds it — `verifyAuth0Token` only needs `domain` + `audience`.
+   */
+  clientId: string;
+  audience: string;
+  /**
+   * WebSocket URL advertised to the client.
+   *
+   * - `string` — used verbatim.
+   * - function — derived per request (e.g. from `Host` /
+   *   `X-Forwarded-Proto`), for deployments behind a reverse proxy or
+   *   on non-localhost hosts.
+   * - omitted — the built-in derivation from the request headers is
+   *   used (TLS-aware via `X-Forwarded-Proto` / `socket.encrypted`).
+   */
+  remoteUrl?: string | ((req: import("node:http").IncomingMessage) => string);
+  /** Route path the handler responds on. Default: `"/auth-config"`. */
+  path?: string;
+  /**
+   * Origin allowlist mirrored from the WebSocket layer. When non-empty,
+   * a request whose `Origin` is not listed gets a 403 and no
+   * `Access-Control-Allow-Origin` header. Empty / unset means any
+   * origin (`Access-Control-Allow-Origin: *`) — intended for local dev.
+   */
+  allowedOrigins?: string[];
+  /** `Cache-Control` header value. Default: `"private, max-age=60"`. */
+  cacheControl?: string;
+  /**
+   * Extra fields merged into the config JSON, computed per request.
+   * Lets a deployment append feature flags / RBAC defaults / tenant
+   * metadata WITHOUT the package locking in a schema. Keys returned
+   * here override the built-in fields if they collide.
+   */
+  extend?: (req: import("node:http").IncomingMessage) => Record<string, unknown>;
+}
+
+/**
+ * Options for the `exposeAuthConfig` convenience on
+ * `createAuthenticatedWSS`.
+ *
+ * A thin sugar over {@link AuthConfigHandlerOptions} /
+ * `createAuthConfigHandler`, valid **only when the factory owns the
+ * HTTP server** (i.e. `port` mode, not `server` mode — providing your
+ * own `server` means you mount `createAuthConfigHandler()` yourself to
+ * avoid a second, racing `request` listener). `domain` / `audience`
+ * default to the factory's `auth0Domain` / `auth0Audience`, and
+ * `allowedOrigins` is reused from the factory options.
+ */
+export interface ExposeAuthConfigOptions {
+  /** SPA client id — the server does not otherwise hold it. */
+  clientId: string;
+  remoteUrl?: string | ((req: import("node:http").IncomingMessage) => string);
+  path?: string;
+  cacheControl?: string;
+  extend?: (req: import("node:http").IncomingMessage) => Record<string, unknown>;
+}
+
+/**
  * Options for verifyAuth0Token().
  */
 export interface VerifyTokenOptions {
