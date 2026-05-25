@@ -15,39 +15,29 @@
     </style>
 
     <!--
-      Define the payload custom element. The session adopts the first
-      wc-bindable child via `child.constructor.wcBindable`, which is
-      module-instance agnostic — no need to share the bootstrap call
-      with @csbc-dev/auth0/auto.
+      Define the payload custom element (<app-core-facade>). The session adopts
+      the first wc-bindable child via `child.constructor.wcBindable`, which is
+      module-instance agnostic — no need to share the bootstrap call with
+      @csbc-dev/auth0/auto.
 
-      IMPORTANT — this schema is a HAND-WRITTEN DUPLICATE of the one in
-      ../shared/appCore.js (`appCoreDeclaration`). The other examples
-      (vanilla / react / vue) import that single source of truth; this
-      CDN / no-bundler page cannot import from ../shared without a build
-      step, so the declaration is copied here. KEEP THE TWO IN SYNC:
-      property names, command names, AND every `event` string must match
-      ../shared/appCore.js exactly, or the server-side mirrors will not
-      line up with this facade.
+      The definition is DELIVERED BY THE EXAMPLE SERVER over its `/_shared/`
+      static mount (../shared served as static files). So the schema flows from
+      the SINGLE source of truth — `appCoreDeclaration` in ../shared/appCore.js,
+      the same declaration the server-side `AppCore` carries — via
+      appCoreFacade.auto.js → appCoreFacade.js → appCore.js. There is no
+      hand-written duplicate in this page to keep in sync. (appCore.js has no
+      bare imports, so this needs no import map.)
+
+      Loaded cross-origin (this page is served separately from the server, e.g.
+      at :5176): the server's CORS header makes the module-script load work.
+      Timing is safe even though it loads async — <auth0-session> awaits
+      `customElements.whenDefined("app-core-facade")` before adopting the child,
+      so load order vs. the auto bundles does not matter.
+
+      URL note: this points at the SAME example server as CONFIG_URL below
+      (http://localhost:3000). Adjust both if your server is not there.
     -->
-    <script type="module">
-      class AppCoreFacade extends HTMLElement {
-        // Must match `appCoreDeclaration` in ../shared/appCore.js verbatim.
-        static wcBindable = {
-          protocol: "wc-bindable",
-          version: 1,
-          properties: [
-            { name: "count",         event: "app-core:count-changed" },
-            { name: "connectedUser", event: "app-core:connected-user-changed" },
-          ],
-          commands: [
-            { name: "increment" },
-            { name: "decrement" },
-            { name: "reset" },
-          ],
-        };
-      }
-      customElements.define("app-core-facade", AppCoreFacade);
-    </script>
+    <script type="module" src="http://localhost:3000/_shared/appCoreFacade.auto.js"></script>
 
     <script type="module" src="https://esm.run/@csbc-dev/auth0/auto"></script>
     <script type="module" src="https://esm.run/@wcstack/state/auto"></script>

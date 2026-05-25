@@ -1,4 +1,7 @@
 import { createServer } from "node:http";
+import { readFile } from "node:fs/promises";
+import { dirname, extname, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
 import {
   handleConnection,
@@ -6,6 +9,22 @@ import {
   extractTokenFromProtocol,
 } from "@csbc-dev/auth0/server";
 import { AppCore } from "../shared/appCore.js";
+
+// Directory of shared browser modules served over the `/_shared/` mount below.
+// The buildless wcstack-state example loads `/_shared/appCoreFacade.auto.js`
+// from here, which defines <app-core-facade> from the same `appCoreDeclaration`
+// this server's `AppCore` uses — a single source of truth, no hand-written
+// duplicate in the HTML. Mirrors feature-flags' `/_shared/` convention.
+const SHARED_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "../shared");
+
+const MIME_TYPES = {
+  ".js": "application/javascript; charset=utf-8",
+  ".mjs": "application/javascript; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".map": "application/json; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".html": "text/html; charset=utf-8",
+};
 
 // PORT validation. `Number(process.env.PORT ?? 3000)` is too lenient:
 // `PORT=""` (a common "set but empty" shape in .env files) is NOT caught
@@ -115,6 +134,18 @@ const httpServer = createServer((req, res) => {
         remoteUrl: resolveRemoteUrl(req),
       }),
     );
+    return;
+  }
+
+  // Static mount for shared browser modules. Cross-origin module-script /
+  // dynamic-import loads work because the CORS header set at the top of this
+  // handler already applies (the schema is non-secret — only property/command
+  // names — so there is no per-origin 403 like /auth-config; an off-allowlist
+  // browser is still blocked by the absent Access-Control-Allow-Origin). The
+  // body is async (readFile), so it is handled in a helper that owns all of its
+  // own status codes and never rejects back into this synchronous handler.
+  if (req.method === "GET" && pathname.startsWith("/_shared/")) {
+    serveShared(pathname, res);
     return;
   }
 
@@ -309,6 +340,46 @@ function onAuthEvent(event) {
 
 function normalize(err) {
   return err instanceof Error ? err : new Error(String(err));
+}
+
+// Serve a file from SHARED_DIR for a `/_shared/...` request. Self-contained:
+// owns its own status codes (400 / 403 / 404) and catches every failure mode,
+// so the synchronous request handler can call it fire-and-forget without an
+// unhandled rejection taking the process down. CORS headers were already set on
+// `res` by the top of the handler.
+async function serveShared(pathname, res) {
+  let relative;
+  try {
+    // `decodeURIComponent` throws a URIError on a malformed escape (a bare `%`);
+    // treat that as a client error rather than letting it reject the promise.
+    relative = decodeURIComponent(pathname.slice("/_shared/".length));
+  } catch {
+    res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("Bad Request");
+    return;
+  }
+
+  // Resolve and confine to SHARED_DIR — reject path traversal (`../`).
+  const file = resolve(SHARED_DIR, relative);
+  const rootWithSep = SHARED_DIR.endsWith(sep) ? SHARED_DIR : SHARED_DIR + sep;
+  if (file !== SHARED_DIR && !file.startsWith(rootWithSep)) {
+    res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("Forbidden");
+    return;
+  }
+
+  try {
+    const content = await readFile(file);
+    res.setHeader("Content-Type", MIME_TYPES[extname(file)] || "application/octet-stream");
+    // Example glue; the schema is non-secret. Let the browser cache briefly so a
+    // reload does not re-fetch, while a facade edit still propagates within a
+    // minute (matches the /auth-config max-age).
+    res.setHeader("Cache-Control", "public, max-age=60");
+    res.end(content);
+  } catch {
+    res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("Not Found");
+  }
 }
 
 // Resolve the WebSocket URL advertised through /auth-config.
