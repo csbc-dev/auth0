@@ -4,15 +4,16 @@
 
 It is not a visual UI widget. It is an **I/O node** that connects Auth0 authentication to reactive state:
 
-- **input / command surface**: `domain`, `client-id`, `trigger`
-- **output state surface**: `authenticated`, `user`, `loading`, `error` (+ `connected` in remote mode)
+- **`<auth0-config>`**: fetches public boot config (`domain`, `clientId`, `audience`, `remoteUrl`) from a JSON endpoint and exposes it as bindable state
+- **`<auth0-gate>` input / command surface**: `domain`, `client-id`, `trigger`, login/logout/token/connect commands
+- **`<auth0-gate>` output state surface**: `authenticated`, `user`, `loading`, `error` (+ `connected` in remote mode)
 
 Authentication state can be expressed declaratively in HTML, without writing OAuth flows, token management, or login/logout glue code in your UI layer.
 
 `@csbc-dev/auth0` follows the **CSBC (Core/Shell Bindable Component)** architecture:
 
 - **Core** (`AuthCore`) handles Auth0 SDK interaction, token management, and auth state
-- **Shell** (`<auth0-gate>`) connects that state to the DOM
+- **Shells** (`<auth0-config>`, `<auth0-gate>`, `<auth0-session>`) connect config, auth state, and remote readiness to the DOM
 - frameworks and binding systems consume it through [wc-bindable-protocol](https://github.com/wc-bindable-protocol/wc-bindable-protocol)
 
 `@csbc-dev/auth0` spans two CSBC shapes. In **local mode** it is the **Case A** shape: the Core itself is browser-anchored because the Auth0 SPA SDK and redirect callback flow require browser globals. In **remote mode** the element becomes a thin browser-side gatekeeper for authenticated access to server-side Cores, typically paired with `<auth0-session>`.
@@ -61,6 +62,7 @@ Remote deployments additionally need `@wc-bindable/remote`.
 | Call `fetch('/api/...')` from browser JS with a Bearer token | [README-LOCAL.md](README-LOCAL.md) |
 | Connect to a WebSocket backend that constructs server-side Cores after auth | [README-REMOTE.md](README-REMOTE.md) |
 | Need the full remote protocol / server handler / error codes / threat model | [SPEC-REMOTE.md](SPEC-REMOTE.md) |
+| Need to serve Auth0 tenant values from the backend at boot | [docs/patterns/server-config-discovery.md](docs/patterns/server-config-discovery.md) |
 
 ## Error contract (at a glance)
 

@@ -1,13 +1,24 @@
 export interface ITagNames {
+  readonly authConfig: string;
   readonly auth: string;
   readonly authLogout: string;
   readonly authSession: string;
 }
 
 export interface IWritableTagNames {
+  authConfig?: string;
   auth?: string;
   authLogout?: string;
   authSession?: string;
+}
+
+export interface AuthConfigValues {
+  domain: string;
+  clientId: string;
+  audience: string;
+  remoteUrl: string;
+  loading: boolean;
+  error: Error | null;
 }
 
 export interface IConfig {

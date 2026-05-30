@@ -2,18 +2,16 @@
 
 A documented pattern for **remote-mode** deployments where the static client should not bake `domain` / `client-id` / `audience` / `remote-url` into HTML — typically because the same HTML is shipped to multiple environments (dev/staging/prod) or hosted off a CDN.
 
-The server (`createAuthenticatedWSS`) already holds the same tenant values it needs to verify tokens. This pattern lets the static client fetch those values at boot from a small **`GET /auth-config`** endpoint mounted on the same port as the WebSocket, then stamp them onto `<auth0-gate>` before the custom element is upgraded.
+The server (`createAuthenticatedWSS`) already holds the same tenant values it needs to verify tokens. This pattern lets the static client fetch those values at boot from a small **`GET /auth-config`** endpoint mounted on the same port as the WebSocket, then stamp them onto `<auth0-gate>`.
 
-> Status: **partially built-in.** `@csbc-dev/auth0/server` now ships
-> `createAuthConfigHandler(...)` — a framework-agnostic request-handler
-> factory that serves the config JSON (CORS, cache-control, per-request
-> `remoteUrl` derivation, and an `extend()` hook for extra fields). You
-> still own your HTTP layer and JSON shape; the package just removes the
-> hand-written boilerplate. For the pure standalone case there is also a
-> one-line `exposeAuthConfig` sugar on `createAuthenticatedWSS` (port mode
-> only — see below). Each application's HTTP layer and config schema still
-> differ enough that the handler is a primitive you compose, not a blessed
-> end-to-end schema.
+> Status: **built-in as composable primitives.** `@csbc-dev/auth0/server`
+> ships `createAuthConfigHandler(...)` — a framework-agnostic
+> request-handler factory that serves the config JSON (CORS,
+> cache-control, per-request `remoteUrl` derivation, and an `extend()`
+> hook for extra fields). The browser package ships `<auth0-config>`,
+> which fetches that JSON and exposes `domain` / `clientId` / `audience` /
+> `remoteUrl` / `loading` / `error` as wc-bindable state. You still own
+> the HTTP layer and the declarative wiring into `<auth0-gate>`.
 
 ## Why this is OK security-wise
 
@@ -43,12 +41,9 @@ A `GET /auth-config` endpoint is therefore a **delivery convenience**, not a sec
       │         remoteUrl }                        │
       │◄───────────────────────────────────────────┤
       │                                            │
-      │ 3. setAttribute on <auth0-gate>            │
-      │    (still HTMLUnknownElement at this point)│
+      │ 3. <auth0-config> publishes bindable state │
       │                                            │
-      │ 4. dynamic import("@csbc-dev/auth0/auto")  │
-      │    → customElements.define triggers upgrade│
-      │    → connectedCallback runs with attrs set │
+      │ 4. bindings stamp attrs on <auth0-gate>    │
       │                                            │
       │ 5. <auth0-gate> opens WebSocket            │
       ├───────────────────────────────────────────►│  (normal handshake
@@ -127,7 +122,7 @@ Two equivalent ways to deliver the fetched config to `<auth0-gate>`. Both rely o
 
 ### Variant A — with `@wcstack/state` (recommended for `<wcs-state>` apps)
 
-If the page already uses `<wcs-state>`, the cleanest wiring is to fetch inside the state's `$connectedCallback` lifecycle hook and let `attr.*` bindings push the values onto `<auth0-gate>`. No imperative `setAttribute` / dynamic `import()` in HTML — `/auto` script tags load normally.
+If the page already uses `<wcs-state>`, the cleanest wiring is to let `<auth0-config>` fetch the JSON and let `attr.*` bindings push the values onto `<auth0-gate>`. No imperative `fetch` / `setAttribute` / dynamic `import()` in HTML — `/auto` script tags load normally.
 
 ```html
 <script type="module" src="https://esm.run/@csbc-dev/auth0/auto"></script>
@@ -135,36 +130,38 @@ If the page already uses `<wcs-state>`, the cleanest wiring is to fetch inside t
 
 <wcs-state>
   <script type="module">
-    const CONFIG_URL = "http://localhost:3000/auth-config";
-
     export default {
-      auth0Domain:   "",
-      auth0ClientId: "",
-      auth0Audience: "",
-      remoteUrl:     "",
-      redirectUri:   window.location.origin,
-
-      // …other state…
-
-      async $connectedCallback() {
-        const res = await fetch(CONFIG_URL);
-        if (!res.ok) throw new Error(`config fetch failed: HTTP ${res.status}`);
-        const cfg = await res.json();
-        this.auth0Domain   = cfg.domain;
-        this.auth0ClientId = cfg.clientId;
-        this.auth0Audience = cfg.audience;
-        this.remoteUrl     = cfg.remoteUrl;
+      config: {
+        domain: "",
+        clientId: "",
+        audience: "",
+        remoteUrl: "",
+        loading: true,
+        error: null,
       },
+      redirectUri:   window.location.origin,
     };
   </script>
+
+  <auth0-config
+    src="http://localhost:3000/auth-config"
+    data-wcs="
+      domain:    config.domain;
+      clientId:  config.clientId;
+      audience:  config.audience;
+      remoteUrl: config.remoteUrl;
+      loading:   config.loading;
+      error:     config.error
+    ">
+  </auth0-config>
 
   <auth0-gate
     id="auth"
     data-wcs="
-      attr.domain:       auth0Domain;
-      attr.client-id:    auth0ClientId;
-      attr.audience:     auth0Audience;
-      attr.remote-url:   remoteUrl;
+      attr.domain:       config.domain;
+      attr.client-id:    config.clientId;
+      attr.audience:     config.audience;
+      attr.remote-url:   config.remoteUrl;
       attr.redirect-uri: redirectUri;
       authenticated:     isLoggedIn;
       user:              currentUser;
@@ -180,33 +177,25 @@ Reference: [examples/wcstack-state/index.html](../../examples/wcstack-state/inde
 
 ### Variant B — plain HTML (no state library)
 
-Same end state, expressed imperatively. The single hardcoded value in HTML is the **config server URL**; everything else is fetched and stamped onto `<auth0-gate>` before the custom element upgrades.
+Same end state, expressed imperatively. The single hardcoded value in HTML is the **config server URL**; everything else is fetched and stamped onto `<auth0-gate>`.
 
 ```html
+<script type="module" src="https://esm.run/@csbc-dev/auth0/auto"></script>
+
+<auth0-config id="cfg" src="http://localhost:3000/auth-config"></auth0-config>
 <auth0-gate id="auth"></auth0-gate>
 
 <script type="module">
-  const CONFIG_URL = "http://localhost:3000/auth-config";
-
-  const cfg = await fetch(CONFIG_URL).then((r) => {
-    if (!r.ok) throw new Error(`config fetch failed: HTTP ${r.status}`);
-    return r.json();
-  });
-
-  // Element exists as HTMLUnknownElement at this point — the /auto
-  // bundle's customElements.define() has not been called yet.
+  const cfg = document.getElementById("cfg");
   const auth = document.getElementById("auth");
+  await cfg.load();
+  if (cfg.error) throw cfg.error;
+
   auth.setAttribute("domain",       cfg.domain);
   auth.setAttribute("client-id",    cfg.clientId);
   auth.setAttribute("audience",     cfg.audience);
   auth.setAttribute("remote-url",   cfg.remoteUrl);
   auth.setAttribute("redirect-uri", location.origin);
-
-  // Dynamic-import the /auto bundle AFTER the attributes are set.
-  // customElements.define() inside the bundle will then upgrade
-  // the element in place, calling connectedCallback with all attrs
-  // already in their final values.
-  await import("https://esm.run/@csbc-dev/auth0/auto");
 </script>
 ```
 
@@ -214,27 +203,24 @@ Same end state, expressed imperatively. The single hardcoded value in HTML is th
 
 `<auth0-gate>`'s [Auth.ts:_tryInitialize](../../src/components/Auth.ts) only calls `initialize()` when both `domain` and `client-id` are truthy. If either is missing at upgrade time, `connectedCallback` becomes a no-op — no throw, no error event. When the missing attributes later arrive (via `setAttribute` directly, or via wcstack/state's `attr.*` propagation), `attributeChangedCallback` schedules a coalesced microtask that calls `initialize()` once both are present.
 
-This means the two variants amount to the same thing:
+This means the two variants amount to the same thing: `<auth0-config>` (or your own imperative fetch) resolves the public JSON, then the values arrive on `<auth0-gate>` after upgrade via attributes. The microtask path triggers init once both `domain` and `client-id` are present.
 
-- **Variant A** lets the upgrade happen first (with empty attributes) and pushes values via state binding afterward. The microtask path triggers init.
-- **Variant B** sets attributes BEFORE `customElements.define()` runs, so `attributeChangedCallback` (during upgrade) and `connectedCallback` see fully-populated values immediately. The synchronous `_tryInitialize` path triggers init.
+Either is correct. Variant A is preferred when wcstack/state is already in the page (fully declarative config→state→attr propagation). Variant B is for pages that don't use a state library.
 
-Either is correct. Variant A is preferred when wcstack/state is already in the page (same lifecycle hook, declarative state→attr propagation). Variant B is for pages that don't use a state library or that want to keep the bootstrap entirely in `<head>`.
-
-The empty initial values in Variant A (`auth0Domain: ""`, `remoteUrl: ""`) are deliberate. `<auth0-gate>`'s mode inference treats `remote-url=""` as **unset** (it does not flip into remote mode prematurely while the config is loading), and `_tryInitialize` treats `""` as falsy. Both behaviours were specifically reinforced by past quality cycles to make this pattern viable.
+The empty initial values in Variant A (`config.domain: ""`, `config.remoteUrl: ""`) are deliberate. `<auth0-gate>`'s mode inference treats `remote-url=""` as **unset** (it does not flip into remote mode prematurely while the config is loading), and `_tryInitialize` treats `""` as falsy. Both behaviours were specifically reinforced by past quality cycles to make this pattern viable.
 
 ## Tradeoffs
 
 | | This pattern | Static-attribute baseline |
 |---|---|---|
-| Static HTML in repo | Tenant values absent — only `CONFIG_URL` is hardcoded | All four values hardcoded; need per-env HTML or sed at deploy |
+| Static HTML in repo | Tenant values absent — only `<auth0-config src>` is hardcoded | All four values hardcoded; need per-env HTML or sed at deploy |
 | Boot latency | +1 HTTP round-trip before WebSocket open | none |
-| Same HTML for dev/staging/prod | yes (different `CONFIG_URL` per environment, OR a relative path if served from same origin) | no |
+| Same HTML for dev/staging/prod | yes (different `<auth0-config src>` per environment, OR a relative path if served from same origin) | no |
 | Tenant rotation | server `.env` change + 60s cache window | redeploy / sed every static HTML |
 | Works without CORS | only if static page and config server share origin | always |
 | Works in `file://` | no | no (Auth0 SDK requires a real origin anyway) |
 
-The HTTP round-trip is small (~5 KB JSON, single TCP/TLS) compared to the WebSocket handshake itself, but it's still latency on cold load. If you can serve the static HTML from the same origin as the WebSocket server (e.g. behind a reverse proxy that fronts both), use a relative `CONFIG_URL = "/auth-config"` and avoid CORS preflight altogether.
+The HTTP round-trip is small (~5 KB JSON, single TCP/TLS) compared to the WebSocket handshake itself, but it's still latency on cold load. If you can serve the static HTML from the same origin as the WebSocket server (e.g. behind a reverse proxy that fronts both), use a relative `<auth0-config src="/auth-config">` and avoid CORS preflight altogether.
 
 ## When NOT to use this
 

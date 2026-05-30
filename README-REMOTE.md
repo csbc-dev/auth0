@@ -55,11 +55,45 @@ npm install @csbc-dev/auth0 @wc-bindable/remote @auth0/auth0-spa-js
 
 The recommended declarative flow uses **two elements** plus a **user-defined payload child**:
 
+- `<auth0-config>` — optional config-discovery source that fetches public boot config from `/auth-config` and exposes it as bindable state.
 - `<auth0-gate>` — the Auth0 gatekeeper (same element as local mode).
 - `<auth0-session>` — a companion that owns the remote session: calls `connect()` on login, wraps the returned transport with `createRemoteCoreProxy()`, and flips a single `ready` signal when the server's initial `sync` lands.
 - A **child custom element** whose class declares `static wcBindable` matching the server-side Core's surface. The session adopts that child as its data-plane facade.
 
 Without `<auth0-session>`, application code has to manually wire the transport → proxy → "first bind callback batch" → `synced` state machine. The session element collapses that into one declarative `ready` property.
+
+### Optional: discover Auth0 config from the server
+
+For static / CDN-hosted clients, avoid baking `domain`, `client-id`, `audience`, and `remote-url` into HTML. Mount `createAuthConfigHandler()` or `createAuthenticatedWSS({ exposeAuthConfig })` on the server, then let `<auth0-config>` fetch the public JSON and bind the values into `<auth0-gate>`.
+
+```html
+<auth0-config
+  src="/auth-config"
+  data-wcs="
+    domain:    config.domain;
+    clientId:  config.clientId;
+    audience:  config.audience;
+    remoteUrl: config.remoteUrl;
+    loading:   config.loading;
+    error:     config.error
+  ">
+</auth0-config>
+
+<auth0-gate
+  id="auth"
+  data-wcs="
+    attr.domain:     config.domain;
+    attr.client-id:  config.clientId;
+    attr.audience:   config.audience;
+    attr.remote-url: config.remoteUrl;
+    authenticated:   isLoggedIn;
+    user:            currentUser;
+    connected:       wsConnected
+  ">
+</auth0-gate>
+```
+
+The config values are not secrets; do not include client secrets or tokens in this endpoint. See [docs/patterns/server-config-discovery.md](docs/patterns/server-config-discovery.md) for the full server-side pattern.
 
 ### 1. Define your payload element
 

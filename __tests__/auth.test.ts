@@ -36,6 +36,7 @@ describe("raiseError", () => {
 
 describe("config", () => {
   it("デフォルト設定を取得できる", () => {
+    expect(config.tagNames.authConfig).toBe("auth0-config");
     expect(config.tagNames.auth).toBe("auth0-gate");
     expect(config.tagNames.authLogout).toBe("auth0-logout");
     expect(config.autoTrigger).toBe(true);
@@ -44,6 +45,7 @@ describe("config", () => {
 
   it("getConfig()でフリーズされたコピーを取得できる", () => {
     const frozen = getConfig();
+    expect(frozen.tagNames.authConfig).toBe("auth0-config");
     expect(frozen.tagNames.auth).toBe("auth0-gate");
     expect(Object.isFrozen(frozen)).toBe(true);
     const frozen2 = getConfig();
@@ -58,6 +60,9 @@ describe("config", () => {
   });
 
   it("setConfig()でtagNamesを変更できる", () => {
+    setConfig({ tagNames: { authConfig: "my-auth-config" } });
+    expect(config.tagNames.authConfig).toBe("my-auth-config");
+    setConfig({ tagNames: { authConfig: "auth0-config" } });
     setConfig({ tagNames: { auth: "my-auth" } });
     expect(config.tagNames.auth).toBe("my-auth");
     setConfig({ tagNames: { auth: "auth0-gate" } });
@@ -95,6 +100,8 @@ describe("config", () => {
   });
 
   it("setConfig()で tagNames.auth に空文字列を渡すと raiseError する", () => {
+    expect(() => setConfig({ tagNames: { authConfig: "" } }))
+      .toThrow(/tagNames\.authConfig.*non-empty/);
     expect(() => setConfig({ tagNames: { auth: "" } }))
       .toThrow(/tagNames\.auth.*non-empty/);
     expect(() => setConfig({ tagNames: { authLogout: "  " } }))
@@ -102,6 +109,7 @@ describe("config", () => {
     expect(() => setConfig({ tagNames: { authSession: "" } }))
       .toThrow(/tagNames\.authSession.*non-empty/);
     // Defaults intact — no partial mutation leaked through a throw.
+    expect(config.tagNames.authConfig).toBe("auth0-config");
     expect(config.tagNames.auth).toBe("auth0-gate");
     expect(config.tagNames.authLogout).toBe("auth0-logout");
     expect(config.tagNames.authSession).toBe("auth0-session");
@@ -123,6 +131,8 @@ describe("config", () => {
     // Cast through `any` because `IWritableTagNames.auth?: string` accepts
     // omission but some strict callers may still ship `{ auth: undefined }`
     // (e.g. spread from an optional field that happens to be unset).
+    setConfig({ tagNames: { authConfig: undefined } as any });
+    expect(config.tagNames.authConfig).toBe("auth0-config");
     setConfig({ tagNames: { auth: undefined } as any });
     expect(config.tagNames.auth).toBe("auth0-gate");
     setConfig({ tagNames: { authLogout: undefined } as any });
@@ -151,6 +161,8 @@ describe("config", () => {
   // a wrong field type, optional chaining that evaluates to null,
   // etc.).
   it("setConfig()で tagNames の値に非 string を渡すと raiseError する", () => {
+    expect(() => setConfig({ tagNames: { authConfig: null as any } }))
+      .toThrow(/tagNames\.authConfig.*must be a string.*null/);
     // null
     expect(() => setConfig({ tagNames: { auth: null as any } }))
       .toThrow(/tagNames\.auth.*must be a string.*null/);
@@ -165,6 +177,7 @@ describe("config", () => {
       .toThrow(/tagNames\.auth.*must be a string.*boolean/);
 
     // Defaults intact — no partial mutation leaked through a throw.
+  expect(config.tagNames.authConfig).toBe("auth0-config");
     expect(config.tagNames.auth).toBe("auth0-gate");
     expect(config.tagNames.authLogout).toBe("auth0-logout");
     expect(config.tagNames.authSession).toBe("auth0-session");
@@ -178,6 +191,8 @@ describe("config", () => {
   // far from the setConfig call. Catching the shape at the
   // configuration boundary keeps the diagnostic next to the cause.
   it("setConfig()で tagNames に不正な custom element 名を渡すと raiseError する", () => {
+    expect(() => setConfig({ tagNames: { authConfig: "Auth0-Config" } }))
+      .toThrow(/tagNames\.authConfig.*valid lower-case custom element name/);
     // Uppercase
     expect(() => setConfig({ tagNames: { auth: "Auth0-Gate" } }))
       .toThrow(/tagNames\.auth.*valid lower-case custom element name/);
@@ -192,6 +207,7 @@ describe("config", () => {
       .toThrow(/tagNames\.auth.*valid lower-case custom element name/);
 
     // Defaults intact — no partial mutation leaked through any throw.
+  expect(config.tagNames.authConfig).toBe("auth0-config");
     expect(config.tagNames.auth).toBe("auth0-gate");
     expect(config.tagNames.authLogout).toBe("auth0-logout");
     expect(config.tagNames.authSession).toBe("auth0-session");

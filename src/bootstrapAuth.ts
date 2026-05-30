@@ -4,8 +4,8 @@ import { IWritableConfig } from "./types.js";
 
 /**
  * One-shot library initialisation: applies an optional partial config
- * and registers the `<auth0-gate>` / `<auth0-logout>` / `<auth0-session>`
- * custom elements.
+ * and registers the `<auth0-config>` / `<auth0-gate>` /
+ * `<auth0-logout>` / `<auth0-session>` custom elements.
  *
  * Configuration is bootstrap-only by design. `setConfig` is not part of
  * the public package exports (`src/index.ts`) — once components are
