@@ -3,6 +3,7 @@ export { getConfig } from "./config.js";
 export { AuthCore } from "./core/AuthCore.js";
 export { AuthShell } from "./shell/AuthShell.js";
 export { Auth } from "./components/Auth.js";
+export { AuthConfig } from "./components/AuthConfig.js";
 export { AuthLogout } from "./components/AuthLogout.js";
 export { AuthSession } from "./components/AuthSession.js";
 export {
@@ -13,7 +14,7 @@ export {
 
 export type {
   IWritableConfig, IWritableTagNames,
-  AuthUser, AuthError, AuthCoreValues, AuthValues,
+  AuthUser, AuthError, AuthConfigValues, AuthCoreValues, AuthValues,
   Auth0ClientOptions,
   AuthShellValues, AuthShellOptions, AuthMode,
   UserContext, AuthenticatedConnectionOptions, VerifyTokenOptions,

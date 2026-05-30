@@ -5,6 +5,7 @@ interface IInternalConfig extends IConfig {
   autoTrigger: boolean;
   triggerAttribute: string;
   tagNames: {
+    authConfig: string;
     auth: string;
     authLogout: string;
     authSession: string;
@@ -15,6 +16,7 @@ const _config: IInternalConfig = {
   autoTrigger: true,
   triggerAttribute: "data-authtarget",
   tagNames: {
+    authConfig: "auth0-config",
     auth: "auth0-gate",
     authLogout: "auth0-logout",
     authSession: "auth0-session",
@@ -96,7 +98,7 @@ export function setConfig(partialConfig: IWritableConfig): void {
     // here, `Object.assign(_config.tagNames, { auth: undefined })` would
     // copy the own-enumerable `undefined` over a valid default and break
     // `customElements.define` / tagName comparisons downstream.
-    for (const key of ["auth", "authLogout", "authSession"] as const) {
+    for (const key of ["authConfig", "auth", "authLogout", "authSession"] as const) {
       const value = partialConfig.tagNames[key];
       if (value === undefined) continue;
       // Reject non-string values (null, numbers, objects, …) at the

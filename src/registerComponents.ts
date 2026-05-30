@@ -1,4 +1,5 @@
 import { Auth } from "./components/Auth.js";
+import { AuthConfig } from "./components/AuthConfig.js";
 import { AuthLogout } from "./components/AuthLogout.js";
 import { AuthSession } from "./components/AuthSession.js";
 import { config } from "./config.js";
@@ -66,6 +67,7 @@ function defineOrVerify(tagName: string, ctor: CustomElementConstructor): void {
 }
 
 export function registerComponents(): void {
+  defineOrVerify(config.tagNames.authConfig, AuthConfig);
   defineOrVerify(config.tagNames.auth, Auth);
   defineOrVerify(config.tagNames.authLogout, AuthLogout);
   defineOrVerify(config.tagNames.authSession, AuthSession);
