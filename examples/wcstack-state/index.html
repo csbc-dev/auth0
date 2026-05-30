@@ -86,13 +86,18 @@
           remoteUrl:     "",
           redirectUri:   window.location.origin,
 
-          // <auth0-gate> output bindings — nested so the gate's whole output
-          // surface wires with one spread (`...: auth`, see the element below).
+          // <auth0-gate> output bindings — nested under `auth` so the five
+          // outputs bind as a tidy group (`authenticated: auth.authenticated; …`,
+          // see the element below) and so this `error` stays distinct from the
+          // session's same-named `error` (a flat layout of both would collide).
           // Leaf names match the gate's `wcBindable.properties` EXACTLY
-          // (authenticated / user / loading / error / connected) — that is what
-          // makes the spread expand to `authenticated: auth.authenticated; …`.
-          // Nesting also keeps this `error` distinct from the session's
-          // same-named `error` below (a flat spread of both would collide).
+          // (authenticated / user / loading / error / connected).
+          //
+          // NOTE: these are bound EXPLICITLY, not via `...: auth`. As of the
+          // inputs/commands release the gate also declares `inputs`, and
+          // wcstack/state's spread expands `properties` PLUS `inputs` — so a
+          // blanket `...: auth` would no longer mean "just the outputs". See the
+          // long comment on the element below for the full reasoning.
           auth: {
             authenticated: false,
             user:          null,
@@ -101,10 +106,9 @@
             connected:     false,
           },
 
-          // Login trigger — an INPUT (`trigger: shouldLogin`), NOT a wcBindable
-          // output, so it stays a flat top-level prop and is NOT part of the
-          // `auth` spread (spread covers only the declared output surface).
-          shouldLogin: false,
+          // (Login is driven through the gate's `login` command, not a `trigger`
+          // boolean — see `$commandTokens` and the `login()` method below. So
+          // there is no `shouldLogin` flag here anymore.)
 
           // <auth0-session> output bindings — same idea: `...: session` spreads
           // ready / connecting / error. Its `error` is separate from auth.error.
@@ -122,19 +126,31 @@
           // to `count: live.count; connectedUser: live.connectedUser`.
           live: { count: 0, connectedUser: "" },
 
-          // Command tokens routed to <app-core-facade> by wcstack/state.
-          // The facade element exposes increment / decrement / reset in its
-          // `static wcBindable.commands`, and <auth0-session> installs them
-          // as own-property forwarders that call `proxy.invoke(...)`. The
-          // `command.<name>: <token>` bindings below subscribe each forwarder
-          // to its token, so emitting the token fires the proxy command.
+          // Command tokens. `increment` / `decrement` / `reset` route to
+          // <app-core-facade> (the server-side Core): <auth0-session> installs
+          // them as own-property forwarders that call `proxy.invoke(...)`, and
+          // the `command.<name>: <token>` bindings below subscribe each forwarder
+          // to its token. `login` routes to <auth0-gate>'s OWN `login` command
+          // (declared in its `static wcBindable.commands` as of the
+          // inputs/commands release) — the same pub/sub mechanism, just a local
+          // element method instead of a remote proxy call.
           //
-          // The tokens are EMITTED straight from the +1 / −1 / Reset buttons'
-          // `onclick: $command.<name>` bindings — no state method in between.
-          // Declaring them here is still required: `$command.<name>` resolves
-          // against this list, both for the buttons' emit side and the facade's
-          // subscribe side.
-          $commandTokens: ["increment", "decrement", "reset"],
+          // The count tokens are emitted STRAIGHT from the +1 / −1 / Reset
+          // buttons (`onclick: $command.<name>` — no state method in between).
+          // `login` is the deliberate EXCEPTION: it is emitted from the `login()`
+          // method below, not `onclick: $command.login` directly. Why — an
+          // `onclick` emit passes the DOM Event as the token payload, and a
+          // command subscriber forwards that payload to `el.login(event)`; but
+          // the gate's native `login(options)` feeds its first arg straight into
+          // Auth0 as `authorizationParams`, so a MouseEvent would land there. The
+          // facade's count commands dodge this only because their session-
+          // installed forwarders ignore args — the gate's real method does not.
+          // Emitting from `login()` with NO payload keeps `el.login()` clean.
+          //
+          // Declaring every token here is required either way: `$command.<name>`
+          // resolves against this list, for both the emit side and the subscribe
+          // side.
+          $commandTokens: ["login", "increment", "decrement", "reset"],
 
           // wcstack/state lifecycle hook — fires once after the
           // <wcs-state> element is connected and the state has been
@@ -191,37 +207,75 @@
           get authErrorMessage()    { return formatErr(this["auth.error"]); },
           get sessionErrorMessage() { return formatErr(this["session.error"]); },
 
-          // Pulse the trigger: set it true so the `trigger: shouldLogin`
-          // binding pushes `true` onto <auth0-gate> (which starts the
-          // redirect login), then reset to false on the next microtask so
-          // the one-shot edge can be re-armed. The happy path navigates away
-          // before the reset matters; the reset only matters on a FAILURE
-          // path (e.g. Auth0 misconfig with no redirect), where leaving
-          // shouldLogin stuck at true would stop a second click from
-          // producing a fresh state change. <auth0-gate> ignores a redundant
-          // `trigger=true` while a login is already in flight, so the brief
-          // true -> false pulse is safe.
+          // Fire the gate's `login` command through wcstack/state's $command
+          // pub/sub — symmetric with how the +1 / −1 / Reset buttons reach the
+          // facade's commands. `command.login: $command.login` on <auth0-gate>
+          // (below) subscribes the element's native `login()` to this token, so
+          // emitting it calls `el.login()`.
+          //
+          // Emit with NO argument on purpose (see the $commandTokens note): a
+          // command subscriber forwards the emit payload to `el.login(payload)`,
+          // and the gate feeds login()'s first arg into Auth0 as
+          // `authorizationParams` — so a no-arg emit is what keeps the redirect
+          // login options clean.
+          //
+          // `emit()` returns the subscribers' results — here the gate's
+          // `login()` promise. `login()` rejects on one precondition path
+          // (clicking Sign in before init, while the Auth0 client isn't ready —
+          // the button is visible during the loading phase), so `allSettled`
+          // swallows that rejection instead of leaking an unhandled one. Auth0
+          // SDK failures do NOT reject (they surface via `auth.error`); this
+          // guard is only for the precondition. `allSettled` never rejects, so
+          // the floating promise is safe.
           login() {
-            this.shouldLogin = true;
-            queueMicrotask(() => { this.shouldLogin = false; });
+            Promise.allSettled(this.$command.login.emit());
           },
 
           // NOTE: the +1 / −1 / Reset buttons need no handler methods here.
           // Their clicks emit to the command tokens DIRECTLY from the markup
           // via `onclick: $command.<name>` (wcstack/state's event→command
           // binding), so there is no `incrementClick`-style trampoline to keep
-          // in sync. See the button section at the bottom of the page.
+          // in sync. See the button section at the bottom of the page. (`login`
+          // is the one deliberate exception — it routes through the `login()`
+          // method above so the click Event is NOT forwarded into the gate's
+          // command; see the $commandTokens note for why.)
         };
       </script>
 
       <!--
-        INPUTS stay explicit, OUTPUTS spread. The gate's `wcBindable` declares
-        only the five OUTPUT properties (authenticated / user / loading / error
-        / connected) and NO inputs, so `...: auth` expands exactly those five
-        (element → state) into the `auth` object. The `attr.*` config writes and
-        `trigger` are NOT wcBindable inputs, so spread never touches them — they
-        remain hand-written above the spread. (Order is irrelevant here since
-        the two sets don't overlap; spread last reads cleanest.)
+        EVERYTHING EXPLICIT — no `...:` spread on the gate. As of the
+        inputs/commands release, `<auth0-gate>`'s `wcBindable` declares three
+        surfaces, not one:
+
+          - OUTPUT `properties`: authenticated / user / loading / error /
+            connected (+ `trigger`, which is also an input)
+          - `inputs`: domain / client-id / audience / scope / redirect-uri /
+            cache-location / use-refresh-tokens / remote-url / mode / trigger —
+            most mapped to a kebab-case DOM attribute
+          - `commands`: login / logout / getToken / connect / refreshToken /
+            reconnect
+
+        wcstack/state's `...:` spread expands `properties` PLUS `inputs`, so
+        `...: auth` would NO LONGER mean "the five outputs": it would also emit a
+        state→element write for every declared input. The configured inputs would
+        fight the explicit `attr.*` writes below — the spread reads `auth.domain`
+        (which doesn't exist), and wcstack/state's null-guard turns that into
+        `removeAttribute("domain")`, clobbering the value `attr.domain` just set —
+        and the unconfigured inputs (`trigger` — which is also a property — plus
+        `scope` / `mode` / …) would be driven from absent state paths too. So the
+        five state outputs are listed by hand
+        (exactly what `...: auth` used to expand to) and config stays the
+        deliberate, one-directional `attr.*` writes it was designed to be.
+
+        Login is driven through the gate's OWN `login` command —
+        `command.login: $command.login` below, fired from the `login()` method
+        via `$command.login.emit()`, symmetric with how the payload facade's
+        increment / decrement / reset commands are wired. (Logout still goes
+        through `<auth0-logout>`. The gate's other commands — getToken / connect /
+        refreshToken / reconnect — are not needed by this page.)
+
+        The payload facade further down still uses `...: live`, because it
+        declares NO `inputs` — there the spread is still properties-only.
       -->
       <auth0-gate
         id="auth"
@@ -231,8 +285,12 @@
           attr.audience:     auth0Audience;
           attr.remote-url:   remoteUrl;
           attr.redirect-uri: redirectUri;
-          trigger:           shouldLogin;
-          ...: auth
+          command.login:     $command.login;
+          authenticated:     auth.authenticated;
+          user:              auth.user;
+          loading:           auth.loading;
+          error:             auth.error;
+          connected:         auth.connected
         ">
       </auth0-gate>
 
@@ -256,7 +314,11 @@
 
           DATA SURFACE via SPREAD — `...: live` expands to one binding per
           `wcBindable.properties` name (`count: live.count;
-          connectedUser: live.connectedUser`). wcstack/state reads the facade's
+          connectedUser: live.connectedUser`). The spread covers `properties`
+          PLUS `inputs`, but this facade declares NO `inputs`, so here it stays
+          properties-only — which is exactly why the spread is still appropriate
+          on the facade even though it was retired on `<auth0-gate>` above (whose
+          new `inputs` would over-expand it). wcstack/state reads the facade's
           `static wcBindable` to know what to expand, so the page never restates
           the property list; the nested `live` state object just has to use the
           same names. The facade loads cross-origin and async, but spread is
