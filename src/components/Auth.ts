@@ -42,6 +42,40 @@ export class Auth extends HTMLElement {
       ...AuthShell.wcBindable.properties,
       { name: "trigger", event: "auth0-gate:trigger-changed" },
     ],
+    // The `<auth0-gate>` element surface. Inputs are overridden (not
+    // inherited from the AuthShell spread) because the element maps each
+    // one to a kebab-case DOM `attribute` and adds two element-only
+    // inputs the Shell has no concept of: `remoteUrl` (the `remote-url`
+    // attribute, read by `connect()`) and `trigger` (the settable
+    // login-trigger property — no attribute, so `attribute` is omitted;
+    // it is also an output `property` above, hence it appears in both
+    // lists). `popup` is intentionally absent — it is a click-time read,
+    // not an observed attribute (see the `popup` getter).
+    inputs: [
+      { name: "domain",           attribute: "domain" },
+      { name: "clientId",         attribute: "client-id" },
+      { name: "audience",         attribute: "audience" },
+      { name: "scope",            attribute: "scope" },
+      { name: "redirectUri",      attribute: "redirect-uri" },
+      { name: "cacheLocation",    attribute: "cache-location" },
+      { name: "useRefreshTokens", attribute: "use-refresh-tokens" },
+      { name: "remoteUrl",        attribute: "remote-url" },
+      { name: "mode",             attribute: "mode" },
+      { name: "trigger" },
+    ],
+    // The element's public callable surface. `login()` internally picks
+    // redirect vs popup from the `popup` attribute, so the element
+    // exposes a single `login` command (no separate `loginWithPopup`);
+    // `disconnect()` is Shell-internal (driven by `disconnectedCallback`)
+    // and is not part of the element's command surface. All are async.
+    commands: [
+      { name: "login",        async: true },
+      { name: "logout",       async: true },
+      { name: "getToken",     async: true },
+      { name: "connect",      async: true },
+      { name: "refreshToken", async: true },
+      { name: "reconnect",    async: true },
+    ],
   };
   static get observedAttributes(): string[] {
     return [

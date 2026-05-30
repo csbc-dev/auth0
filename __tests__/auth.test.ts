@@ -232,6 +232,42 @@ describe("Auth (auth0-gate)", () => {
     expect(Auth.wcBindable.properties[5].name).toBe("trigger");
   });
 
+  it("wcBindable inputs が属性マッピング付きで宣言されている", () => {
+    const inputs = Auth.wcBindable.inputs ?? [];
+    expect(inputs.map((i) => [i.name, i.attribute])).toEqual([
+      ["domain", "domain"],
+      ["clientId", "client-id"],
+      ["audience", "audience"],
+      ["scope", "scope"],
+      ["redirectUri", "redirect-uri"],
+      ["cacheLocation", "cache-location"],
+      ["useRefreshTokens", "use-refresh-tokens"],
+      ["remoteUrl", "remote-url"],
+      ["mode", "mode"],
+      // trigger は settable プロパティで対応する属性を持たない
+      ["trigger", undefined],
+    ]);
+    // popup は observedAttributes ではなくクリック時読み取りなので含まない
+    expect(inputs.some((i) => i.name === "popup")).toBe(false);
+  });
+
+  it("wcBindable commands が要素の公開メソッド面を宣言している", () => {
+    const commands = Auth.wcBindable.commands ?? [];
+    expect(commands.map((c) => c.name)).toEqual([
+      "login",
+      "logout",
+      "getToken",
+      "connect",
+      "refreshToken",
+      "reconnect",
+    ]);
+    expect(commands.every((c) => c.async === true)).toBe(true);
+    // login() が内部で popup/redirect を切り替えるため loginWithPopup は出さない
+    expect(commands.some((c) => c.name === "loginWithPopup")).toBe(false);
+    // disconnect() は disconnectedCallback 駆動の内部メソッド
+    expect(commands.some((c) => c.name === "disconnect")).toBe(false);
+  });
+
   it("hasConnectedCallbackPromiseがtrueである", () => {
     expect(Auth.hasConnectedCallbackPromise).toBe(true);
   });

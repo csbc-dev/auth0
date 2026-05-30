@@ -48,6 +48,29 @@ describe("AuthCore", () => {
     expect(AuthCore.wcBindable.properties[4].name).toBe("error");
   });
 
+  it("wcBindable inputs/commands が宣言されている", () => {
+    // EventTarget なので attribute マッピングは無し（initialize() の
+    // Auth0ClientOptions キーとして到達する）
+    const inputs = AuthCore.wcBindable.inputs ?? [];
+    expect(inputs.map((i) => i.name)).toEqual([
+      "domain",
+      "clientId",
+      "cacheLocation",
+      "useRefreshTokens",
+    ]);
+    expect(inputs.every((i) => i.attribute === undefined)).toBe(true);
+
+    const commands = AuthCore.wcBindable.commands ?? [];
+    expect(commands.map((c) => c.name)).toEqual([
+      "login",
+      "loginWithPopup",
+      "logout",
+      "getToken",
+    ]);
+    // すべて Promise を返す決定操作
+    expect(commands.every((c) => c.async === true)).toBe(true);
+  });
+
   it("初期状態が正しい", () => {
     const core = new AuthCore();
     expect(core.authenticated).toBe(false);

@@ -102,6 +102,32 @@ export class AuthCore extends EventTarget {
       { name: "loading", event: "auth0-gate:loading-changed" },
       { name: "error", event: "auth0-gate:error" },
     ],
+    // No `attribute` mappings: AuthCore is an `EventTarget`, not an
+    // `HTMLElement`, so these inputs are reachable only as keys of the
+    // `Auth0ClientOptions` passed to `initialize()` — there is no DOM
+    // attribute surface to map them onto. Limited to the flat top-level
+    // option keys AuthCore reads directly; `audience` / `scope` /
+    // `redirectUri` live nested under `authorizationParams` and are
+    // surfaced as flat inputs one layer up at `AuthShell` / `<auth0-gate>`.
+    inputs: [
+      { name: "domain" },
+      { name: "clientId" },
+      { name: "cacheLocation" },
+      { name: "useRefreshTokens" },
+    ],
+    // The Auth0 decision operations AuthCore exposes. All return a
+    // Promise (the precondition `raiseError` is boxed into a rejection —
+    // see the class JSDoc "Error delivery contract"), so every entry is
+    // `async: true`. Lower-level fetch/commit plumbing
+    // (`fetchToken` / `fetchFreshToken` / `commitToken`) is intentionally
+    // omitted: it exists for `AuthShell`'s connection paths, not as a
+    // tooling-facing command surface.
+    commands: [
+      { name: "login", async: true },
+      { name: "loginWithPopup", async: true },
+      { name: "logout", async: true },
+      { name: "getToken", async: true },
+    ],
   };
 
   private _target: EventTarget;

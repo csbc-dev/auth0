@@ -40,6 +40,38 @@ export class AuthShell extends EventTarget {
       { name: "error",         event: "auth0-gate:error" },
       { name: "connected",     event: "auth0-gate:connected-changed" },
     ],
+    // The flat `AuthShellOptions` keys consumed by `initialize()`. Like
+    // AuthCore, AuthShell is an `EventTarget` with no attribute surface,
+    // so no `attribute` mappings — the kebab-case attribute names live on
+    // the `<auth0-gate>` element (`Auth.wcBindable.inputs`). `mode` is a
+    // Shell-level concept (not an AuthCore option); `remoteUrl` is NOT an
+    // input here because the URL is passed as a `connect()` argument
+    // rather than stored as a configured option.
+    inputs: [
+      { name: "domain" },
+      { name: "clientId" },
+      { name: "audience" },
+      { name: "scope" },
+      { name: "redirectUri" },
+      { name: "cacheLocation" },
+      { name: "useRefreshTokens" },
+      { name: "mode" },
+    ],
+    // AuthCore's auth operations plus the remote-transport commands the
+    // Shell owns. `disconnect()` is synchronous (no `async`); everything
+    // else returns a Promise. `connect` / `refreshToken` / `reconnect`
+    // are the WebSocket I/O operations that exist only at the Shell layer
+    // (AuthCore has no transport).
+    commands: [
+      { name: "login",          async: true },
+      { name: "loginWithPopup", async: true },
+      { name: "logout",         async: true },
+      { name: "getToken",       async: true },
+      { name: "connect",        async: true },
+      { name: "refreshToken",   async: true },
+      { name: "reconnect",      async: true },
+      { name: "disconnect" },
+    ],
   };
 
   private _core: AuthCore;
