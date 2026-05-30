@@ -55,8 +55,8 @@
         //
         // <auth0-gate> waits for `domain` + `client-id` before calling
         // initialize(): until they arrive the element sits inert with
-        // `loading` true, so the `loading: authLoading` binding keeps the
-        // `statusMessage` line on "Loading Auth0…".
+        // `loading` true, which the `...: auth` spread mirrors onto
+        // `auth.loading`, keeping the `statusMessage` line on "Loading Auth0…".
         //
         // See ../../docs/patterns/server-config-discovery.md for the
         // full pattern + threat model.
@@ -65,8 +65,8 @@
         // Normalize an unknown error-ish value to a display string. Auth0 SDK
         // failures are Error instances (use `.message`); WebSocket / proxy
         // failures may be plain `{ error: "..." }` shapes (use `.error`);
-        // anything else falls back to String(). Shared by the authError and
-        // sessionError getters so the two render symmetrically.
+        // anything else falls back to String(). Shared by the authErrorMessage
+        // and sessionErrorMessage getters so the two render symmetrically.
         function formatErr(e) {
           if (!e) return "";
           if (typeof e.message === "string") return e.message;
@@ -86,29 +86,54 @@
           remoteUrl:     "",
           redirectUri:   window.location.origin,
 
-          // <auth0-gate> output bindings.
-          isLoggedIn: false,
-          currentUser: null,
-          authLoading: true,
-          authError: null,
-          wsConnected: false,
+          // <auth0-gate> output bindings — nested so the gate's whole output
+          // surface wires with one spread (`...: auth`, see the element below).
+          // Leaf names match the gate's `wcBindable.properties` EXACTLY
+          // (authenticated / user / loading / error / connected) — that is what
+          // makes the spread expand to `authenticated: auth.authenticated; …`.
+          // Nesting also keeps this `error` distinct from the session's
+          // same-named `error` below (a flat spread of both would collide).
+          auth: {
+            authenticated: false,
+            user:          null,
+            loading:       true,
+            error:         null,
+            connected:     false,
+          },
+
+          // Login trigger — an INPUT (`trigger: shouldLogin`), NOT a wcBindable
+          // output, so it stays a flat top-level prop and is NOT part of the
+          // `auth` spread (spread covers only the declared output surface).
           shouldLogin: false,
 
-          // <auth0-session> output bindings.
-          sessionReady: false,
-          sessionConnecting: false,
-          sessionError: null,
+          // <auth0-session> output bindings — same idea: `...: session` spreads
+          // ready / connecting / error. Its `error` is separate from auth.error.
+          session: {
+            ready:      false,
+            connecting: false,
+            error:      null,
+          },
 
-          // <app-core-facade> output bindings.
-          liveCount: 0,
-          liveConnectedUser: "",
+          // <app-core-facade> output bindings — held as a nested object so the
+          // facade's data surface can be wired with a single spread
+          // (`...: live`, see below) instead of one line per property. The
+          // shape mirrors the facade's `wcBindable.properties` names exactly
+          // (`count` / `connectedUser`), which is what makes the spread expand
+          // to `count: live.count; connectedUser: live.connectedUser`.
+          live: { count: 0, connectedUser: "" },
 
-          // Command tokens delivered to <app-core-facade> by wcstack/state.
+          // Command tokens routed to <app-core-facade> by wcstack/state.
           // The facade element exposes increment / decrement / reset in its
           // `static wcBindable.commands`, and <auth0-session> installs them
           // as own-property forwarders that call `proxy.invoke(...)`. The
           // `command.<name>: <token>` bindings below subscribe each forwarder
           // to its token, so emitting the token fires the proxy command.
+          //
+          // The tokens are EMITTED straight from the +1 / −1 / Reset buttons'
+          // `onclick: $command.<name>` bindings — no state method in between.
+          // Declaring them here is still required: `$command.<name>` resolves
+          // against this list, both for the buttons' emit side and the facade's
+          // subscribe side.
           $commandTokens: ["increment", "decrement", "reset"],
 
           // wcstack/state lifecycle hook — fires once after the
@@ -117,7 +142,7 @@
           // values into state; the attr.* bindings propagate to
           // <auth0-gate> automatically.
           async $connectedCallback() {
-            // Route EVERY failure mode to the same authError path: a non-OK
+            // Route EVERY failure mode to the same `auth.error` path: a non-OK
             // HTTP status, a fetch rejection (server not started / DNS / CORS
             // / network drop), AND a res.json() parse failure. The `!res.ok`
             // check alone left the latter two as unhandled promise rejections,
@@ -133,29 +158,38 @@
               this.auth0Audience = cfg.audience;
               this.remoteUrl     = cfg.remoteUrl;
             } catch (err) {
-              this.authError   = err instanceof Error ? err : new Error(String(err));
-              this.authLoading = false;
+              // Path-STRING assignment, not `this.auth.error = …`. wcstack/state
+              // detects updates only through a path assignment; reading
+              // `this.auth` then mutating `.error` on the plain object bypasses
+              // the contract and would NOT re-render. Same for `auth.loading`.
+              this["auth.error"]   = err instanceof Error ? err : new Error(String(err));
+              this["auth.loading"] = false;
             }
           },
 
           // Single status line — exclusive ladder mirroring the React example.
           // A getter, not four independent `if:` templates, because data-wcs
           // `if:` has no `&&` / `||` operators: four separate conditions can't
-          // be made mutually exclusive in the template (at boot `authLoading`
-          // AND `isLoggedIn|not` are both true; the authenticated-but-not-yet-
-          // connected gap matches none). The getter reads several reactive
-          // props and wcstack/state's dependency tracking re-renders
+          // be made mutually exclusive in the template (at boot `auth.loading`
+          // AND `auth.authenticated|not` are both true; the authenticated-but-
+          // not-yet-connected gap matches none). The getter reads several
+          // reactive props and wcstack/state's dependency tracking re-renders
           // {{ statusMessage }} whenever any of them changes.
+          //
+          // Nested props are read via dot-path STRINGS (`this["auth.loading"]`),
+          // the same form path getters use internally — that is what registers
+          // the per-path dependency. `this.auth.loading` would read the plain
+          // sub-object and miss fine-grained tracking.
           get statusMessage() {
-            if (this.authLoading)       return "Loading Auth0…";
-            if (!this.isLoggedIn)       return "Signed out.";
-            if (this.sessionReady)      return "Session ready.";
-            if (this.sessionConnecting) return "Opening session…";
+            if (this["auth.loading"])       return "Loading Auth0…";
+            if (!this["auth.authenticated"]) return "Signed out.";
+            if (this["session.ready"])      return "Session ready.";
+            if (this["session.connecting"]) return "Opening session…";
             return "Authenticated, waiting for session…";
           },
 
-          get authErrorMessage()    { return formatErr(this.authError); },
-          get sessionErrorMessage() { return formatErr(this.sessionError); },
+          get authErrorMessage()    { return formatErr(this["auth.error"]); },
+          get sessionErrorMessage() { return formatErr(this["session.error"]); },
 
           // Pulse the trigger: set it true so the `trigger: shouldLogin`
           // binding pushes `true` onto <auth0-gate> (which starts the
@@ -172,19 +206,23 @@
             queueMicrotask(() => { this.shouldLogin = false; });
           },
 
-          // Button click handlers — each emits to a command token. The
-          // matching `command.<name>:` binding on <app-core-facade> routes
-          // the emit to the proxy forwarder, which in turn calls
-          // `proxy.invoke(...)` over the WebSocket. No `document.querySelector`
-          // / element lookup needed: state and element are decoupled by the
-          // token, so reordering or duplicating the facade does not break
-          // these handlers.
-          incrementClick() { this.$command.increment.emit(); },
-          decrementClick() { this.$command.decrement.emit(); },
-          resetClick()     { this.$command.reset.emit(); },
+          // NOTE: the +1 / −1 / Reset buttons need no handler methods here.
+          // Their clicks emit to the command tokens DIRECTLY from the markup
+          // via `onclick: $command.<name>` (wcstack/state's event→command
+          // binding), so there is no `incrementClick`-style trampoline to keep
+          // in sync. See the button section at the bottom of the page.
         };
       </script>
 
+      <!--
+        INPUTS stay explicit, OUTPUTS spread. The gate's `wcBindable` declares
+        only the five OUTPUT properties (authenticated / user / loading / error
+        / connected) and NO inputs, so `...: auth` expands exactly those five
+        (element → state) into the `auth` object. The `attr.*` config writes and
+        `trigger` are NOT wcBindable inputs, so spread never touches them — they
+        remain hand-written above the spread. (Order is irrelevant here since
+        the two sets don't overlap; spread last reads cleanest.)
+      -->
       <auth0-gate
         id="auth"
         data-wcs="
@@ -193,23 +231,22 @@
           attr.audience:     auth0Audience;
           attr.remote-url:   remoteUrl;
           attr.redirect-uri: redirectUri;
-          authenticated:     isLoggedIn;
-          user:              currentUser;
-          loading:           authLoading;
-          error:             authError;
-          connected:         wsConnected;
-          trigger:           shouldLogin
+          trigger:           shouldLogin;
+          ...: auth
         ">
       </auth0-gate>
 
+      <!--
+        OUTPUTS spread the same way. The session's `wcBindable` declares three
+        output properties (ready / connecting / error) and no inputs, so
+        `...: session` expands them into the `session` object. `target` is a
+        plain HTML attribute (it points at the gate's id), not a data-wcs
+        binding, so it stays on the element itself.
+      -->
       <auth0-session
         id="session"
         target="auth"
-        data-wcs="
-          ready:      sessionReady;
-          connecting: sessionConnecting;
-          error:      sessionError
-        ">
+        data-wcs="...: session">
         <!--
           Payload child — <auth0-session> mirrors the server-side Core's
           `count` / `connectedUser` onto this element, dispatches the
@@ -217,17 +254,28 @@
           `reset` as command forwarders. data-wcs reads directly from
           this element, no extra bridging code in the state.
 
-          The `command.<name>: <token>` lines subscribe each forwarder to
-          a wcstack/state command token. When state calls
-          `this.$command.increment.emit()`, wcstack/state invokes the
-          facade's `increment` forwarder, which routes to `proxy.invoke()`.
-          `command.<name>` is validated against `static wcBindable.commands`
-          on the facade at binding time.
+          DATA SURFACE via SPREAD — `...: live` expands to one binding per
+          `wcBindable.properties` name (`count: live.count;
+          connectedUser: live.connectedUser`). wcstack/state reads the facade's
+          `static wcBindable` to know what to expand, so the page never restates
+          the property list; the nested `live` state object just has to use the
+          same names. The facade loads cross-origin and async, but spread is
+          safe here: for a not-yet-registered custom element class wcstack/state
+          DEFERS the expansion until `customElements.whenDefined("app-core-facade")`
+          resolves, matching this page's load-order-agnostic design.
+
+          COMMANDS stay EXPLICIT — spread deliberately covers only the data
+          surface (properties + inputs), never `commands`, so the pub/sub
+          firing points remain readable in the HTML. Each `command.<name>:
+          <token>` line subscribes a forwarder to a wcstack/state command token;
+          when the token emits (from a button's `onclick: $command.<name>` or
+          from state code), wcstack/state invokes the facade's forwarder, which
+          routes to `proxy.invoke()`. `command.<name>` is validated against
+          `static wcBindable.commands` on the facade at binding time.
         -->
         <app-core-facade
           data-wcs="
-            count:             liveCount;
-            connectedUser:     liveConnectedUser;
+            ...: live;
             command.increment: $command.increment;
             command.decrement: $command.decrement;
             command.reset:     $command.reset
@@ -239,24 +287,24 @@
         <!--
           Single status line. data-wcs `if:` has no boolean operators
           (`&&` / `||`), so four independent `if:` templates can't be made
-          mutually exclusive: at boot `authLoading` AND `isLoggedIn|not` are
-          both true (two lines at once) and the authenticated-but-not-yet-
+          mutually exclusive: at boot `auth.loading` AND `auth.authenticated|not`
+          are both true (two lines at once) and the authenticated-but-not-yet-
           connected gap matches none (blank line). The exclusive ladder lives
           in the `statusMessage` getter above; {{ }} re-renders reactively.
         -->
         <p class="muted">{{ statusMessage }}</p>
 
-        <template data-wcs="if: authError">
+        <template data-wcs="if: auth.error">
           <p class="err">Auth error: {{ authErrorMessage }}</p>
         </template>
-        <template data-wcs="if: sessionError">
+        <template data-wcs="if: session.error">
           <p class="err">Session error: {{ sessionErrorMessage }}</p>
         </template>
 
-        <template data-wcs="if: isLoggedIn|not">
+        <template data-wcs="if: auth.authenticated|not">
           <button data-wcs="onclick: login">Sign in</button>
         </template>
-        <template data-wcs="if: isLoggedIn">
+        <template data-wcs="if: auth.authenticated">
           <!--
             <auth0-logout> is a bare HTMLElement that only wires a `click`
             listener (no native button semantics). Add `role="button"` so
@@ -272,14 +320,25 @@
         </template>
       </section>
 
-      <template data-wcs="if: sessionReady">
+      <template data-wcs="if: session.ready">
         <section>
-          <p>Count: <strong>{{ liveCount }}</strong></p>
-          <p class="muted">Connected as: {{ liveConnectedUser }}</p>
+          <p>Count: <strong>{{ live.count }}</strong></p>
+          <p class="muted">Connected as: {{ live.connectedUser }}</p>
+          <!--
+            EVENT → COMMAND, no trampoline. The right-hand side of each
+            `onclick:` is a `$command.<name>` path, not a state method, so the
+            click emits to the token DIRECTLY: wcstack/state runs
+            `state.$command.increment.emit(event)`. The facade's matching
+            `command.increment: $command.increment` subscriber receives it and
+            calls `proxy.invoke(...)` over the WebSocket. The DOM `Event` is the
+            emit's first argument (subscribers ignore it here). No
+            `incrementClick` method, no element lookup — state and element are
+            decoupled by the token name.
+          -->
           <div class="row">
-            <button data-wcs="onclick: incrementClick">+1</button>
-            <button data-wcs="onclick: decrementClick">−1</button>
-            <button data-wcs="onclick: resetClick">Reset</button>
+            <button data-wcs="onclick: $command.increment">+1</button>
+            <button data-wcs="onclick: $command.decrement">−1</button>
+            <button data-wcs="onclick: $command.reset">Reset</button>
           </div>
         </section>
       </template>

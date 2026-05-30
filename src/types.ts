@@ -36,6 +36,40 @@ export interface IWcBindableProperty {
   readonly getter?: (event: Event) => unknown;
 }
 
+/**
+ * A configurable input declared on `static wcBindable.inputs`.
+ *
+ * Mirrors `@wc-bindable/core`'s `WcBindableInput` (`{ name; attribute? }`)
+ * — the field names match exactly so a framework adapter reading
+ * `target.constructor.wcBindable.inputs` sees the same shape regardless
+ * of which package produced the declaration.
+ *
+ * Per the wc-bindable protocol, `inputs` are declaration-only: this
+ * package does NOT auto-sync them. Writing an input is the caller's
+ * responsibility (set the property / attribute directly). `attribute`
+ * is the kebab-case DOM attribute an `HTMLElement` Shell maps the input
+ * to; it is omitted on `EventTarget` Cores / Shells that have no
+ * attribute surface (the input is reachable only as a JS property /
+ * `initialize()` option there).
+ */
+export interface IWcBindableInput {
+  readonly name: string;
+  readonly attribute?: string;
+}
+
+/**
+ * A callable command declared on `static wcBindable.commands`.
+ *
+ * Mirrors `@wc-bindable/core`'s `WcBindableCommand` (`{ name; async? }`).
+ * Intended for remote proxies and tooling that invoke methods by name;
+ * `async: true` marks a command whose invocation returns a Promise so a
+ * proxy knows to await a `return` / `throw` frame.
+ */
+export interface IWcBindableCommand {
+  readonly name: string;
+  readonly async?: boolean;
+}
+
 export interface IWcBindable {
   readonly protocol: "wc-bindable";
   readonly version: number;
@@ -47,6 +81,17 @@ export interface IWcBindable {
    * every consumer that reads the shared array.
    */
   readonly properties: readonly IWcBindableProperty[];
+  /**
+   * Configurable inputs (declaration-only — no automatic syncing).
+   * Optional per the wc-bindable protocol; `readonly` for the same
+   * shared-declaration-mutation reason as `properties`.
+   */
+  readonly inputs?: readonly IWcBindableInput[];
+  /**
+   * Callable commands (for remote proxies / tooling). Optional per the
+   * wc-bindable protocol; `readonly` for the same reason as `properties`.
+   */
+  readonly commands?: readonly IWcBindableCommand[];
 }
 
 /**
