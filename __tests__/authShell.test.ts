@@ -105,6 +105,40 @@ describe("AuthShell", () => {
     expect(names).not.toContain("token");
   });
 
+  it("wcBindable declares flat inputs and transport commands", () => {
+    // EventTarget — no attribute surface, so inputs carry no `attribute`.
+    const inputs = AuthShell.wcBindable.inputs ?? [];
+    expect(inputs.map((i) => i.name)).toEqual([
+      "domain",
+      "clientId",
+      "audience",
+      "scope",
+      "redirectUri",
+      "cacheLocation",
+      "useRefreshTokens",
+      "mode",
+    ]);
+    expect(inputs.every((i) => i.attribute === undefined)).toBe(true);
+
+    const commands = AuthShell.wcBindable.commands ?? [];
+    expect(commands.map((c) => c.name)).toEqual([
+      "login",
+      "loginWithPopup",
+      "logout",
+      "getToken",
+      "connect",
+      "refreshToken",
+      "reconnect",
+      "disconnect",
+    ]);
+    // disconnect() is synchronous; everything else returns a Promise.
+    const asyncByName = new Map(commands.map((c) => [c.name, c.async ?? false]));
+    expect(asyncByName.get("disconnect")).toBe(false);
+    expect(
+      commands.filter((c) => c.name !== "disconnect").every((c) => c.async === true),
+    ).toBe(true);
+  });
+
   it("initial state is correct", () => {
     const shell = new AuthShell();
     expect(shell.authenticated).toBe(false);
