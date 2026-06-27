@@ -22,6 +22,12 @@ Cross-cutting recipes that apply on top of any framework / mode.
 |---|---|
 | Server-hosted Auth0 config (no env in static HTML) | [patterns/server-config-discovery.md](patterns/server-config-discovery.md) |
 
+## Security notes
+
+| Topic | Doc |
+|---|---|
+| Local-mode token exposure and when to prefer remote mode | [security/local-mode-threat-model.md](security/local-mode-threat-model.md) |
+
 ## When to pick Local vs Remote
 
 | | Local mode (these docs) | Remote mode ([README-REMOTE.md](../README-REMOTE.md)) |

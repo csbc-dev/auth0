@@ -56,6 +56,7 @@ vi.mock("ws", () => ({
 }));
 
 import { _normalizeError, createAuthenticatedWSS } from "../../src/server/createAuthenticatedWSS";
+import type { UserContext } from "../../src/types";
 
 function makeJwt(payload: Record<string, unknown>): string {
   const header = Buffer.from(JSON.stringify({ alg: "RS256" })).toString("base64url");
@@ -444,7 +445,7 @@ describe("createAuthenticatedWSS", () => {
       properties: [],
     };
 
-    const createCores = vi.fn(() => core);
+    const createCores = vi.fn((_: UserContext) => core);
 
     const wss: any = await createAuthenticatedWSS({
       auth0Domain: "test.auth0.com",

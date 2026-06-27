@@ -1233,8 +1233,9 @@ describe("handleConnection", () => {
       );
 
       const parseFailure = events.find((e) => e.type === "auth:exp-parse-failure");
-      expect(parseFailure?.error).toBeInstanceOf(Error);
-      expect(parseFailure?.error.message).toContain("boom");
+      if (!parseFailure?.error) throw new Error("Expected exp parse failure error");
+      expect(parseFailure.error).toBeInstanceOf(Error);
+      expect(parseFailure.error.message).toContain("boom");
     } finally {
       (globalThis as any).Buffer = originalBuffer;
       vi.stubGlobal("atob", originalAtob);

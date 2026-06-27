@@ -16,8 +16,8 @@ import {
   exportJWK,
   generateKeyPair,
   SignJWT,
+  type CryptoKey,
   type JWK,
-  type KeyLike,
 } from "jose";
 
 // Hold the JWKS resolver in a module-level slot. The mock factory below
@@ -54,7 +54,7 @@ import { verifyAuth0Token, _clearJwksCache } from "../src/server/verifyAuth0Toke
 // --- key + JWT helpers ---------------------------------------------------
 
 interface KeyMaterial {
-  privateKey: KeyLike;
+  privateKey: CryptoKey;
   publicJwk: JWK;
   kid: string;
 }
