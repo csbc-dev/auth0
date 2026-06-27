@@ -1107,7 +1107,9 @@ describe("AuthSession (auth0-session)", () => {
       return { authEl, addSpy, removeSpy, connectSpy };
     }
 
-    function countAuthChangedListeners(spy: ReturnType<typeof vi.spyOn>): number {
+    function countAuthChangedListeners(
+      spy: { mock: { calls: Parameters<Auth["addEventListener"]>[] } },
+    ): number {
       return spy.mock.calls.filter(
         (args) => args[0] === "auth0-gate:authenticated-changed",
       ).length;

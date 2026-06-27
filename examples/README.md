@@ -2,6 +2,8 @@
 
 Four runnable client examples that all talk to one shared WebSocket server in **remote mode**:
 
+Example maintenance rules live in [`CONVENTIONS.md`](CONVENTIONS.md). Update that file when changing the example topology, port model, shared Core declaration, or token/config handling pattern.
+
 | Example                        | Stack                                       | Demonstrates |
 |--------------------------------|---------------------------------------------|--------------|
 | [`vanilla/`](vanilla/)         | Vite + `bind()` from `@wc-bindable/core`    | Pure-JS imperative binding |

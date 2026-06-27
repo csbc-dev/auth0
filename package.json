@@ -3,6 +3,13 @@
   "version": "0.3.0",
   "description": "Declarative Auth0 authentication component for Web Components. Framework-agnostic auth via wc-bindable-protocol.",
   "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "sideEffects": [
+    "./src/auto/auto.js",
+    "./src/auto/auto.min.js"
+  ],
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
@@ -25,12 +32,14 @@
     "README.md",
     "README-LOCAL.md",
     "README-REMOTE.md",
-    "SPEC-REMOTE.md"
+    "SPEC-REMOTE.md",
+    "docs"
   ],
   "scripts": {
     "prepack": "npm run build",
     "build": "tsc",
     "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit -p tsconfig.test.json",
     "test": "npm run test:unit",
     "test:watch": "npm run test:unit:watch",
     "test:coverage": "npm run test:unit:coverage",
@@ -48,8 +57,8 @@
     "framework-agnostic"
   ],
   "dependencies": {
-    "@wc-bindable/core": "^0.7.1",
-    "@wc-bindable/remote": "^0.7.1",
+    "@wc-bindable/core": "^0.8.0",
+    "@wc-bindable/remote": "^0.8.0",
     "jose": "^6.0.0"
   },
   "peerDependencies": {
