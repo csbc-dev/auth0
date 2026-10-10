@@ -125,17 +125,23 @@
           // inputs/commands release) — the same pub/sub mechanism, just a local
           // element method instead of a remote proxy call.
           //
-          // The count tokens are emitted STRAIGHT from the +1 / −1 / Reset
-          // buttons (`onclick: $command.<name>` — no state method in between).
-          // `login` is the deliberate EXCEPTION: it is emitted from the `login()`
-          // method below, not `onclick: $command.login` directly. Why — an
-          // `onclick` emit passes the DOM Event as the token payload, and a
-          // command subscriber forwards that payload to `el.login(event)`; but
-          // the gate's native `login(options)` feeds its first arg straight into
-          // Auth0 as `authorizationParams`, so a MouseEvent would land there. The
-          // facade's count commands dodge this only because their session-
-          // installed forwarders ignore args — the gate's real method does not.
-          // Emitting from `login()` with NO payload keeps `el.login()` clean.
+          // Every token is emitted from a state method with NO payload — the
+          // `login()` / `increment()` / `decrement()` / `reset()` methods below
+          // — never straight from markup as `onclick: $command.<name>`. A
+          // DOM-event emit passes `(event, ...listIndexes)` as the token
+          // payload, and a command subscriber forwards that payload to the
+          // element method unchanged:
+          //   - the gate's native `login(options)` feeds its first arg into
+          //     Auth0 as `authorizationParams`, so a MouseEvent would land there;
+          //   - the facade's session-installed forwarders pass their args
+          //     straight to `proxy.invoke(name, ...args)`, and
+          //     @wc-bindable/remote (0.10+) only sends JSON values: a DOM Event
+          //     argument is rejected with `WC_BINDABLE_INVALID_JSON_VALUE`
+          //     before anything reaches the server, so the click would do
+          //     nothing. (Older remote versions serialized the event to
+          //     `{"isTrusted":true}`, which the server ignored — that hid it.)
+          // Emitting with no payload keeps both `el.login()` and
+          // `proxy.invoke("increment")` clean.
           //
           // Declaring every token here is required either way: `$command.<name>`
           // resolves against this list, for both the emit side and the subscribe
@@ -193,14 +199,20 @@
             Promise.allSettled(this.$command.login.emit());
           },
 
-          // NOTE: the +1 / −1 / Reset buttons need no handler methods here.
-          // Their clicks emit to the command tokens DIRECTLY from the markup
-          // via `onclick: $command.<name>` (wcstack/state's event→command
-          // binding), so there is no `incrementClick`-style trampoline to keep
-          // in sync. See the button section at the bottom of the page. (`login`
-          // is the one deliberate exception — it routes through the `login()`
-          // method above so the click Event is NOT forwarded into the gate's
-          // command; see the $commandTokens note for why.)
+          // +1 / −1 / Reset — same shape as `login()`: emit the facade's token
+          // with NO payload, so the session-installed forwarder calls
+          // `proxy.invoke("increment")` with no arguments (see the
+          // $commandTokens note for why the click Event must not be forwarded).
+          // The state still never touches the element — the token is the only
+          // shared object.
+          //
+          // `emit()` returns the forwarders' `proxy.invoke()` promises.
+          // Returning `Promise.all(...)` hands them to wcstack/state, which
+          // reports a rejected invoke (e.g. the socket dropped mid-click) with
+          // `console.error` instead of leaving an unhandled rejection.
+          increment() { return Promise.all(this.$command.increment.emit()); },
+          decrement() { return Promise.all(this.$command.decrement.emit()); },
+          reset()     { return Promise.all(this.$command.reset.emit()); },
         };
       </script>
 
@@ -304,9 +316,10 @@
           surface (properties + inputs), never `commands`, so the pub/sub
           firing points remain readable in the HTML. Each `command.<name>:
           <token>` line subscribes a forwarder to a wcstack/state command token;
-          when the token emits (from a button's `onclick: $command.<name>` or
-          from state code), wcstack/state invokes the facade's forwarder, which
-          routes to `proxy.invoke()`. `command.<name>` is validated against
+          when the token emits (from the `increment()` / `decrement()` /
+          `reset()` state methods), wcstack/state invokes the facade's
+          forwarder with the emit's arguments, which routes to
+          `proxy.invoke()`. `command.<name>` is validated against
           `static wcBindable.commands` on the facade at binding time.
         -->
         <app-core-facade
@@ -364,20 +377,20 @@
           <p>Count: <strong>{{ live.count }}</strong></p>
           <p class="muted">Connected as: {{ live.connectedUser }}</p>
           <!--
-            EVENT → COMMAND, no trampoline. The right-hand side of each
-            `onclick:` is a `$command.<name>` path, not a state method, so the
-            click emits to the token DIRECTLY: wcstack/state runs
-            `state.$command.increment.emit(event)`. The facade's matching
-            `command.increment: $command.increment` subscriber receives it and
-            calls `proxy.invoke(...)` over the WebSocket. The DOM `Event` is the
-            emit's first argument (subscribers ignore it here). No
-            `incrementClick` method, no element lookup — state and element are
-            decoupled by the token name.
+            EVENT → STATE METHOD → COMMAND. Each `onclick:` names a state
+            method (`increment` …), which emits the matching token with NO
+            payload; the facade's `command.increment: $command.increment`
+            subscriber then calls `proxy.invoke("increment")` over the
+            WebSocket. Not `onclick: $command.increment`: that form emits
+            `(event, ...listIndexes)`, the subscriber would forward the DOM
+            `Event` to `proxy.invoke`, and the JSON-only wire rejects it (see
+            the $commandTokens note). Still no element lookup — state and
+            element are decoupled by the token name.
           -->
           <div class="row">
-            <button data-wcs="onclick: $command.increment">+1</button>
-            <button data-wcs="onclick: $command.decrement">−1</button>
-            <button data-wcs="onclick: $command.reset">Reset</button>
+            <button data-wcs="onclick: increment">+1</button>
+            <button data-wcs="onclick: decrement">−1</button>
+            <button data-wcs="onclick: reset">Reset</button>
           </div>
         </section>
       </template>

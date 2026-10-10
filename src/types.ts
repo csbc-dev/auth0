@@ -265,6 +265,12 @@ export interface AuthShellOptions {
 
 /**
  * User context built after JWT verification on the server.
+ *
+ * Not a wire value as-is: `email` / `name` / `orgId` are present with
+ * the value `undefined` when the token lacks the claim, which
+ * `@wc-bindable/remote` (>= 0.10) rejects as a non-`JsonValue`. Expose a
+ * projection that omits absent claims (as `UserCore.currentUser` does)
+ * instead of returning a `UserContext` from a remote Core property.
  */
 export interface UserContext {
   /** Auth0 user identifier (e.g. "auth0|abc123"). */

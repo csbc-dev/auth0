@@ -170,6 +170,8 @@ increment() {
 }
 ```
 
+The forwarder passes its arguments to `proxy.invoke()` **unchanged**, and `@wc-bindable/remote` 0.10+ only sends JSON values: an `undefined`, `Date`, class-instance or DOM `Event` argument makes the call reject with `err.code === "WC_BINDABLE_INVALID_JSON_VALUE"` before anything is sent. Call forwarders with explicit JSON arguments, as above — never wire an event handler straight to one (`button.onclick = payload.increment`, or wcstack's `onclick: $command.increment`), which hands it the click `Event`. See [Wire values must be JSON](#wire-values-must-be-json).
+
 ### 4. Access proxy state from JS (when not using the payload child)
 
 The `RemoteCoreProxy` is also exposed on the session for callers that want imperative access — useful for low-level inspection or when no payload child is in play:
@@ -361,7 +363,7 @@ The companion element that turns the three-stage readiness sequence (authenticat
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `ready` | `boolean` | `true` once the proxy has delivered its first batch of sync values — the true "session ready" signal. |
+| `ready` | `boolean` | `true` once the proxy has delivered its first batch of sync values — the true "session ready" signal. A sync in which every declared property was dropped as non-JSON delivers nothing, so `ready` stays `false` (see [Wire values must be JSON](#wire-values-must-be-json)). |
 | `connecting` | `boolean` | `true` between `connect()` start and either `ready=true` or `error`. |
 | `error` | `Error \| null` | Any error from target resolution, payload resolution, transport handshake, or proxy construction. |
 
@@ -411,7 +413,7 @@ What `<auth0-session>` does to the adopted child while the session is live:
 |-----------|--------|
 | Property mirror | `child[propName] = value` is written as a configurable, writable, enumerable own data property each time the proxy fires that property's event. The mirror happens BEFORE the re-dispatch so any listener that reads `child[name]` after receiving the dispatch sees the up-to-date value. |
 | Event re-dispatch | The user's declared `event` name (NOT the proxy's synthetic per-property event) is dispatched on the child — so `bind(child, ...)` from `@wc-bindable/core` and `data-wcs="prop: ..."` work directly against the child. |
-| Command forwarder | For each declared command, `child[cmdName]` is installed as a non-enumerable own-property function that delegates to `proxy.invoke(cmdName, ...args)` and returns the proxy's promise. Installed up-front (before the first sync) so callers can invoke commands as soon as the transport is open. |
+| Command forwarder | For each declared command, `child[cmdName]` is installed as a non-enumerable own-property function that delegates to `proxy.invoke(cmdName, ...args)` and returns the proxy's promise. Installed up-front (before the first sync) so callers can invoke commands as soon as the transport is open. Arguments are forwarded unchanged and must be JSON values — a non-JSON argument (including `undefined` and a DOM `Event`) rejects with `WC_BINDABLE_INVALID_JSON_VALUE`, a non-JSON return value with `WC_BINDABLE_INVALID_RETURN_VALUE` (see [Wire values must be JSON](#wire-values-must-be-json)). |
 | Teardown cleanup | On logout / disconnect / element removal, every own-property the session installed is deleted via identity comparison — values mirrored from the proxy and command forwarders are removed only when the descriptor still matches what the session wrote. A user replacement made mid-session is left untouched. |
 
 The user's element class is intentionally **schema-only** — no methods, no constructor logic, no shadow DOM are required. If users add their own methods of the same name as a declared command, the session's forwarder shadows them as an own-property for the duration of the session and lifts the shadow on teardown so the prototype method comes back.
@@ -452,6 +454,24 @@ const wss = await createAuthenticatedWSS({
 ```
 
 For handler options, protocol error codes, `verifyAuth0Token()` utility, and RBAC propagation on refresh, see [SPEC-REMOTE.md §5 Server Side](SPEC-REMOTE.md) and §3.6 onwards.
+
+### Wire values must be JSON
+
+From `@wc-bindable/remote` 0.10, `RemoteShellProxy` (server) and `RemoteCoreProxy` (client) validate every value that crosses the WebSocket as a strict JSON value — plain objects, plain arrays, strings, finite numbers, booleans and `null`. Nothing is coerced any more: `undefined`, `NaN` / `±Infinity`, `Date`, `Map` / `Set`, class instances (`Error` included) and DOM `Event`s are rejected instead of being reshaped by `JSON.stringify`. For the application Core you return from `createCores`, and for the client calling it:
+
+| Value | Rule | When it is not JSON |
+|-------|------|---------------------|
+| Command arguments (`payload.cmd(...args)` / `proxy.invoke(name, ...args)`) | Every argument must be JSON. `undefined` is rejected too — it is no longer sent as `null`. | The call rejects **before anything is sent** with `err.code === "WC_BINDABLE_INVALID_JSON_VALUE"`. |
+| Command return values | What a Core command returns (or resolves to) must be JSON or `undefined`. | The caller's promise rejects with `err.code === "WC_BINDABLE_INVALID_RETURN_VALUE"`. |
+| Property values (`sync` snapshot and `*-changed` events) | Must be JSON or `undefined`, and an object **must not carry a field whose value is `undefined`** — omit the key instead. | Dropped with a server-side warning: the update is discarded, and in `sync` the name is listed under `getterFailures`. The client keeps its last value (or none); it sees no error. |
+
+A rejected call carries the producer's `err.code`: the codes above, or an application error's own string `code` (one in the reserved `WC_BINDABLE_` namespace becomes `WC_BINDABLE_REMOTE_THROW`). A Core that throws a non-`Error` value surfaces as an `Error` named `NonErrorThrow` — throw `Error` instances.
+
+Consequences:
+
+- **Project user data; don't pass `UserContext` through.** `verifyAuth0Token()` sets `email` / `name` / `orgId` to `undefined` whenever the token lacks the claim, and Auth0 access tokens carry no `email` / `name` by default. Returning the `UserContext` — or a literal such as `{ sub, email: user.email }` — from a Core property makes the whole value unsendable. Omit absent claims, as the reference `UserCore.currentUser` does, and convert `Date`s to ISO strings or epoch numbers.
+- **`<auth0-session>`'s `ready` needs at least one property to arrive.** `ready` flips on the first property event after sync. If every declared property of your Core is non-JSON at sync time, nothing is dispatched, the bind callback never fires, and `ready` stays `false` with no `error` until a later update delivers a JSON value. The server logs `RemoteShellProxy: dropped sync value for "<name>"`; the browser console shows `RemoteCoreProxy: the producer could not read or transmit property "<name>"`.
+- **Don't wire DOM events straight to a forwarder.** See [§3](#3-gate-ui-on-sessionready-and-command-the-core-via-the-payload).
 
 ### Resource & rate-limit knobs
 

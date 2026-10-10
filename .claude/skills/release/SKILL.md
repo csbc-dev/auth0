@@ -36,18 +36,13 @@ If any check fails, stop and report. Do not attempt fixes unless the user asks.
 
 ## Local-path dependency check (MANDATORY before publish)
 
-`package.json` currently pins `@wc-bindable/remote` as a `file:` reference to a sibling monorepo (`file:../../wc-bindable-protocol/wc-bindable-protocol/packages/remote`) for development convenience. **`npm publish` will refuse to publish a package whose `dependencies` contain a `file:` URI** — and even if a registry accepted it, downstream `npm install @csbc-dev/auth0` on any machine without that exact directory layout would fail.
-
-Before running any publish-prep step, confirm with the user:
-
-1. `@wc-bindable/remote` has been published to npm at the version `@csbc-dev/auth0` is built and tested against, AND
-2. `package.json` `dependencies["@wc-bindable/remote"]` has been updated to a semver range (`^X.Y.Z`) pointing at that published version.
+`package.json` resolves `@wc-bindable/core` and `@wc-bindable/remote` from the npm registry (`^0.10.0` at the time of writing). This check stays as a guard against a temporary local pointer — e.g. a `file:` reference to a sibling `wc-bindable-protocol` checkout while testing an unreleased upstream change — slipping into a release. **`npm publish` will refuse to publish a package whose `dependencies` contain a `file:` URI** — and even if a registry accepted it, downstream `npm install @csbc-dev/auth0` on any machine without that exact directory layout would fail.
 
 Procedure:
 
 - Use Read on [package.json](package.json) and grep its `dependencies` block for any value starting with `file:` / `link:` / `portal:` / a relative path (`./` / `../`). If you find one, STOP and surface it as a blocker — do NOT continue with version bump, build verification, or commit.
-- After the user updates the dep to a registry-resolvable range, re-run `npm install` and `npm test` so `package-lock.json` (if present) and the test suite pick up the published artifact instead of the sibling-monorepo build.
-- Restore the `file:` reference in a follow-up commit AFTER the publish, if the user wants the dev-convenience pointer back. The release commit itself must ship a published-artifact-resolvable manifest.
+- Confirm with the user that the upstream version the local pointer stood in for has been published to npm, and that the dependency has been changed to a semver range (`^X.Y.Z`) pointing at it.
+- Then re-run `npm install` and `npm test` so `package-lock.json` and the test suite pick up the published artifact instead of the local build. The release commit must ship a published-artifact-resolvable manifest.
 
 If the user asks "why can't we just publish anyway", remind them that `npm publish` runs its own `_resolveLink`-style check and rejects `file:` deps with `EUNSUPPORTEDPROTOCOL` / "Cannot publish a package with a file: dependency".
 

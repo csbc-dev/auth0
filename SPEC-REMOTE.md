@@ -698,7 +698,7 @@ export class Auth extends HTMLElement {
 
 `<auth0-session>` observes `auth0-gate:authenticated-changed`, calls `authEl.connect()` when the target becomes authenticated, wraps the transport with `createRemoteCoreProxy`, and owns the proxy lifecycle. This is the path whose `ready` signal is correct for gating UI (§3.1, §11).
 
-The `wcBindable` declaration is sourced from the **first wc-bindable child** (`<app-core-facade>` here — a user-defined custom element whose class declares `static wcBindable`). Property events from the proxy are mirrored onto that child as own data properties + the user-declared event names, and each declared command is installed on the child as an own-property forwarder that delegates to `proxy.invoke(...)`. The `core="..."` attribute + `registerCoreDeclaration()` registry path is preserved as a fallback for elements with no wc-bindable child but is not preferred for new code.
+The `wcBindable` declaration is sourced from the **first wc-bindable child** (`<app-core-facade>` here — a user-defined custom element whose class declares `static wcBindable`). Property events from the proxy are mirrored onto that child as own data properties + the user-declared event names, and each declared command is installed on the child as an own-property forwarder that delegates to `proxy.invoke(...)`. Forwarders pass their arguments through unchanged, so the wire-value contract of §5.0 applies to every call: under `@wc-bindable/remote` 0.10+ an argument that is not a JSON value — `undefined`, a `Date`, a class instance, a DOM `Event` handed over by an event handler wired straight to the forwarder — rejects with `WC_BINDABLE_INVALID_JSON_VALUE` before anything is sent, and a non-JSON return value rejects with `WC_BINDABLE_INVALID_RETURN_VALUE`. The `core="..."` attribute + `registerCoreDeclaration()` registry path is preserved as a fallback for elements with no wc-bindable child but is not preferred for new code.
 
 **Pattern B — fully imperative:**
 
@@ -867,6 +867,8 @@ interface UserContext {
 }
 ```
 
+`verifyAuth0Token()` sets an optional field to `undefined` when the token lacks the claim, so a `UserContext` is not itself a valid wire value — expose a projection that omits absent claims (§5.0, §5.1).
+
 ### 4.4 Provided Helper Functions
 
 #### `createAuthenticatedWSS(options): Promise<WebSocketServer>`
@@ -918,6 +920,24 @@ Parses the `Sec-WebSocket-Protocol` header to extract the token from `auth0-gate
 
 ## 5. Core Side Patterns
 
+### 5.0 Wire Value Contract (JsonValue)
+
+Everything a Core exchanges with the client crosses the WebSocket through `RemoteShellProxy` / `RemoteCoreProxy`, and from `@wc-bindable/remote` 0.10 both sides validate it as a strict `JsonValue`: `null`, booleans, strings, finite numbers, plain arrays and plain objects, recursively. Nothing is coerced — `undefined`, `NaN` / `±Infinity`, `BigInt`, `Date`, `Map` / `Set`, class instances (`Error` included), DOM `Event`s, cycles and sparse arrays are rejected rather than reshaped by `JSON.stringify` as before 0.10. A Core hosted by `createAuthenticatedWSS` / `handleConnection` MUST therefore follow these rules:
+
+| Direction | Value | Requirement | On violation |
+|-----------|-------|-------------|--------------|
+| client → server | `invoke` arguments (including payload-child forwarders, §3.7) | Each argument is a `JsonValue`. `undefined` is not sent as `null` any more. | Consumer rejects the call before sending: `err.code === "WC_BINDABLE_INVALID_JSON_VALUE"`. |
+| server → client | command return value | A `JsonValue`, or `undefined`. | The call rejects with `err.code === "WC_BINDABLE_INVALID_RETURN_VALUE"`. |
+| server → client | property value (`sync` snapshot, `update` from a `*-changed` event) | A `JsonValue`, or `undefined` as the whole value. An object field whose value is `undefined` makes the **whole** value invalid — omit the key. | Dropped with a producer-side warning (`RemoteShellProxy: dropped …`). An `update` is discarded; in `sync` the name is listed under `getterFailures` and the client keeps its last value (`RemoteCoreProxy: the producer could not read or transmit property …`). The client sees no error. |
+
+Errors: a rejected call carries the producer's `err.code` (an application error's own string `code` passes through, except that codes in the reserved `WC_BINDABLE_` namespace become `WC_BINDABLE_REMOTE_THROW`). A Core that throws a non-`Error` value surfaces on the client as an `Error` named `NonErrorThrow`; Cores SHOULD throw `Error` instances.
+
+Consequences for this package:
+
+- **`UserContext` is not a wire value.** `verifyAuth0Token()` (§4.4) sets `email` / `name` / `orgId` to `undefined` when the token lacks the claim — the default for Auth0 access tokens — and `raw` holds the full payload. Cores MUST expose a projection that omits absent claims, as `UserCore.currentUser` does (§5.1).
+- **`ready` requires at least one delivered property.** `<auth0-session>` flips `ready` on the first property event after sync (§3.7). A `sync` in which every declared property was dropped as non-JSON dispatches nothing, so `ready` stays `false` with no `error` until a later update delivers a JSON value. (A property that is `undefined` at sync time is still dispatched — only non-JSON values, and getters that throw, are withheld.)
+- **The in-band `auth:refresh` command (§3.4.1) is not affected:** it is intercepted at the transport layer on both sides and never passes through the proxies' validation.
+
 ### 5.1 UserCore — Exposing Authenticated User Information
 
 A Core constructed server-side that exposes user information as wc-bindable properties.
@@ -945,12 +965,15 @@ export class UserCore extends EventTarget {
     this._user = user;
   }
 
+  // Absent claims are OMITTED, never `email: undefined` / `name: undefined`
+  // — an `undefined` field makes the whole value non-JSON and it would never
+  // reach the client (§5.0). Auth0 access tokens carry neither claim by
+  // default, so this is the common case, not an edge case.
   get currentUser(): { sub: string; email?: string; name?: string } {
-    return {
-      sub:   this._user.sub,
-      email: this._user.email,
-      name:  this._user.name,
-    };
+    const user: { sub: string; email?: string; name?: string } = { sub: this._user.sub };
+    if (this._user.email !== undefined) user.email = this._user.email;
+    if (this._user.name !== undefined) user.name = this._user.name;
+    return user;
   }
 
   get permissions(): string[] {
@@ -1040,6 +1063,13 @@ export class AppCore extends EventTarget {
     this._forwardEvents(this._userCore);
     this._forwardEvents(this._s3Core);
   }
+
+  // `RemoteShellProxy` answers `sync` by reading `core[prop.name]` directly,
+  // so every forwarded property also needs a delegating getter. Forwarding
+  // keeps the child Core's value as-is — it must already satisfy §5.0, as
+  // `UserCore.currentUser` does by omitting absent claims.
+  get currentUser() { return this._userCore.currentUser; }
+  get permissions() { return this._userCore.permissions; }
 }
 ```
 
@@ -1890,12 +1920,12 @@ packages/auth0/src/
 
 ### Client-Side (`dependencies`)
 - `@auth0/auth0-spa-js` — Auth0 SPA SDK (dynamic import)
-- `@wc-bindable/core` — `bind()`, `isWcBindable()`
-- `@wc-bindable/remote` — `RemoteCoreProxy`, `WebSocketClientTransport`
+- `@wc-bindable/core` (`^0.10.0`) — `bind()`, `isWcBindable()`
+- `@wc-bindable/remote` (`^0.10.0`) — `RemoteCoreProxy`, `WebSocketClientTransport`. 0.10 is the first version that enforces the JsonValue wire contract (§5.0)
 
 ### Server-Side (`dependencies`)
 - `jose` — JWT verification, JWKS retrieval
-- `@wc-bindable/remote` — `RemoteShellProxy`, `WebSocketServerTransport`
+- `@wc-bindable/remote` (`^0.10.0`) — `RemoteShellProxy`, `WebSocketServerTransport`
 - `ws` — WebSocket server (may also be listed as `peerDependencies`)
 
 ---

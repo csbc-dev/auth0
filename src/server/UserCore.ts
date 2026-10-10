@@ -12,7 +12,8 @@ import type { IWcBindable, UserContext } from "../types.js";
  * different payload shapes — AuthCore dispatches `AuthUser | null`
  * (the Auth0 ID token profile, including Auth0-specific fields like
  * `picture`, `sid`, `updated_at`), while UserCore dispatches a
- * server-side `{ sub, email, name }` projection of `UserContext`.
+ * server-side `{ sub, email?, name? }` projection of `UserContext`
+ * (absent claims omitted — see `currentUser`).
  *
  * Without the namespace, a pass-through / bridge that forwarded the
  * raw event name across the CSBC wire would silently overlap on the
@@ -43,12 +44,26 @@ export class UserCore extends EventTarget {
     this._user = user;
   }
 
+  /**
+   * Absent claims are OMITTED from the projection, never present as
+   * `undefined`. Auth0 access tokens carry no `email` / `name` claim by
+   * default, so `verifyAuth0Token()` routinely yields a `UserContext`
+   * with both fields `undefined`. `@wc-bindable/remote` (>= 0.10)
+   * validates every outbound property value as a strict `JsonValue`,
+   * and an object field whose value is `undefined` rejects the WHOLE
+   * value rather than being dropped the way `JSON.stringify` drops it:
+   * the `sync` snapshot would list `currentUser` under `getterFailures`
+   * and every `user-changed` update would be discarded with a warning,
+   * so the client would never receive the user at all. Omitting the
+   * keys keeps the declared `{ sub; email?; name? }` shape and delivers
+   * exactly what older `remote` versions delivered after
+   * `JSON.stringify` silently dropped the `undefined` fields.
+   */
   get currentUser(): { sub: string; email?: string; name?: string } {
-    return {
-      sub:   this._user.sub,
-      email: this._user.email,
-      name:  this._user.name,
-    };
+    const user: { sub: string; email?: string; name?: string } = { sub: this._user.sub };
+    if (this._user.email !== undefined) user.email = this._user.email;
+    if (this._user.name !== undefined) user.name = this._user.name;
+    return user;
   }
 
   get permissions(): string[] {
