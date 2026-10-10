@@ -696,9 +696,9 @@ export class Auth extends HTMLElement {
 </auth0-session>
 ```
 
-`<auth0-session>` observes `auth0-gate:authenticated-changed`, calls `authEl.connect()` when the target becomes authenticated, wraps the transport with `createRemoteCoreProxy`, and owns the proxy lifecycle. This is the path whose `ready` signal is correct for gating UI (§3.1, §11).
+`<auth0-session>` observes `auth0-gate:authenticated-changed`, calls `authEl.connect()` when the target becomes authenticated, wraps the transport with `createRemoteCoreProxy`, and owns the proxy lifecycle and the connection it opened (see "Connection lifetime" below). This is the path whose `ready` signal is correct for gating UI (§3.1, §11).
 
-The `wcBindable` declaration is sourced from the **first wc-bindable child** (`<app-core-facade>` here — a user-defined custom element whose class declares `static wcBindable`). Property events from the proxy are mirrored onto that child as own data properties + the user-declared event names, and each declared command is installed on the child as an own-property forwarder that delegates to `proxy.invoke(...)`. Forwarders pass their arguments through unchanged, so the wire-value contract of §5.0 applies to every call: under `@wc-bindable/remote` 0.10+ an argument that is not a JSON value — `undefined`, a `Date`, a class instance, a DOM `Event` handed over by an event handler wired straight to the forwarder — rejects with `WC_BINDABLE_INVALID_JSON_VALUE` before anything is sent, and a non-JSON return value rejects with `WC_BINDABLE_INVALID_RETURN_VALUE`. The `core="..."` attribute + `registerCoreDeclaration()` registry path is preserved as a fallback for elements with no wc-bindable child but is not preferred for new code.
+The `wcBindable` declaration is sourced from the **first wc-bindable child** (`<app-core-facade>` here — a user-defined custom element whose class declares `static wcBindable`). Property events from the proxy are mirrored onto that child as own data properties + the user-declared event names, and each declared command is installed on the child as an own-property forwarder that delegates to `proxy.invoke(...)`. A declared command name that the application has locked on the child (a non-configurable own property, or no own property on a non-extensible child) cannot take a forwarder; the session then fails with an `error` that names the command and the lock rather than skip it — unlike a locked mirrored property, which is skipped — since calls to it would never reach the server. Forwarders pass their arguments through unchanged, so the wire-value contract of §5.0 applies to every call: under `@wc-bindable/remote` 0.10+ an argument that is not a JSON value — `undefined`, a `Date`, a class instance, a DOM `Event` handed over by an event handler wired straight to the forwarder — rejects with `WC_BINDABLE_INVALID_JSON_VALUE` before anything is sent, and a non-JSON return value rejects with `WC_BINDABLE_INVALID_RETURN_VALUE`. The `core="..."` attribute + `registerCoreDeclaration()` registry path is preserved as a fallback for elements with no wc-bindable child but is not preferred for new code.
 
 **Pattern B — fully imperative:**
 
@@ -709,11 +709,21 @@ const transport = await auth.connect();
 const proxy = createRemoteCoreProxy(AppCore.wcBindable, transport);
 ```
 
-The application owns the transport and the proxy. No session element is mounted.
+The application owns the transport and the proxy. No session element is mounted. The connection stays open until the application calls `logout()`, `<auth0-gate>` leaves the DOM, or the server closes it.
 
 **Why they must not be combined.** `AuthShell.connect()` unconditionally calls `_closeWebSocket()` at its start (so a failed handshake cannot leak a previous socket). This means a second `connect()` call from the application closes the WebSocket that `<auth0-session>` just opened, leaving the session's `RemoteCoreProxy` bound to a transport that will never deliver another frame. The session keeps `ready=true` but property updates silently stop. There is no way for the session element to "take over" a transport it did not create. **Pick one pattern per `<auth0-gate>` instance.**
 
 **Enforcement.** `<auth0-session>` fails fast: if `authEl.connected === true` at the point where the session would have called `connect()` itself, the session sets `error` to a message describing the conflict and does not build a proxy. This surfaces the mistake immediately instead of producing a silently-dead session.
+
+**Connection lifetime (Pattern A).** The session owns exactly the connection it obtained from `authEl.connect()` and gives it back to `<auth0-gate>` — the WebSocket is closed with `1000` and `connected` returns to `false` — when the session ends:
+
+- `authenticated` turns `false` (on `logout()` the gate has already closed the connection, so the release finds nothing to close and no second `connected-changed` is emitted);
+- the transport is lost (the gate has already dropped it);
+- the `<auth0-session>` element is removed from the DOM, including a remount or a move within it;
+- `start()` restarts the session;
+- setting the session up fails after the handshake (proxy construction, `bind()`'s initial sync, or a command forwarder that cannot be installed).
+
+A handshake in flight when the session ends cannot be cancelled; its connection is closed as soon as it opens, and a run started meanwhile on the same element waits for that before calling `connect()` instead of failing the ownership guard against it. The release is identity-checked inside the package: it closes the connection only while it is still the gate's live one. It therefore never touches a connection the session did not open — Pattern B's, a take-over `connect()`, or the replacement `reconnect()` opened (§3.4.2, even when `session.proxy` was re-attached to it) — and it does not cancel another caller's in-flight handshake the way `disconnect()` does. Such a connection stays until `logout()` or until `<auth0-gate>` leaves the DOM; the session's next `connect()` reports the ownership conflict meanwhile.
 
 ---
 

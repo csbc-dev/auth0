@@ -10,7 +10,7 @@ import {
   getCoreDeclaration,
   _clearCoreRegistry,
 } from "../src/coreRegistry";
-import { isOwnershipError, OWNERSHIP_ERROR_MARKER } from "../src/raiseError";
+import { ERROR_PREFIX, isOwnershipError, OWNERSHIP_ERROR_MARKER } from "../src/raiseError";
 import { setConfig } from "../src/config";
 
 vi.mock("@auth0/auth0-spa-js", () => ({
@@ -1083,6 +1083,742 @@ describe("AuthSession (auth0-session)", () => {
     });
   });
 
+  describe("connection release (real AuthShell over a mock WebSocket)", () => {
+    // These tests run the real AuthShell.connect() against a mock
+    // WebSocket, so what the session closes is observable on the sockets
+    // and on the target's `connected` / `connected-changed`.
+    class MockSocket {
+      static CONNECTING = 0;
+      static OPEN = 1;
+      static CLOSING = 2;
+      static CLOSED = 3;
+      static instances: MockSocket[] = [];
+
+      readyState = MockSocket.CONNECTING;
+      closeCode: number | undefined;
+      // Every close() call, including ones on an already-closed socket.
+      closeCalls = 0;
+      private _listeners: Record<string, Array<(event: unknown) => void>> = {};
+
+      constructor(public url: string, public protocols?: string | string[]) {
+        MockSocket.instances.push(this);
+        // Open on a later task, like a real handshake, so an in-flight
+        // connect stays observable across microtasks.
+        setTimeout(() => {
+          if (this.readyState !== MockSocket.CONNECTING) return;
+          this.readyState = MockSocket.OPEN;
+          this._emit("open", {});
+        }, 0);
+      }
+
+      addEventListener(type: string, listener: (event: unknown) => void): void {
+        (this._listeners[type] ??= []).push(listener);
+      }
+
+      removeEventListener(type: string, listener: (event: unknown) => void): void {
+        const list = this._listeners[type] ?? [];
+        const idx = list.indexOf(listener);
+        if (idx >= 0) list.splice(idx, 1);
+      }
+
+      send(_data: string): void {}
+
+      close(code?: number, reason?: string): void {
+        this.closeCalls++;
+        if (this.readyState === MockSocket.CLOSED) return;
+        this.readyState = MockSocket.CLOSED;
+        this.closeCode = code;
+        this._emit("close", { code, reason });
+      }
+
+      private _emit(type: string, event: unknown): void {
+        for (const fn of [...(this._listeners[type] ?? [])]) fn(event);
+      }
+    }
+
+    const RELEASE_PAYLOAD_DECL: WcBindableDeclaration = {
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [
+        { name: "count", event: "release-payload:count-changed" },
+        { name: "label", event: "release-payload:label-changed" },
+      ],
+      commands: [{ name: "increment" }, { name: "decrement" }],
+    };
+
+    let releaseTagSeq = 0;
+    function definePayloadTag(decl: WcBindableDeclaration): string {
+      const tag = `release-payload-${++releaseTagSeq}`;
+      customElements.define(tag, class extends HTMLElement {
+        static wcBindable = decl;
+      });
+      return tag;
+    }
+
+    beforeEach(() => {
+      MockSocket.instances = [];
+      vi.stubGlobal("WebSocket", MockSocket);
+    });
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    async function mountGate() {
+      createAuth0Client.mockResolvedValue(createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently: vi.fn().mockResolvedValue("jwt-token"),
+      }));
+      const authEl = document.createElement("auth0-gate") as Auth;
+      authEl.id = "auth";
+      authEl.setAttribute("domain", "d.auth0.com");
+      authEl.setAttribute("client-id", "c");
+      authEl.setAttribute("audience", "https://api.example.com");
+      authEl.setAttribute("remote-url", "wss://example.com/ws");
+      document.body.appendChild(authEl);
+      await authEl.connectedCallbackPromise;
+      const connectedEvents: boolean[] = [];
+      authEl.addEventListener("auth0-gate:connected-changed",
+        (e) => connectedEvents.push((e as CustomEvent).detail));
+      return { authEl, connectedEvents };
+    }
+
+    async function mountSession(configure: (el: AuthSession) => void): Promise<AuthSession> {
+      const el = document.createElement("auth0-session") as AuthSession;
+      el.target = "auth";
+      configure(el);
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+      return el;
+    }
+
+    // The failed attempt closed the one socket it opened, `connected`
+    // went back to false (with the event), and nothing of the attempt
+    // survives on the session.
+    function expectReleased(authEl: Auth, el: AuthSession, connectedEvents: boolean[]): void {
+      expect(MockSocket.instances).toHaveLength(1);
+      expect(MockSocket.instances[0].readyState).toBe(MockSocket.CLOSED);
+      expect(MockSocket.instances[0].closeCode).toBe(1000);
+      expect(authEl.connected).toBe(false);
+      expect(connectedEvents).toEqual([true, false]);
+      expect(el.proxy).toBeNull();
+      expect(el.transport).toBeNull();
+      expect(el.payload).toBeNull();
+      expect(el.connecting).toBe(false);
+      expect(el.ready).toBe(false);
+    }
+
+    // With the cause removed, `start()` on the same element connects.
+    async function expectRetrySucceeds(
+      authEl: Auth,
+      el: AuthSession,
+      syncValues: Record<string, unknown>,
+    ): Promise<void> {
+      await el.start();
+      expect(el.error).toBeNull();
+      expect(el.proxy).not.toBeNull();
+      expect(authEl.connected).toBe(true);
+      expect(MockSocket.instances).toHaveLength(2);
+      expect(MockSocket.instances[1].readyState).toBe(MockSocket.OPEN);
+      (el.proxy as any)._simulateSync(syncValues);
+      await Promise.resolve();
+      expect(el.ready).toBe(true);
+    }
+
+    // Lets the mock sockets open (they do so on a later task).
+    const flush = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+
+    // Pumps microtasks until the session has created its `n`-th socket,
+    // i.e. a handshake is in flight but has not opened yet.
+    async function untilSocketCount(n: number): Promise<void> {
+      for (let i = 0; i < 100 && MockSocket.instances.length < n; i++) {
+        await Promise.resolve();
+      }
+      expect(MockSocket.instances).toHaveLength(n);
+      expect(MockSocket.instances[n - 1].readyState).toBe(MockSocket.CONNECTING);
+    }
+
+    describe("failure after the handshake releases the connection", () => {
+      // `auth.connect()` succeeded, then setting the session up failed. The
+      // session used to drop its reference to the transport without
+      // closing it, so `<auth0-gate>` stayed `connected=true` with an open
+      // WebSocket nobody owned and every `start()` retry failed the
+      // Connection Ownership guard (SPEC-REMOTE §3.7) until logout.
+      it("closes the connection when createRemoteCoreProxy throws, and start() can retry", async () => {
+        const { authEl, connectedEvents } = await mountGate();
+        const failure = new Error("proxy construction failed");
+        proxyHooks.onCreate = () => { throw failure; };
+
+        const el = await mountSession((s) => { s.core = "app-core"; });
+
+        expect(el.error).toBe(failure);
+        expectReleased(authEl, el, connectedEvents);
+
+        proxyHooks.onCreate = null;
+        await expectRetrySucceeds(authEl, el, { currentUser: { sub: "u" }, items: [] });
+      });
+
+      it("closes the connection when the payload declaration loses its properties after discovery, and start() can retry", async () => {
+        const { authEl, connectedEvents } = await mountGate();
+        const decl = { ...RELEASE_PAYLOAD_DECL };
+        const tag = definePayloadTag(decl);
+        // The application mutates the declaration while the handshake runs —
+        // after discovery validated it, before the proxy is built from it.
+        authEl.addEventListener("auth0-gate:connected-changed", () => {
+          delete (decl as Partial<WcBindableDeclaration>).properties;
+        }, { once: true });
+        const child = document.createElement(tag);
+
+        const el = await mountSession((s) => s.appendChild(child));
+
+        expect(el.error).toBeInstanceOf(Error);
+        expectReleased(authEl, el, connectedEvents);
+
+        decl.properties = RELEASE_PAYLOAD_DECL.properties;
+        await expectRetrySucceeds(authEl, el, { count: 1 });
+        expect(el.payload).toBe(child);
+        expect((child as any).count).toBe(1);
+      });
+
+      it("closes the connection when bind()'s synchronous initial sync throws, and start() can retry", async () => {
+        const { authEl, connectedEvents } = await mountGate();
+        const failure = new Error("cached value unreadable");
+        // A cached property whose read throws makes bind() throw from its
+        // synchronous initial sync.
+        proxyHooks.onCreate = (proxy) => {
+          Object.defineProperty(proxy, "items", {
+            get() { throw failure; },
+            configurable: true,
+          });
+        };
+
+        const el = await mountSession((s) => { s.core = "app-core"; });
+
+        expect(el.error).toBe(failure);
+        expectReleased(authEl, el, connectedEvents);
+
+        proxyHooks.onCreate = null;
+        await expectRetrySucceeds(authEl, el, { currentUser: null, items: [] });
+      });
+
+      it("lets an `error` listener retry synchronously with start()", async () => {
+        // The error is published after the failed attempt's state is
+        // cleared and before its connection is released; a restart begun
+        // from the listener must neither be undone by that cleanup nor hit
+        // the ownership guard.
+        const { authEl, connectedEvents } = await mountGate();
+        const tag = definePayloadTag(RELEASE_PAYLOAD_DECL);
+        let failuresLeft = 1;
+        proxyHooks.onCreate = () => {
+          if (failuresLeft-- > 0) throw new Error("transient proxy failure");
+        };
+        const child = document.createElement(tag);
+        let retry: Promise<void> | undefined;
+
+        const el = await mountSession((s) => {
+          s.appendChild(child);
+          s.addEventListener("auth0-session:error", (e) => {
+            if ((e as CustomEvent).detail && !retry) retry = s.start();
+          });
+        });
+        expect(retry).toBeDefined();
+        await retry;
+
+        expect(el.error).toBeNull();
+        expect(el.payload).toBe(child);
+        expect(authEl.connected).toBe(true);
+        expect(connectedEvents).toEqual([true, false, true]);
+        expect(MockSocket.instances.map((s) => s.readyState))
+          .toEqual([MockSocket.CLOSED, MockSocket.OPEN]);
+        (el.proxy as any)._simulateSync({ count: 7 });
+        expect((child as any).count).toBe(7);
+        await Promise.resolve();
+        expect(el.ready).toBe(true);
+      });
+
+      it("still releases the connection when the failing attempt was already superseded by a teardown", async () => {
+        // A payload listener unmounts the session during bind()'s initial
+        // sync, then a later property read throws. The error is swallowed
+        // (the attempt is stale), but its connection was never handed to a
+        // live session and must not outlive it.
+        const { authEl, connectedEvents } = await mountGate();
+        const tag = definePayloadTag(RELEASE_PAYLOAD_DECL);
+        proxyHooks.onCreate = (proxy) => {
+          Object.defineProperty(proxy, "count", {
+            value: 1, writable: true, configurable: true, enumerable: true,
+          });
+          Object.defineProperty(proxy, "label", {
+            get() { throw new Error("label unreadable"); },
+            configurable: true,
+          });
+        };
+        const child = document.createElement(tag);
+        const errorEvents: unknown[] = [];
+
+        const el = await mountSession((s) => {
+          s.appendChild(child);
+          child.addEventListener("release-payload:count-changed", () => s.remove(), { once: true });
+          s.addEventListener("auth0-session:error", (e) => errorEvents.push((e as CustomEvent).detail));
+        });
+
+        expect(el.error).toBeNull();
+        expect(errorEvents).toEqual([]);
+        expectReleased(authEl, el, connectedEvents);
+
+        // Remounting the session connects instead of failing ownership.
+        proxyHooks.onCreate = null;
+        document.body.appendChild(el);
+        await el.connectedCallbackPromise;
+        expect(el.error).toBeNull();
+        expect(el.proxy).not.toBeNull();
+        expect(authEl.connected).toBe(true);
+        expect(MockSocket.instances).toHaveLength(2);
+      });
+
+      it("leaves another owner's connection open when the ownership guard rejects the handshake", async () => {
+        // The application opens the connection itself while the session
+        // starts. `auth.connect()` rejects, so the session established
+        // nothing and must not close anything.
+        const { authEl, connectedEvents } = await mountGate();
+        const appConnect = authEl.connect();
+
+        const el = await mountSession((s) => { s.core = "app-core"; });
+        await appConnect;
+
+        expect(isOwnershipError(el.error)).toBe(true);
+        expect(el.connecting).toBe(false);
+        expect(MockSocket.instances).toHaveLength(1);
+        expect(MockSocket.instances[0].readyState).toBe(MockSocket.OPEN);
+        expect(authEl.connected).toBe(true);
+        expect(connectedEvents).toEqual([true]);
+      });
+
+      it("does not close a connection that replaced the session's own before the failure path ran", async () => {
+        const { authEl, connectedEvents } = await mountGate();
+        const shell = (authEl as any)._shell;
+        const realConnect = shell.connect.bind(shell);
+        vi.spyOn(shell, "connect").mockImplementationOnce(async (...args: unknown[]) => {
+          const [url, options] = args as [string, { failIfConnected?: boolean }];
+          const sessionTransport = await realConnect(url, options);
+          // Another owner takes the connection over before the session
+          // resumes from its handshake.
+          await realConnect(url);
+          return sessionTransport;
+        });
+        proxyHooks.onCreate = () => { throw new Error("proxy construction failed"); };
+
+        const el = await mountSession((s) => { s.core = "app-core"; });
+
+        expect(el.error?.message).toBe("proxy construction failed");
+        expect(MockSocket.instances).toHaveLength(2);
+        // The session's socket was closed by the take-over, not by the
+        // session; the other owner's socket is untouched.
+        expect(MockSocket.instances[1].readyState).toBe(MockSocket.OPEN);
+        expect(authEl.connected).toBe(true);
+        expect(connectedEvents).toEqual([true]);
+      });
+    });
+
+    describe("a locked command name fails the session with an error that says why", () => {
+      // A declared command's forwarder cannot be installed on a name the
+      // application locked. The session still fails on purpose — running
+      // on would leave `payload.<command>()` calling the application's
+      // member, so the command would never reach the server — but the
+      // error names the command, the lock and the fix instead of a bare
+      // "Cannot redefine property" TypeError, and the regular failure
+      // path cleans up.
+
+      it("names the command and its non-configurable lock, removes the forwarders already installed, closes the connection, and start() recovers with an unlocked element", async () => {
+        const { authEl, connectedEvents } = await mountGate();
+        const tag = definePayloadTag(RELEASE_PAYLOAD_DECL);
+        const lockedChild = document.createElement(tag);
+        // `decrement` is declared after `increment`, so the forwarder for
+        // `increment` is already installed when the lock is hit.
+        const appDecrement = (): string => "app";
+        Object.defineProperty(lockedChild, "decrement", {
+          value: appDecrement, writable: false, configurable: false,
+        });
+        const errorEvents: unknown[] = [];
+
+        const el = await mountSession((s) => {
+          s.appendChild(lockedChild);
+          s.addEventListener("auth0-session:error", (e) => errorEvents.push((e as CustomEvent).detail));
+        });
+
+        const err = el.error;
+        expect(err).toBeInstanceOf(Error);
+        expect(err).not.toBeInstanceOf(TypeError);
+        expect(errorEvents).toEqual([err]);
+        expect(err?.message.startsWith(`${ERROR_PREFIX} <auth0-session>: `)).toBe(true);
+        expect(err?.message).toContain(`cannot install the forwarder for command "decrement" on payload <${tag}>`);
+        expect(err?.message).toContain(`<${tag}>.decrement is a non-configurable own property`);
+        expect(err?.message).toContain("payload.decrement() never reaches the server");
+        expect(err?.message).toContain(`Stop locking "decrement"`);
+        expect(err?.message).toContain(`remove "decrement" from its wcBindable.commands, then call start()`);
+
+        // Cleanup ran through the existing failure path: the forwarder
+        // installed before the lock was hit is gone, the application's
+        // locked member is untouched, and the connection is closed.
+        expectReleased(authEl, el, connectedEvents);
+        expect(Object.prototype.hasOwnProperty.call(lockedChild, "increment")).toBe(false);
+        expect((lockedChild as any).decrement).toBe(appDecrement);
+
+        // A lock cannot be undone on that element; remove the cause by
+        // mounting an unlocked one, then retry.
+        lockedChild.remove();
+        const child = document.createElement(tag);
+        el.appendChild(child);
+        await expectRetrySucceeds(authEl, el, { count: 2 });
+        expect(el.payload).toBe(child);
+        expect(typeof (child as any).increment).toBe("function");
+        expect(typeof (child as any).decrement).toBe("function");
+      });
+
+      it("names a non-extensible payload the same way, and start() recovers once the command is removed from the declaration", async () => {
+        const { authEl, connectedEvents } = await mountGate();
+        const decl: WcBindableDeclaration = { ...RELEASE_PAYLOAD_DECL, commands: [{ name: "increment" }] };
+        const tag = definePayloadTag(decl);
+        const child = document.createElement(tag);
+        // Lock the element after it is in the document, before the
+        // session installs anything on it.
+        authEl.addEventListener("auth0-gate:connected-changed", () => {
+          Object.preventExtensions(child);
+        }, { once: true });
+
+        const el = await mountSession((s) => s.appendChild(child));
+
+        expect(el.error?.message).toContain(`cannot install the forwarder for command "increment" on payload <${tag}>`);
+        expect(el.error?.message).toContain(`<${tag}> is non-extensible`);
+        expect(el.error?.message).toContain(`"increment" cannot be added to it`);
+        expectReleased(authEl, el, connectedEvents);
+        expect(Object.prototype.hasOwnProperty.call(child, "increment")).toBe(false);
+
+        // Drop the command from the declaration and retry. The element
+        // stays non-extensible, so mirrored properties are skipped with a
+        // warning, but the session runs.
+        decl.commands = [];
+        vi.spyOn(console, "warn").mockImplementation(() => {});
+        await expectRetrySucceeds(authEl, el, { count: 3 });
+        expect(el.payload).toBe(child);
+      });
+    });
+
+    describe("the session's end gives its connection back", () => {
+      // The session owns the connection it opened. Logout, removal from
+      // the DOM and a `start()` restart all end the session, and each
+      // gives that connection back (closes it through the target), so the
+      // next run — a remount, `start()` — does not fail the Connection
+      // Ownership guard (SPEC-REMOTE §3.7) against a connection nobody
+      // uses any more. A connection the session did not open is never
+      // closed.
+
+      function createSession(): AuthSession {
+        const el = document.createElement("auth0-session") as AuthSession;
+        el.target = "auth";
+        el.core = "app-core";
+        return el;
+      }
+
+      async function mountReadySession() {
+        const { authEl, connectedEvents } = await mountGate();
+        const readyEvents: boolean[] = [];
+        const el = await mountSession((s) => {
+          s.core = "app-core";
+          s.addEventListener("auth0-session:ready-changed",
+            (e) => readyEvents.push((e as CustomEvent).detail));
+        });
+        await expectSynced(el);
+        expect(authEl.connected).toBe(true);
+        return { authEl, connectedEvents, el, readyEvents };
+      }
+
+      async function expectSynced(el: AuthSession): Promise<void> {
+        expect(el.error).toBeNull();
+        (el.proxy as any)._simulateSync({ currentUser: { sub: "u" }, items: [] });
+        await Promise.resolve();
+        expect(el.ready).toBe(true);
+      }
+
+      function socketStates(): number[] {
+        return MockSocket.instances.map((s) => s.readyState);
+      }
+
+      it("start() on a live session closes its connection, reconnects, and returns to ready", async () => {
+        const { authEl, connectedEvents, el, readyEvents } = await mountReadySession();
+        const firstProxy = el.proxy;
+
+        await el.start();
+
+        expect(el.error).toBeNull();
+        expect(socketStates()).toEqual([MockSocket.CLOSED, MockSocket.OPEN]);
+        expect(MockSocket.instances[0].closeCode).toBe(1000);
+        expect(authEl.connected).toBe(true);
+        expect(connectedEvents).toEqual([true, false, true]);
+        expect(el.proxy).not.toBeNull();
+        expect(el.proxy).not.toBe(firstProxy);
+        await expectSynced(el);
+        expect(readyEvents).toEqual([true, false, true]);
+      });
+
+      it("removing the session closes its connection, and adding it back reconnects", async () => {
+        const { authEl, connectedEvents, el } = await mountReadySession();
+
+        el.remove();
+
+        expect(socketStates()).toEqual([MockSocket.CLOSED]);
+        expect(MockSocket.instances[0].closeCode).toBe(1000);
+        expect(authEl.connected).toBe(false);
+        expect(connectedEvents).toEqual([true, false]);
+        expect(el.ready).toBe(false);
+        expect(el.proxy).toBeNull();
+        expect(el.transport).toBeNull();
+
+        document.body.appendChild(el);
+        await el.connectedCallbackPromise;
+
+        expect(socketStates()).toEqual([MockSocket.CLOSED, MockSocket.OPEN]);
+        expect(authEl.connected).toBe(true);
+        expect(connectedEvents).toEqual([true, false, true]);
+        await expectSynced(el);
+      });
+
+      it("moving the session within the DOM in one task reconnects instead of failing ownership", async () => {
+        const { authEl, el } = await mountReadySession();
+        const container = document.createElement("div");
+        document.body.appendChild(container);
+
+        container.appendChild(el); // disconnectedCallback, then connectedCallback
+        await el.connectedCallbackPromise;
+
+        expect(socketStates()).toEqual([MockSocket.CLOSED, MockSocket.OPEN]);
+        expect(authEl.connected).toBe(true);
+        await expectSynced(el);
+      });
+
+      it("removing the session mid-handshake closes that connection as soon as the handshake completes", async () => {
+        const { authEl, connectedEvents } = await mountGate();
+        const el = createSession();
+        document.body.appendChild(el);
+        await untilSocketCount(1);
+        expect(el.connecting).toBe(true);
+
+        el.remove();
+        expect(el.connecting).toBe(false);
+        // The abandoned attempt finishes: its handshake opens, and the
+        // connection it delivers is given back at once.
+        await el.connectedCallbackPromise;
+
+        expect(socketStates()).toEqual([MockSocket.CLOSED]);
+        expect(MockSocket.instances[0].closeCode).toBe(1000);
+        expect(authEl.connected).toBe(false);
+        expect(connectedEvents).toEqual([true, false]);
+        expect(el.proxy).toBeNull();
+        expect(el.transport).toBeNull();
+        expect(el.error).toBeNull();
+      });
+
+      it("adding the session back mid-handshake waits for the abandoned handshake, then connects", async () => {
+        const { authEl, connectedEvents } = await mountGate();
+        const el = createSession();
+        document.body.appendChild(el);
+        await untilSocketCount(1);
+
+        el.remove();
+        document.body.appendChild(el);
+        await el.connectedCallbackPromise;
+
+        expect(el.error).toBeNull();
+        expect(socketStates()).toEqual([MockSocket.CLOSED, MockSocket.OPEN]);
+        expect(MockSocket.instances[0].closeCode).toBe(1000);
+        expect(authEl.connected).toBe(true);
+        expect(connectedEvents).toEqual([true, false, true]);
+        await expectSynced(el);
+      });
+
+      it("start() mid-handshake closes the abandoned handshake's connection and connects again", async () => {
+        const { authEl, connectedEvents } = await mountGate();
+        const el = createSession();
+        const connectingEvents: boolean[] = [];
+        el.addEventListener("auth0-session:connecting-changed",
+          (e) => connectingEvents.push((e as CustomEvent).detail));
+        document.body.appendChild(el);
+        await untilSocketCount(1);
+
+        await el.start();
+
+        expect(el.error).toBeNull();
+        expect(socketStates()).toEqual([MockSocket.CLOSED, MockSocket.OPEN]);
+        expect(MockSocket.instances[0].closeCode).toBe(1000);
+        expect(authEl.connected).toBe(true);
+        expect(connectedEvents).toEqual([true, false, true]);
+        // The restart reads `connecting` throughout its wait.
+        expect(connectingEvents).toEqual([true, false, true, false]);
+        await expectSynced(el);
+      });
+
+      it("a restart begun after the handshake opened, but before the session resumed from it, waits instead of failing ownership", async () => {
+        // A `connected-changed: true` listener runs while the target
+        // already reports `connected=true` for the session's own
+        // handshake, before that attempt resumed to install (or, now
+        // superseded, give back) the connection.
+        const { authEl, connectedEvents } = await mountGate();
+        const el = createSession();
+        let restart: Promise<void> | undefined;
+        authEl.addEventListener("auth0-gate:connected-changed", (e) => {
+          if ((e as CustomEvent).detail === true && !restart) restart = el.start();
+        });
+        document.body.appendChild(el);
+        await el.connectedCallbackPromise;
+        expect(restart).toBeDefined();
+        await restart;
+
+        expect(el.error).toBeNull();
+        expect(socketStates()).toEqual([MockSocket.CLOSED, MockSocket.OPEN]);
+        expect(authEl.connected).toBe(true);
+        expect(connectedEvents).toEqual([true, false, true]);
+        await expectSynced(el);
+      });
+
+      it("removing the session while a restart waits for the abandoned handshake leaves nothing open", async () => {
+        const { authEl, connectedEvents } = await mountGate();
+        const el = createSession();
+        document.body.appendChild(el);
+        await untilSocketCount(1);
+        const restart = el.start();
+        // Let the restart reach `_connect()`, where it waits.
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+        expect(el.connecting).toBe(true);
+
+        el.remove();
+        await restart;
+
+        expect(socketStates()).toEqual([MockSocket.CLOSED]);
+        expect(authEl.connected).toBe(false);
+        expect(connectedEvents).toEqual([true, false]);
+        expect(el.connecting).toBe(false);
+        expect(el.proxy).toBeNull();
+        expect(el.error).toBeNull();
+      });
+
+      it("logout closes the connection exactly once: the gate closes it, the session finds nothing left to release", async () => {
+        const { authEl, connectedEvents, el, readyEvents } = await mountReadySession();
+        const socket = MockSocket.instances[0];
+
+        await authEl.logout();
+
+        expect(socket.closeCalls).toBe(1);
+        expect(socket.readyState).toBe(MockSocket.CLOSED);
+        expect(authEl.connected).toBe(false);
+        expect(connectedEvents).toEqual([true, false]);
+        expect(el.ready).toBe(false);
+        expect(readyEvents).toEqual([true, false]);
+        expect(el.proxy).toBeNull();
+        expect(el.error).toBeNull();
+      });
+
+      it("a server close ends the session without a second close or event, and start() reconnects", async () => {
+        const { authEl, connectedEvents, el } = await mountReadySession();
+        const socket = MockSocket.instances[0];
+
+        socket.close(4401, "Session expired"); // server-initiated
+
+        expect(socket.closeCalls).toBe(1);
+        expect(authEl.connected).toBe(false);
+        expect(connectedEvents).toEqual([true, false]);
+        expect(el.ready).toBe(false);
+        expect(el.proxy).toBeNull();
+
+        await el.start();
+        expect(socketStates()).toEqual([MockSocket.CLOSED, MockSocket.OPEN]);
+        expect(connectedEvents).toEqual([true, false, true]);
+        await expectSynced(el);
+      });
+
+      it("authenticated flipping to false without a logout closes the session's connection", async () => {
+        const { authEl, connectedEvents, el } = await mountReadySession();
+
+        authEl.dispatchEvent(new CustomEvent("auth0-gate:authenticated-changed", { detail: false }));
+
+        expect(MockSocket.instances[0].closeCalls).toBe(1);
+        expect(socketStates()).toEqual([MockSocket.CLOSED]);
+        expect(authEl.connected).toBe(false);
+        expect(connectedEvents).toEqual([true, false]);
+        expect(el.ready).toBe(false);
+      });
+
+      it("removing the gate together with the session closes the socket once and announces it once", async () => {
+        const { authEl, connectedEvents } = await mountReadySession();
+
+        document.body.innerHTML = "";
+        await Promise.resolve(); // the gate's deferred disconnect()
+
+        expect(MockSocket.instances[0].closeCalls).toBe(1);
+        expect(authEl.connected).toBe(false);
+        expect(connectedEvents).toEqual([true, false]);
+      });
+
+      it("never closes the application's own connection: a session that lost the ownership check leaves it open on start() and on removal", async () => {
+        const { authEl, connectedEvents } = await mountGate();
+        await authEl.connect(); // Pattern B: the application owns the connection
+
+        const el = await mountSession((s) => { s.core = "app-core"; });
+        expect(isOwnershipError(el.error)).toBe(true);
+        await el.start();
+        expect(isOwnershipError(el.error)).toBe(true);
+        el.remove();
+
+        expect(socketStates()).toEqual([MockSocket.OPEN]);
+        expect(MockSocket.instances[0].closeCalls).toBe(0);
+        expect(authEl.connected).toBe(true);
+        expect(connectedEvents).toEqual([true]);
+      });
+
+      it("a second session on the same gate leaves the first session's connection open when it is restarted or removed", async () => {
+        const { authEl, connectedEvents, el: first } = await mountReadySession();
+        const second = await mountSession((s) => { s.core = "app-core"; });
+        expect(isOwnershipError(second.error)).toBe(true);
+
+        await second.start();
+        second.remove();
+
+        expect(socketStates()).toEqual([MockSocket.OPEN]);
+        expect(authEl.connected).toBe(true);
+        expect(connectedEvents).toEqual([true]);
+        expect(first.ready).toBe(true);
+        expect(first.proxy).not.toBeNull();
+      });
+
+      it("does not close a connection that a take-over connect() opened in place of the session's", async () => {
+        const { authEl, connectedEvents, el } = await mountReadySession();
+        await authEl.connect(); // no failIfConnected: replaces the session's socket
+
+        el.remove();
+
+        expect(socketStates()).toEqual([MockSocket.CLOSED, MockSocket.OPEN]);
+        expect(MockSocket.instances[1].closeCalls).toBe(0);
+        expect(authEl.connected).toBe(true);
+        expect(connectedEvents).toEqual([true]);
+      });
+
+      it("does not close a connection that authEl.reconnect() opened in place of the session's (Strategy B)", async () => {
+        const { authEl, connectedEvents, el } = await mountReadySession();
+        await authEl.reconnect();
+
+        // The replacement is not the session's: a restart neither closes
+        // it nor takes it over, and reports the ownership conflict.
+        await el.start();
+        el.remove();
+
+        expect(isOwnershipError(el.error)).toBe(true);
+        expect(socketStates()).toEqual([MockSocket.CLOSED, MockSocket.OPEN]);
+        expect(MockSocket.instances[1].closeCalls).toBe(0);
+        expect(authEl.connected).toBe(true);
+        expect(connectedEvents).toEqual([true]);
+      });
+    });
+  });
+
   describe("auto-connect=false", () => {
     it("does not start until start() is called", async () => {
       const mockClient = createMockAuth0Client({
@@ -1421,21 +2157,27 @@ describe("AuthSession (auth0-session)", () => {
         detail: false,
       }));
 
-      // User logs in again before the first handshake settles.
+      // User logs in again before the first handshake settles. The new
+      // attempt is `connecting` but does not start its own handshake yet:
+      // the stale one still holds the target's single connection slot, so
+      // a second `connect({ failIfConnected: true })` would be rejected as
+      // an ownership conflict. It waits for the stale attempt to finish.
       authEl.dispatchEvent(new CustomEvent("auth0-gate:authenticated-changed", {
         detail: true,
       }));
       await Promise.resolve();
       await Promise.resolve();
       await Promise.resolve();
-      expect(deferreds).toHaveLength(2);
+      expect(deferreds).toHaveLength(1);
       expect(el.connecting).toBe(true);
 
-      // Stale first handshake finally resolves — must be discarded.
+      // Stale first handshake finally resolves — must be discarded, and
+      // only then does the fresh attempt open its handshake.
       deferreds[0].resolve({ send: vi.fn(), onMessage: vi.fn(), onClose: vi.fn() });
-      await Promise.resolve();
-      await Promise.resolve();
+      await new Promise((r) => setTimeout(r, 0));
       expect(el.proxy).toBeNull();
+      expect(deferreds).toHaveLength(2);
+      expect(el.connecting).toBe(true);
 
       // Fresh handshake resolves — this one is the live attempt.
       deferreds[1].resolve({ send: vi.fn(), onMessage: vi.fn(), onClose: vi.fn() });

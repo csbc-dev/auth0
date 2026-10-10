@@ -1023,8 +1023,63 @@ export class AuthShell extends EventTarget {
   private _createTransport(ws: WebSocket): InterceptingClientTransport {
     const transport = new InterceptingClientTransport(ws);
     this._transport = transport;
+    _transportReleasers.set(transport, () => this._releaseTransport(transport));
     return transport;
   }
+
+  /**
+   * Ownership-checked counterpart of `disconnect()`, reached through
+   * `releaseAuthTransport()`. Closes the connection only while
+   * `transport` is still the live one this shell handed out; once a
+   * later `connect()` / `reconnect()` replaced it, or `disconnect()` /
+   * `logout()` already released it, `_transport` no longer matches and
+   * this is a no-op — so a caller can never close a connection another
+   * owner opened in the meantime.
+   *
+   * Unlike `disconnect()` it does NOT bump `_connectGeneration`: it
+   * gives up one specific connection rather than vetoing connections in
+   * general, so an unrelated take-over `connect()` / `reconnect()`
+   * already in flight must still be allowed to complete.
+   */
+  private _releaseTransport(transport: InterceptingClientTransport): boolean {
+    if (this._transport !== transport) return false;
+    this._closeWebSocket();
+    this._setConnected(false);
+    return true;
+  }
+}
+
+// Release hooks for the transports AuthShell hands out, keyed by the
+// transport object itself. Kept in a module-private WeakMap rather than
+// as a method on the transport (or on AuthShell / `<auth0-gate>`) so the
+// capability stays package-internal: application code that holds a
+// transport — `authEl.connect()`'s return value, `session.transport` —
+// gains no new public close surface.
+const _transportReleasers = new WeakMap<ClientTransport, () => boolean>();
+
+/**
+ * Package-internal: close the connection behind `transport` if, and only
+ * if, it is still the live connection of the `AuthShell` that created it.
+ * Closes the WebSocket (code 1000) and publishes `connected=false` (with
+ * `auth0-gate:connected-changed`) synchronously, the same way
+ * `disconnect()` does.
+ *
+ * Returns `false` without side effects for a transport that was not
+ * created by `AuthShell.connect()` / `reconnect()`, or that is no longer
+ * that shell's live connection (replaced by a later connect / reconnect,
+ * or already closed by `disconnect()` / `logout()`).
+ *
+ * Used by `<auth0-session>` to give back the connection it opened when
+ * the session ends (logout, removal from the DOM, a `start()` restart,
+ * transport loss) or fails to finish setting up — without it, the target
+ * `<auth0-gate>` would keep `connected=true` with a WebSocket nobody
+ * uses, and the session's next run would hit the Connection Ownership
+ * guard (SPEC-REMOTE §3.7). Not re-exported from the package entry
+ * point.
+ */
+export function releaseAuthTransport(transport: ClientTransport): boolean {
+  const release = _transportReleasers.get(transport);
+  return release ? release() : false;
 }
 
 class InterceptingClientTransport implements ClientTransport {
