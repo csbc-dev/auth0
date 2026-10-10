@@ -1,3 +1,10 @@
+import type {
+  WcBindableCommand,
+  WcBindableDeclaration,
+  WcBindableInput,
+  WcBindableProperty,
+} from "@wc-bindable/core";
+
 export interface ITagNames {
   readonly authConfig: string;
   readonly auth: string;
@@ -33,7 +40,7 @@ export interface IWritableConfig {
   tagNames?: IWritableTagNames;
 }
 
-export interface IWcBindableProperty {
+export interface IWcBindableProperty extends WcBindableProperty {
   readonly name: string;
   readonly event: string;
   /**
@@ -63,7 +70,7 @@ export interface IWcBindableProperty {
  * attribute surface (the input is reachable only as a JS property /
  * `initialize()` option there).
  */
-export interface IWcBindableInput {
+export interface IWcBindableInput extends WcBindableInput {
   readonly name: string;
   readonly attribute?: string;
 }
@@ -76,33 +83,44 @@ export interface IWcBindableInput {
  * `async: true` marks a command whose invocation returns a Promise so a
  * proxy knows to await a `return` / `throw` frame.
  */
-export interface IWcBindableCommand {
+export interface IWcBindableCommand extends WcBindableCommand {
   readonly name: string;
   readonly async?: boolean;
 }
 
-export interface IWcBindable {
+/**
+ * A `static wcBindable` declaration published by this package.
+ *
+ * Extends `@wc-bindable/core`'s `WcBindableDeclaration` so every
+ * declaration can be passed as-is wherever `@wc-bindable/*` (or this
+ * package's `registerCoreDeclaration()`) asks for one — e.g.
+ * `createRemoteCoreProxy(UserCore.wcBindable, transport)` — with no cast.
+ * The `extends` makes the compiler enforce that here.
+ *
+ * The lists are typed as mutable arrays on purpose. Upstream types them
+ * `T[]`, and a `readonly T[]` is not assignable to `T[]`, so readonly
+ * lists made every such call a type error. Do not reintroduce them.
+ * The shared declaration is protected at runtime instead: each one is
+ * built through `freezeWcBindable()` (src/freezeWcBindable.ts), which
+ * freezes the object, its lists and every entry. Without that a
+ * `properties.push(...)` would leak into every consumer that reads the
+ * same declaration (`Auth.wcBindable` also reuses
+ * `AuthShell.wcBindable`'s property entries).
+ */
+export interface IWcBindable extends WcBindableDeclaration {
   readonly protocol: "wc-bindable";
   readonly version: number;
-  /**
-   * Marked `readonly` (both reference and elements) so a downstream
-   * consumer cannot mutate the shared declaration — `Auth.wcBindable`
-   * spreads `AuthShell.wcBindable.properties` and then appends, so a
-   * `properties.push(...)` from outside would otherwise leak into
-   * every consumer that reads the shared array.
-   */
-  readonly properties: readonly IWcBindableProperty[];
+  readonly properties: IWcBindableProperty[];
   /**
    * Configurable inputs (declaration-only — no automatic syncing).
-   * Optional per the wc-bindable protocol; `readonly` for the same
-   * shared-declaration-mutation reason as `properties`.
+   * Optional per the wc-bindable protocol.
    */
-  readonly inputs?: readonly IWcBindableInput[];
+  readonly inputs?: IWcBindableInput[];
   /**
    * Callable commands (for remote proxies / tooling). Optional per the
-   * wc-bindable protocol; `readonly` for the same reason as `properties`.
+   * wc-bindable protocol.
    */
-  readonly commands?: readonly IWcBindableCommand[];
+  readonly commands?: IWcBindableCommand[];
 }
 
 /**

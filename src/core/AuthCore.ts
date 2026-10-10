@@ -1,6 +1,7 @@
 import { raiseError } from "../raiseError.js";
 import { getTokenExpiryMs } from "../jwtPayload.js";
 import { IWcBindable, Auth0ClientOptions, AuthUser, AuthError } from "../types.js";
+import { freezeWcBindable } from "../freezeWcBindable.js";
 
 /**
  * Normalise an `unknown` caught value into a shape compatible with
@@ -92,7 +93,7 @@ export class AuthCore extends EventTarget {
    * `AuthShell` (which constructs its own Core internally) instead of
    * `AuthCore`.
    */
-  static wcBindable: IWcBindable = {
+  static wcBindable: IWcBindable = freezeWcBindable({
     protocol: "wc-bindable",
     version: 1,
     properties: [
@@ -128,7 +129,7 @@ export class AuthCore extends EventTarget {
       { name: "logout", async: true },
       { name: "getToken", async: true },
     ],
-  };
+  });
 
   private _target: EventTarget;
   private _client: unknown = null;

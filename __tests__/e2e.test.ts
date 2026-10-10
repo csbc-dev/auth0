@@ -46,7 +46,7 @@ vi.mock("jose", async () => {
   };
 });
 
-import { bind, type WcBindableDeclaration } from "@wc-bindable/core";
+import { bind } from "@wc-bindable/core";
 import { createRemoteCoreProxy, WebSocketClientTransport } from "@wc-bindable/remote";
 import { createAuthenticatedWSS } from "../src/server/createAuthenticatedWSS";
 import { PROTOCOL_PREFIX } from "../src/protocolPrefix";
@@ -457,8 +457,7 @@ describe("e2e: real JWT + JWKS + Sec-WebSocket-Protocol + refresh", () => {
       const { WebSocket } = await import("ws");
       ws = new WebSocket(`ws://127.0.0.1:${server.port}`, [`${PROTOCOL_PREFIX}${t1}`]);
       const proxy = createRemoteCoreProxy(
-        // `IWcBindable` declares its lists `readonly`; core's type does not.
-        UserCore.wcBindable as WcBindableDeclaration,
+        UserCore.wcBindable,
         new WebSocketClientTransport(ws as unknown as globalThis.WebSocket),
         { logger: { warn: (m) => proxyLog.push(m), error: (m) => proxyLog.push(m) } },
       );

@@ -11,4 +11,8 @@ export type {
   AuthConfigHandlerOptions,
   ExposeAuthConfigOptions,
   VerifyTokenOptions,
+  IWcBindable,
+  IWcBindableProperty,
+  IWcBindableInput,
+  IWcBindableCommand,
 } from "../types.js";

@@ -3,6 +3,7 @@ import type { ClientTransport, ClientMessage, ServerMessage } from "@wc-bindable
 import { AuthCore } from "../core/AuthCore.js";
 import { raiseError, raiseOwnershipError, ERROR_PREFIX } from "../raiseError.js";
 import { IWcBindable, AuthMode, AuthShellOptions, AuthError, AuthUser } from "../types.js";
+import { freezeWcBindable } from "../freezeWcBindable.js";
 import { PROTOCOL_PREFIX } from "../protocolPrefix.js";
 
 let _nextRefreshId = 1;
@@ -30,7 +31,7 @@ export const DEFAULT_SCOPE = "openid profile email";
  * handshake, minimising XSS exposure surface.
  */
 export class AuthShell extends EventTarget {
-  static wcBindable: IWcBindable = {
+  static wcBindable: IWcBindable = freezeWcBindable({
     protocol: "wc-bindable",
     version: 1,
     properties: [
@@ -72,7 +73,7 @@ export class AuthShell extends EventTarget {
       { name: "reconnect",      async: true },
       { name: "disconnect" },
     ],
-  };
+  });
 
   private _core: AuthCore;
   // Dispatch target for AuthShell-originated events (currently only
