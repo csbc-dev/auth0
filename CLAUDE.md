@@ -185,6 +185,7 @@ src/
 - Auth0 SDK failures (`initialize` / `login` / `logout` / `getToken`) **do not reject** — they publish to `error` / `auth0-gate:error` and clear `loading`. Consumers should bind the state, not wrap calls in `try/catch`.
 - WebSocket I/O failures in remote mode (`connect` / `reconnect` / `refreshToken`) **do reject**. Wrap them when calling directly, or pick them up from `<auth0-session>`'s state.
 - Precondition violations (missing `domain` / `client-id`, calling `getToken()` in remote mode, etc.) throw synchronously.
+- `<auth0-session>`'s payload mirror (`_mirrorToPayload` / `_writePayloadMirror`) runs inside the `bind()` callback and **must never throw**. When the application has locked a mirrored property (`configurable: false`, seal / freeze, non-extensible), the mirror assigns the value if the property is still writable. Otherwise it writes nothing, does not re-dispatch the event, and skips the property with one `console.warn` per property per session. Do not "simplify" this to an unconditional `defineProperty`: a throw there leaves `ready` false or fails the whole session.
 
 ### Primary development scripts
 

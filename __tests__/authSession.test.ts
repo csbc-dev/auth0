@@ -1738,12 +1738,15 @@ describe("AuthSession (auth0-session)", () => {
       expect((child as any).currentUser).toBeUndefined();
     });
 
-    it("does not deadlock when an unrelated unupgraded custom element precedes the payload child", async () => {
-      // Regression: a sequential `await whenDefined(tag)` over children
-      // would block forever on a perpetually-undefined sibling and
-      // starve both the payload pickup and the legacy fallback. Verify
-      // the parallel-race resolution lets the real payload win.
+    it("adopts an already-defined payload synchronously even when an unupgraded custom element precedes it", async () => {
+      // The payload class is defined before discovery runs, so the
+      // synchronous scan must step past the never-defined stranger and
+      // return the payload without waiting on `whenDefined()` at all.
+      // The async race (a payload that upgrades only after discovery
+      // started, next to a sibling that never settles) is covered under
+      // "async discovery" below.
       await setupAuthenticated();
+      const whenDefinedSpy = vi.spyOn(customElements, "whenDefined");
       const payloadTag = definePayloadTag(PAYLOAD_DECL);
 
       const el = document.createElement("auth0-session") as AuthSession;
@@ -1757,8 +1760,8 @@ describe("AuthSession (auth0-session)", () => {
 
       document.body.appendChild(el);
 
-      // If the discovery were sequential, this await would never resolve.
-      // Race against a generous timeout to fail loudly instead of hanging.
+      // A scan that waited on the stranger would never resolve. Race
+      // against a generous timeout to fail loudly instead of hanging.
       const timeout = new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 250));
       const winner = await Promise.race([
         el.connectedCallbackPromise.then(() => "ok" as const),
@@ -1767,11 +1770,19 @@ describe("AuthSession (auth0-session)", () => {
 
       expect(winner).toBe("ok");
       expect(el.error).toBeNull();
-      expect(el.payload?.localName).toBe(payloadTag);
+      expect(el.payload).toBe(child);
+      expect(whenDefinedSpy).not.toHaveBeenCalled();
     });
 
-    it("waits for an unupgraded custom-element child via customElements.whenDefined", async () => {
+    it("adopts a payload whose class is defined in the same task the session connects in", async () => {
+      // e.g. `bootstrapAuth()` followed by `customElements.define(...)`
+      // for the payload in one script: discovery is deferred to a
+      // microtask after connect, so by the time it runs the child has
+      // already upgraded and the synchronous scan picks it up — no
+      // `whenDefined()` wait. A class defined only after discovery has
+      // started is covered under "async discovery" below.
       await setupAuthenticated();
+      const whenDefinedSpy = vi.spyOn(customElements, "whenDefined");
 
       // Use a tag name that is not yet defined when the session connects.
       const tag = `test-payload-late-${++payloadTagSeq}`;
@@ -1783,8 +1794,7 @@ describe("AuthSession (auth0-session)", () => {
       el.appendChild(child);
       document.body.appendChild(el);
 
-      // Define the element AFTER appending. The session's discovery should
-      // await whenDefined and pick the child up once it upgrades.
+      // Define the element AFTER appending, still in the same task.
       class LatePayload extends HTMLElement {
         static wcBindable = PAYLOAD_DECL;
       }
@@ -1792,14 +1802,14 @@ describe("AuthSession (auth0-session)", () => {
 
       await el.connectedCallbackPromise;
 
-      // Identity comparison can be brittle across DOM upgrade paths
-      // (some implementations swap the element instance on upgrade
-      // rather than its prototype). Verify by tag and proxy presence
-      // instead, which is what callers actually care about.
+      // Browsers upgrade `child` in place; happy-dom swaps in a fresh
+      // node on define(), so `el.payload` is not `child` here. Verify by
+      // tag and proxy presence instead, which is what callers care about.
       expect(el.error).toBeNull();
       expect(el.payload).not.toBeNull();
       expect(el.payload!.localName).toBe(tag);
       expect(el.proxy).not.toBeNull();
+      expect(whenDefinedSpy).not.toHaveBeenCalled();
     });
 
     it("teardown removes mirrored properties and command forwarders from the child", async () => {
@@ -1892,6 +1902,174 @@ describe("AuthSession (auth0-session)", () => {
       expect(Object.prototype.hasOwnProperty.call(child, "count")).toBe(false);
       // The rest of the cleanup still ran: command forwarders are removed.
       expect(Object.prototype.hasOwnProperty.call(child, "increment")).toBe(false);
+    });
+
+    describe("mirroring onto properties the application locked", () => {
+      // The mirror (re)defines a configurable own data property. Once the
+      // application locks that slot — a `configurable: false` own property
+      // (`Object.defineProperty`, `Object.seal`, `Object.freeze`) or a
+      // non-extensible element — redefining it throws a TypeError, which
+      // used to escape from the bind callback. A locked property that is
+      // still writable is assigned instead; otherwise it is skipped (one
+      // warning per property per session) without stopping the other
+      // mirrors or the session lifecycle.
+      const flush = () => new Promise((r) => setTimeout(r, 0));
+
+      // Silences console.warn and returns only the `<auth0-session>`
+      // warnings — the gate's unrelated remote-without-audience warning
+      // may land in the same spy.
+      function captureSessionWarnings() {
+        const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
+        return () => spy.mock.calls.filter(
+          (call) => String(call[0]).startsWith("[@csbc-dev/auth0] <auth0-session>"),
+        );
+      }
+
+      async function mountSession(prepareChild?: (child: HTMLElement) => void) {
+        const { authEl } = await setupAuthenticated();
+        const tag = definePayloadTag(PAYLOAD_DECL);
+        const el = document.createElement("auth0-session") as AuthSession;
+        el.target = "auth";
+        const child = document.createElement(tag);
+        prepareChild?.(child);
+        el.appendChild(child);
+        document.body.appendChild(el);
+        await el.connectedCallbackPromise;
+        const countEvents: unknown[] = [];
+        const userEvents: unknown[] = [];
+        child.addEventListener("test-payload:count-changed",
+          (e) => countEvents.push((e as CustomEvent).detail));
+        child.addEventListener("test-payload:last-updated-by-changed",
+          (e) => userEvents.push((e as CustomEvent).detail));
+        return { authEl, el, child, countEvents, userEvents };
+      }
+
+      it("skips a property locked mid-session and keeps mirroring the others", async () => {
+        const { el, child, countEvents, userEvents } = await mountSession();
+        const warnings = captureSessionWarnings();
+
+        (el.proxy as any)._simulateSync({ count: 1, lastUpdatedBy: "alice@example.com" });
+        await flush();
+        expect(el.ready).toBe(true);
+
+        Object.defineProperty(child, "count", {
+          value: 100, writable: false, configurable: false, enumerable: true,
+        });
+        (el.proxy as any)._simulateSync({ count: 2, lastUpdatedBy: "bob@example.com" });
+        (el.proxy as any)._simulateSync({ count: 3 });
+
+        // The locked value stays, and its event is not re-dispatched with
+        // a detail that would contradict `child.count`.
+        expect((child as any).count).toBe(100);
+        expect(countEvents).toEqual([1]);
+        // The sibling property keeps mirroring.
+        expect((child as any).lastUpdatedBy).toBe("bob@example.com");
+        expect(userEvents).toEqual(["alice@example.com", "bob@example.com"]);
+        // One warning per property, not one per server push.
+        expect(warnings()).toHaveLength(1);
+        expect(warnings()[0][0]).toContain(`"count"`);
+        expect(el.ready).toBe(true);
+        expect(el.error).toBeNull();
+        expect(el.proxy).not.toBeNull();
+      });
+
+      it("still flips ready when the whole first sync batch hits a locked property", async () => {
+        const { el, child, countEvents } = await mountSession((c) => {
+          Object.defineProperty(c, "count", {
+            value: 0, writable: false, configurable: false, enumerable: true,
+          });
+        });
+        const warnings = captureSessionWarnings();
+
+        (el.proxy as any)._simulateSync({ count: 5 });
+        await flush();
+
+        expect(el.ready).toBe(true);
+        expect(el.error).toBeNull();
+        expect((child as any).count).toBe(0);
+        expect(countEvents).toEqual([]);
+        expect(warnings()).toHaveLength(1);
+      });
+
+      it("does not fail the session when bind()'s synchronous initial sync hits a locked property", async () => {
+        // A transport that has the initial values cached before bind()
+        // runs makes bind() call the callback synchronously, so a throw
+        // there escapes bind() itself and lands in _connect()'s catch.
+        proxyHooks.onCreate = (proxy) => {
+          Object.defineProperty(proxy, "count", {
+            value: 1, writable: true, configurable: true, enumerable: true,
+          });
+        };
+        const warnings = captureSessionWarnings();
+        const { el, child } = await mountSession((c) => {
+          Object.defineProperty(c, "count", {
+            value: 0, writable: false, configurable: false, enumerable: true,
+          });
+        });
+        await flush();
+
+        expect(el.error).toBeNull();
+        expect(el.proxy).not.toBeNull();
+        expect(el.payload).toBe(child);
+        expect(el.ready).toBe(true);
+        expect((child as any).count).toBe(0);
+        expect(warnings()).toHaveLength(1);
+
+        // The subscription is live: later updates still mirror.
+        (el.proxy as any)._simulateSync({ lastUpdatedBy: "carol@example.com" });
+        expect((child as any).lastUpdatedBy).toBe("carol@example.com");
+      });
+
+      it("writes through a sealed (locked but writable) property and skips names a non-extensible payload cannot gain", async () => {
+        const { authEl, el, child, countEvents, userEvents } = await mountSession();
+        const warnings = captureSessionWarnings();
+
+        (el.proxy as any)._simulateSync({ count: 1 });
+        Object.seal(child);
+        (el.proxy as any)._simulateSync({ count: 2, lastUpdatedBy: "dave@example.com" });
+
+        // `count` is non-configurable but still writable: assignment works.
+        expect((child as any).count).toBe(2);
+        expect(countEvents).toEqual([1, 2]);
+        // `lastUpdatedBy` was never mirrored and the payload can no longer
+        // gain own properties: skipped with a warning.
+        expect(Object.prototype.hasOwnProperty.call(child, "lastUpdatedBy")).toBe(false);
+        expect(userEvents).toEqual([]);
+        expect(warnings()).toHaveLength(1);
+        expect(warnings()[0][0]).toContain(`"lastUpdatedBy"`);
+        await flush();
+        expect(el.ready).toBe(true);
+
+        // Teardown still completes and leaves the sealed value alone.
+        authEl.dispatchEvent(new CustomEvent("auth0-gate:authenticated-changed", { detail: false }));
+        expect(el.proxy).toBeNull();
+        expect(el.payload).toBeNull();
+        expect((child as any).count).toBe(2);
+      });
+
+      it("skips the property and reports the cause when a locked accessor's setter throws", async () => {
+        const cause = new Error("count is read-only in this app");
+        const { el, child, countEvents, userEvents } = await mountSession((c) => {
+          Object.defineProperty(c, "count", {
+            get: () => 0,
+            set: () => { throw cause; },
+            configurable: false,
+          });
+        });
+        const warnings = captureSessionWarnings();
+
+        (el.proxy as any)._simulateSync({ count: 1, lastUpdatedBy: "erin@example.com" });
+        await flush();
+
+        expect((child as any).count).toBe(0);
+        expect(countEvents).toEqual([]);
+        expect(userEvents).toEqual(["erin@example.com"]);
+        expect(warnings()).toHaveLength(1);
+        expect(warnings()[0][0]).toContain(`"count"`);
+        expect(warnings()[0][1]).toBe(cause);
+        expect(el.ready).toBe(true);
+        expect(el.error).toBeNull();
+      });
     });
 
     it("preserves a user-replaced command forwarder on teardown (identity match required)", async () => {
