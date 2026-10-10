@@ -1,4 +1,5 @@
 import { IWcBindable } from "../types.js";
+import { freezeWcBindable } from "../freezeWcBindable.js";
 
 type AuthConfigPayload = {
   domain: string;
@@ -44,7 +45,7 @@ function parsePayload(value: unknown): AuthConfigPayload {
 export class AuthConfig extends HTMLElement {
   static hasConnectedCallbackPromise = true;
 
-  static wcBindable: IWcBindable = {
+  static wcBindable: IWcBindable = freezeWcBindable({
     protocol: "wc-bindable",
     version: 1,
     properties: [
@@ -61,7 +62,7 @@ export class AuthConfig extends HTMLElement {
     commands: [
       { name: "load", async: true },
     ],
-  };
+  });
 
   static get observedAttributes(): string[] {
     return ["src"];

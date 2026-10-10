@@ -18,6 +18,7 @@ export type {
   Auth0ClientOptions,
   AuthShellValues, AuthShellOptions, AuthMode,
   UserContext, AuthenticatedConnectionOptions, VerifyTokenOptions,
+  IWcBindable, IWcBindableProperty, IWcBindableInput, IWcBindableCommand,
   // Deprecated — kept for backward compatibility, see types.ts
   WcsAuthUser, WcsAuthError, WcsAuthCoreValues, WcsAuthValues,
 } from "./types.js";

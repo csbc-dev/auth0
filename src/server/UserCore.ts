@@ -1,4 +1,5 @@
 import type { IWcBindable, UserContext } from "../types.js";
+import { freezeWcBindable } from "../freezeWcBindable.js";
 
 /**
  * Reference implementation: a server-side Core that exposes
@@ -27,7 +28,7 @@ import type { IWcBindable, UserContext } from "../types.js";
  * future AuthCore additions of RBAC state would otherwise collide.
  */
 export class UserCore extends EventTarget {
-  static wcBindable: IWcBindable = {
+  static wcBindable: IWcBindable = freezeWcBindable({
     protocol: "wc-bindable",
     version: 1,
     properties: [
@@ -35,7 +36,7 @@ export class UserCore extends EventTarget {
       { name: "permissions", event: "auth0-gate-user:permissions-changed" },
       { name: "roles",       event: "auth0-gate-user:roles-changed" },
     ],
-  };
+  });
 
   private _user: UserContext;
 

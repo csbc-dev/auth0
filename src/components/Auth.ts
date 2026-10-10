@@ -1,6 +1,7 @@
 import type { ClientTransport } from "@wc-bindable/remote";
 import { config } from "../config.js";
 import { IWcBindable, AuthMode, AuthError, AuthUser } from "../types.js";
+import { freezeWcBindable } from "../freezeWcBindable.js";
 import { AuthShell, DEFAULT_SCOPE } from "../shell/AuthShell.js";
 import { registerAutoTrigger, unregisterAutoTrigger } from "../autoTrigger.js";
 import { ERROR_PREFIX } from "../raiseError.js";
@@ -36,7 +37,7 @@ const _INERT_POST_INIT_ATTRIBUTES = [
 
 export class Auth extends HTMLElement {
   static hasConnectedCallbackPromise = true;
-  static wcBindable: IWcBindable = {
+  static wcBindable: IWcBindable = freezeWcBindable({
     ...AuthShell.wcBindable,
     properties: [
       ...AuthShell.wcBindable.properties,
@@ -76,7 +77,7 @@ export class Auth extends HTMLElement {
       { name: "refreshToken", async: true },
       { name: "reconnect",    async: true },
     ],
-  };
+  });
   static get observedAttributes(): string[] {
     return [
       "domain", "client-id", "redirect-uri", "audience", "scope",
