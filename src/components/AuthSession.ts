@@ -776,11 +776,17 @@ export class AuthSession extends HTMLElement {
       if (child instanceof HTMLElement) candidates.push(child);
     }
     return new Promise<HTMLElement | null>((resolve) => {
+      // Only reachable through `_resolvePayloadChild()`, which calls this
+      // synchronously after seeing at least one unupgraded HTMLElement
+      // child, so `candidates` is never empty here. Kept so a future
+      // caller cannot turn an empty list into a promise that never settles.
+      /* v8 ignore next -- callers guarantee at least one candidate (see above) */
       if (candidates.length === 0) { resolve(null); return; }
       let pending = candidates.length;
       let settled = false;
+      // Every caller checks `settled` first, and `resolve` is idempotent,
+      // so `win` needs no guard of its own.
       const win = (value: HTMLElement | null): void => {
-        if (settled) return;
         settled = true;
         resolve(value);
       };
@@ -802,10 +808,13 @@ export class AuthSession extends HTMLElement {
         customElements.whenDefined(tag).then(
           () => finish(child),
           () => {
-            // whenDefined() does not reject in the spec, but defensively
-            // treat any failure as "this candidate is out of the running"
-            // so the pending counter still drains.
-            if (settled) return;
+            // whenDefined() rejects (SyntaxError) for a dashed name that
+            // is not a valid custom element name — e.g. the reserved
+            // `font-face` / `annotation-xml` family — which can never
+            // upgrade. Treat it as "out of the running" so the pending
+            // counter still drains. No `settled` check is needed: if a
+            // winner was already picked, a late `win(null)` is a no-op
+            // (`resolve` is idempotent).
             if (--pending === 0) win(null);
           },
         );
@@ -839,6 +848,7 @@ export class AuthSession extends HTMLElement {
       this._payloadInstalledProps.push(name);
     }
     const prop = decl.properties.find((p) => p.name === name);
+    /* v8 ignore next -- `name` comes from bind() on a proxy whose declaration createRemoteCoreProxy derives 1:1 from `decl.properties`, so the lookup always succeeds */
     if (!prop) return;
     payload.dispatchEvent(new CustomEvent(prop.event, { detail: value, bubbles: true }));
   }

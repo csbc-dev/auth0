@@ -65,7 +65,16 @@ describe("extractTokenFromProtocol", () => {
       /Sec-WebSocket-Protocol header must be a string or string\[\]/,
     );
     expect(() => extractTokenFromProtocol({ foo: 1 } as unknown as string)).toThrow(
-      /Sec-WebSocket-Protocol header must be a string or string\[\]/,
+      /Sec-WebSocket-Protocol header must be a string or string\[\]; got object\./,
+    );
+  });
+
+  it("treats a runtime null header as a missing header (not as a malformed shape)", () => {
+    // `null` is falsy, so it is rejected by the missing-header guard
+    // before the runtime-shape guard runs — the operator sees the
+    // "Missing" diagnostic, which is the accurate description.
+    expect(() => extractTokenFromProtocol(null as unknown as string)).toThrow(
+      "Missing Sec-WebSocket-Protocol header",
     );
   });
 });

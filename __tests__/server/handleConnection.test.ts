@@ -2110,4 +2110,282 @@ describe("handleConnection", () => {
       expect(ids).toContain("rl-off-2");
     });
   });
+
+  describe("auth:refresh serialisation (refreshInFlight)", () => {
+    it("refuses a second auth:refresh while the first is still verifying, without re-verifying it", async () => {
+      // Two overlapping refreshes would interleave their expiry
+      // pre-extension / rollback paths. The second one must be refused
+      // up-front with a structured `throw` (so the client's
+      // refreshToken() rejects with a specific message) and must never
+      // reach `verifyAuth0Token` or `onTokenRefresh`.
+      const exp = Math.floor(Date.now() / 1000) + 300;
+      jwtVerify.mockResolvedValueOnce({ payload: { sub: "auth0|123", permissions: [] } });
+
+      const socket = createMockSocket();
+      const core = new EventTarget();
+      (core.constructor as any).wcBindable = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+      };
+      const events: AuthEvent[] = [];
+      const onTokenRefresh = vi.fn();
+
+      await handleConnection(
+        socket,
+        "auth0-gate.bearer." + makeJwt({ sub: "auth0|123", exp }),
+        {
+          auth0Domain: "test.auth0.com",
+          auth0Audience: "https://api.example.com",
+          createCores: () => core,
+          onEvent: (e) => events.push(e),
+          onTokenRefresh,
+          // Rate limit off: the only gate exercised here is the
+          // in-flight guard.
+          minRefreshIntervalMs: 0,
+        },
+      );
+
+      // Hold refresh #1 inside JWT verification.
+      let releaseFirst!: () => void;
+      jwtVerify.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            releaseFirst = () =>
+              resolve({ payload: { sub: "auth0|123", permissions: ["refreshed"] } });
+          }),
+      );
+
+      const deliverRefresh = (id: string): void => {
+        socket._listeners["message"][0]({
+          data: JSON.stringify({
+            type: "cmd",
+            name: "auth:refresh",
+            id,
+            args: [makeJwt({ sub: "auth0|123", exp })],
+          }),
+        });
+      };
+      const responseFor = (id: string) =>
+        socket.send.mock.calls
+          .map((c: any[]) => JSON.parse(c[0]))
+          .filter((m: any) => m.id === id);
+
+      deliverRefresh("refresh-1");
+      deliverRefresh("refresh-2-concurrent");
+
+      // #2 is refused synchronously while #1 is still pending.
+      expect(responseFor("refresh-2-concurrent")).toEqual([
+        {
+          type: "throw",
+          id: "refresh-2-concurrent",
+          error: { name: "Error", message: "Token refresh already in progress" },
+        },
+      ]);
+      expect(responseFor("refresh-1")).toEqual([]);
+      // Handshake + refresh-1 only — the refused refresh never verified.
+      expect(jwtVerify).toHaveBeenCalledTimes(2);
+
+      releaseFirst();
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(responseFor("refresh-1")).toEqual([{ type: "return", id: "refresh-1" }]);
+      expect(onTokenRefresh).toHaveBeenCalledTimes(1);
+      expect(events.filter((e) => e.type === "auth:refresh")).toHaveLength(1);
+      // The refusal is a protocol-level decision, not a verification
+      // failure — no auth:refresh-failure is reported for it.
+      expect(events.some((e) => e.type === "auth:refresh-failure")).toBe(false);
+
+      // The guard is released once #1 settles: a follow-up is accepted.
+      jwtVerify.mockResolvedValueOnce({ payload: { sub: "auth0|123", permissions: [] } });
+      deliverRefresh("refresh-3");
+      await new Promise((r) => setTimeout(r, 10));
+      expect(responseFor("refresh-3")).toEqual([{ type: "return", id: "refresh-3" }]);
+    });
+  });
+
+  describe("outbound send failures (_safeSend)", () => {
+    // A frame that cannot be delivered is triggered via the
+    // "Missing token argument" refresh response, which is sent
+    // synchronously through the same `_safeSend` path every outbound
+    // message (proxy pushes, command responses) uses.
+    async function connectWith(
+      socket: ReturnType<typeof createMockSocket>,
+      onEvent?: (e: AuthEvent) => void,
+    ): Promise<void> {
+      jwtVerify.mockResolvedValueOnce({ payload: { sub: "auth0|123", permissions: [] } });
+      const core = new EventTarget();
+      (core.constructor as any).wcBindable = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+      };
+      await handleConnection(
+        socket,
+        "auth0-gate.bearer." + makeJwt({ sub: "auth0|123", exp: Math.floor(Date.now() / 1000) + 300 }),
+        {
+          auth0Domain: "test.auth0.com",
+          auth0Audience: "https://api.example.com",
+          createCores: () => core,
+          onEvent,
+        },
+      );
+    }
+
+    function triggerOutboundFrame(socket: ReturnType<typeof createMockSocket>): void {
+      socket._listeners["message"][0]({
+        data: JSON.stringify({ type: "cmd", name: "auth:refresh", id: "no-arg", args: [] }),
+      });
+    }
+
+    it("surfaces a send() failure against a still-OPEN socket as auth:failure instead of swallowing it", async () => {
+      // A throw while the socket is OPEN is not a closure race — it is a
+      // logic bug (e.g. an unserialisable payload). It must stay visible.
+      const socket = Object.assign(createMockSocket(), { readyState: 1 });
+      const events: AuthEvent[] = [];
+      await connectWith(socket, (e) => events.push(e));
+
+      const sendErr = new Error("payload could not be serialised");
+      socket.send = vi.fn(() => {
+        throw sendErr;
+      });
+
+      expect(() => triggerOutboundFrame(socket)).not.toThrow();
+
+      const failures = events.filter((e) => e.type === "auth:failure");
+      expect(failures).toHaveLength(1);
+      expect(failures[0].error).toBe(sendErr);
+    });
+
+    it("normalises a non-Error send() failure and warns when no onEvent observer is wired", async () => {
+      const socket = Object.assign(createMockSocket(), { readyState: 1 });
+      await connectWith(socket);
+
+      socket.send = vi.fn(() => {
+        throw "socket buffer full";
+      });
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        expect(() => triggerOutboundFrame(socket)).not.toThrow();
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(String(warnSpy.mock.calls[0][0])).toContain(
+          "send() failed against an open socket: socket buffer full",
+        );
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("keeps the send path stable when the onEvent observer itself throws", async () => {
+      const socket = Object.assign(createMockSocket(), { readyState: 1 });
+      const observed: string[] = [];
+      await connectWith(socket, (e) => {
+        observed.push(e.type);
+        if (e.type === "auth:failure") throw new Error("observer bug");
+      });
+
+      socket.send = vi.fn(() => {
+        throw new Error("payload could not be serialised");
+      });
+
+      expect(() => triggerOutboundFrame(socket)).not.toThrow();
+      expect(observed).toContain("auth:failure");
+    });
+
+    it.each([
+      ["CLOSING", 2],
+      ["CLOSED", 3],
+    ])("silently swallows send() failures once the socket is %s (closure race)", async (_label, readyState) => {
+      const socket = Object.assign(createMockSocket(), { readyState: 1 });
+      const events: AuthEvent[] = [];
+      await connectWith(socket, (e) => events.push(e));
+
+      socket.readyState = readyState;
+      socket.send = vi.fn(() => {
+        throw new Error("WebSocket is not open");
+      });
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        expect(() => triggerOutboundFrame(socket)).not.toThrow();
+        expect(socket.send).toHaveBeenCalledTimes(1);
+        expect(events.some((e) => e.type === "auth:failure")).toBe(false);
+        expect(warnSpy).not.toHaveBeenCalled();
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+  });
+
+  describe("exp parsing of a JSON payload that is not an object", () => {
+    // `parseJwtPayload` returns null (rather than throwing) for a payload
+    // segment that decodes to valid JSON but is not a plain object. The
+    // wrapper re-decodes to report the specific cause.
+    function makeJwtWithRawPayload(payloadJson: string): string {
+      const header = Buffer.from(JSON.stringify({ alg: "RS256" })).toString("base64url");
+      const body = Buffer.from(payloadJson).toString("base64url");
+      return `${header}.${body}.fakesig`;
+    }
+
+    function wcCore(): EventTarget {
+      const core = new EventTarget();
+      (core.constructor as any).wcBindable = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+      };
+      return core;
+    }
+
+    it.each([
+      ["an array", "[1,2]"],
+      ["a number", "123"],
+      ["null", "null"],
+    ])("reports 'JWT payload is not an object' when the payload is %s ('allow' keeps the handshake)", async (_label, payloadJson) => {
+      jwtVerify.mockResolvedValue({ payload: { sub: "auth0|123", permissions: [] } });
+      const events: AuthEvent[] = [];
+
+      const proxy = await handleConnection(
+        createMockSocket(),
+        "auth0-gate.bearer." + makeJwtWithRawPayload(payloadJson),
+        {
+          auth0Domain: "test.auth0.com",
+          auth0Audience: "https://api.example.com",
+          createCores: wcCore,
+          onEvent: (e) => events.push(e),
+        },
+      );
+
+      expect(proxy).toBeDefined();
+      const failures = events.filter((e) => e.type === "auth:exp-parse-failure");
+      expect(failures).toHaveLength(1);
+      expect(failures[0].error?.message).toBe("JWT payload is not an object");
+      expect(events.some((e) => e.type === "connection:open")).toBe(true);
+    });
+
+    it("rejects the handshake under the 'close' policy (no unbounded session)", async () => {
+      jwtVerify.mockResolvedValue({ payload: { sub: "auth0|123", permissions: [] } });
+      const createCores = vi.fn(wcCore);
+      const events: AuthEvent[] = [];
+
+      await expect(
+        handleConnection(
+          createMockSocket(),
+          "auth0-gate.bearer." + makeJwtWithRawPayload("[1,2]"),
+          {
+            auth0Domain: "test.auth0.com",
+            auth0Audience: "https://api.example.com",
+            createCores,
+            expParseFailurePolicy: "close",
+            onEvent: (e) => events.push(e),
+          },
+        ),
+      ).rejects.toThrow(/'close' policy/);
+
+      expect(
+        events.find((e) => e.type === "auth:exp-parse-failure")?.error?.message,
+      ).toBe("JWT payload is not an object");
+      expect(createCores).not.toHaveBeenCalled();
+      expect(events.some((e) => e.type === "connection:open")).toBe(false);
+    });
+  });
 });

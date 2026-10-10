@@ -206,6 +206,32 @@ describe("AuthShell", () => {
         expect.objectContaining({ useRefreshTokens: true }),
       );
     });
+
+    it("rolls mode / audience back when initialize() throws synchronously on a missing domain", async () => {
+      const mockClient = createMockAuth0Client({
+        getTokenSilently: vi.fn().mockResolvedValue("local-token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const shell = new AuthShell();
+      // A bad attempt that asks for remote mode + an audience…
+      expect(() =>
+        shell.initialize({ domain: "", clientId: "c", mode: "remote", audience: "bad-aud" }),
+      ).toThrow("domain is required.");
+      expect(createAuth0Client).not.toHaveBeenCalled();
+
+      // …must not leave the shell in remote mode: the token contract of
+      // the previous (local) configuration still applies, so getToken()
+      // reports the real precondition instead of "disabled in remote mode".
+      expect(shell.mode).toBe("local");
+      await expect(shell.getToken()).rejects.toThrow("Auth0 client is not initialized");
+
+      // A subsequent good local-mode attempt behaves as a clean local shell.
+      await shell.initialize({ domain: "d", clientId: "c" });
+      expect(shell.mode).toBe("local");
+      await expect(shell.connect("ws://localhost:3000")).resolves.toBeDefined();
+      expect(shell.token).toBe("local-token");
+    });
   });
 
   describe("mode", () => {
@@ -809,6 +835,48 @@ describe("AuthShell", () => {
       );
     });
 
+    it("rejects fast in remote mode when audience is missing, before touching the live connection", async () => {
+      // Remote mode without `audience` is rejected by the server on `aud`
+      // mismatch (1008). reconnect() must fail at the call site instead —
+      // without fetching a token, closing the working socket, or putting
+      // a token on the wire.
+      const mockClient = createMockAuth0Client({
+        getTokenSilently: vi.fn().mockResolvedValue("token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const sockets: MockWebSocket[] = [];
+      const originalWS = globalThis.WebSocket;
+      (globalThis as any).WebSocket = class extends MockWebSocket {
+        constructor(url: string, protocols?: string | string[]) {
+          super(url, protocols);
+          sockets.push(this);
+        }
+      };
+
+      try {
+        const shell = new AuthShell();
+        // Local mode, no audience: connect() is legal.
+        await shell.initialize({ domain: "d", clientId: "c" });
+        await shell.connect("ws://localhost:3000");
+        expect(shell.connected).toBe(true);
+        const tokenFetchesBefore = mockClient.getTokenSilently.mock.calls.length;
+
+        // The deployment is switched to remote mode (e.g. `mode` attribute).
+        shell.mode = "remote";
+
+        await expect(shell.reconnect()).rejects.toThrow(
+          "reconnect(): `audience` is required in remote mode.",
+        );
+        expect(mockClient.getTokenSilently.mock.calls.length).toBe(tokenFetchesBefore);
+        expect(sockets).toHaveLength(1);
+        expect(sockets[0].readyState).toBe(MockWebSocket.OPEN);
+        expect(shell.connected).toBe(true);
+      } finally {
+        (globalThis as any).WebSocket = originalWS;
+      }
+    });
+
     describe("ownership guard (shared with connect)", () => {
       it("rejects a second concurrent reconnect() while the first is in flight", async () => {
         // Regression: reconnect() used to skip the in-flight claim, so
@@ -1056,6 +1124,246 @@ describe("AuthShell", () => {
       } finally {
         (globalThis as any).WebSocket = originalWS;
       }
+    });
+  });
+
+  describe("superseded handshakes (teardown racing connect / reconnect)", () => {
+    // `disconnect()` / `logout()` / an actual `mode` change bump the
+    // connect generation. A connect()/reconnect() that observes the bump
+    // on its next await boundary must abandon the session it was
+    // building: no token on the wire after the teardown, no
+    // `connected=true`, no committed token, no reusable URL.
+    const jwt = (sub: string, exp: number): string => {
+      const seg = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64url");
+      return `${seg({ alg: "RS256" })}.${seg({ sub, exp })}.sig`;
+    };
+    const EXP_1 = 2_000_000_000;
+    const EXP_2 = 2_000_000_600;
+
+    let sockets: TrackedSocket[];
+    let interjectOnOpen: (() => void) | null;
+    let originalWS: unknown;
+
+    class TrackedSocket extends MockWebSocket {
+      closeCalls: unknown[][] = [];
+      constructor(url: string, protocols?: string | string[]) {
+        super(url, protocols);
+        sockets.push(this);
+      }
+      addEventListener(type: string, listener: (...args: any[]) => void, opts?: any): void {
+        super.addEventListener(type, listener, opts);
+        // Queue the interjection right AFTER the shell's own `open`
+        // handler: it runs once the handshake promise has resolved but
+        // before connect()/reconnect() resumes past its `await`.
+        if (type === "open" && interjectOnOpen) {
+          const interject = interjectOnOpen;
+          interjectOnOpen = null;
+          super.addEventListener("open", interject);
+        }
+      }
+      // Like a real WebSocket, close() only starts the closing handshake;
+      // the `close` event arrives on a later task. (The base mock fires it
+      // synchronously, which would let the shell's close handler mask
+      // state the supersede guards are responsible for.)
+      close(...args: unknown[]): void {
+        this.closeCalls.push(args);
+        if (this.readyState !== MockWebSocket.OPEN) return;
+        this.readyState = 2; // CLOSING
+        setTimeout(() => {
+          this.readyState = MockWebSocket.CLOSED;
+          this._emit("close");
+        }, 0);
+      }
+    }
+
+    function deferred<T>() {
+      let resolve!: (value: T) => void;
+      const promise = new Promise<T>((r) => {
+        resolve = r;
+      });
+      return { promise, resolve };
+    }
+
+    async function initShell(getTokenSilently: ReturnType<typeof vi.fn>) {
+      const mockClient = createMockAuth0Client({ getTokenSilently });
+      createAuth0Client.mockResolvedValue(mockClient);
+      const shell = new AuthShell();
+      await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+      const connectedEvents: boolean[] = [];
+      shell.addEventListener("auth0-gate:connected-changed", (e: Event) => {
+        connectedEvents.push((e as CustomEvent).detail);
+      });
+      return { shell, mockClient, connectedEvents };
+    }
+
+    beforeEach(() => {
+      sockets = [];
+      interjectOnOpen = null;
+      originalWS = (globalThis as any).WebSocket;
+      (globalThis as any).WebSocket = TrackedSocket;
+    });
+
+    afterEach(() => {
+      (globalThis as any).WebSocket = originalWS;
+    });
+
+    it("connect(): a logout() during the token fetch aborts before any socket is opened", async () => {
+      const token = deferred<string>();
+      const { shell, connectedEvents } = await initShell(vi.fn(() => token.promise));
+
+      const pending = shell.connect("ws://localhost:3000");
+      await new Promise((r) => setTimeout(r, 0)); // now parked in fetchToken()
+      await shell.logout();
+      token.resolve(jwt("u", EXP_1));
+
+      await expect(pending).rejects.toThrow(
+        "connect(): superseded by disconnect()/logout() during token fetch.",
+      );
+      // The token obtained for the torn-down session never reached the wire.
+      expect(sockets).toHaveLength(0);
+      expect(shell.connected).toBe(false);
+      expect(connectedEvents).not.toContain(true);
+      expect(shell.token).toBeNull();
+      expect(shell.getTokenExpiry()).toBeNull();
+    });
+
+    it("connect(): a disconnect() between `open` and resume closes the socket and rejects without committing", async () => {
+      const { shell, connectedEvents } = await initShell(
+        vi.fn().mockResolvedValue(jwt("u", EXP_1)),
+      );
+      interjectOnOpen = () => shell.disconnect();
+
+      await expect(shell.connect("ws://localhost:3000")).rejects.toThrow(
+        "connect(): superseded by disconnect()/logout() during handshake.",
+      );
+
+      expect(sockets).toHaveLength(1);
+      expect(sockets[0].closeCalls[0]).toEqual([1000, "Client disconnect"]);
+      expect(shell.connected).toBe(false);
+      expect(connectedEvents).not.toContain(true);
+      // Token was never committed …
+      expect(shell.token).toBeNull();
+      expect(shell.getTokenExpiry()).toBeNull();
+      // … and the abandoned URL was rolled back, so reconnect() has no
+      // previous URL to reuse.
+      await expect(shell.reconnect()).rejects.toThrow("No previous connection URL");
+    });
+
+    it("connect(): a mode flip between `open` and resume closes the fresh socket itself and drops a stale connected=true", async () => {
+      const { shell, connectedEvents } = await initShell(
+        vi.fn()
+          .mockResolvedValueOnce(jwt("u", EXP_1))
+          .mockResolvedValueOnce(jwt("u", EXP_2))
+          .mockResolvedValue(jwt("u", EXP_2)),
+      );
+      // A live connection exists …
+      await shell.connect("ws://first.example");
+      expect(shell.connected).toBe(true);
+      expect(shell.getTokenExpiry()).toBe(EXP_1 * 1000);
+
+      // … and a take-over connect() is superseded by a `mode` change
+      // (which, unlike disconnect/logout, does not close anything itself).
+      interjectOnOpen = () => {
+        shell.mode = "remote";
+      };
+      await expect(shell.connect("ws://second.example")).rejects.toThrow(
+        "connect(): superseded by disconnect()/logout() during handshake.",
+      );
+
+      // The guard owns the cleanup: it closes the just-opened socket with
+      // a normal-closure code …
+      expect(sockets).toHaveLength(2);
+      expect(sockets[1].closeCalls).toEqual([[1000, "Superseded by disconnect/logout"]]);
+      // … does not keep advertising the replaced connection …
+      expect(shell.connected).toBe(false);
+      expect(connectedEvents).toEqual([true, false]);
+      // … and the superseding token was not committed.
+      expect(shell.getTokenExpiry()).toBe(EXP_1 * 1000);
+
+      // No socket reference / stale `connected` lingers (the replacement's
+      // `close` event has not even arrived yet): an ownership-guarded
+      // connect — what <auth0-session> uses — is admitted, not rejected as
+      // "target already owns a connection".
+      await expect(
+        shell.connect("ws://third.example", { failIfConnected: true }),
+      ).resolves.toBeDefined();
+      expect(shell.connected).toBe(true);
+    });
+
+    it("reconnect(): a disconnect() during the token fetch aborts before a replacement socket is opened", async () => {
+      const fresh = deferred<string>();
+      const getTokenSilently = vi.fn()
+        .mockResolvedValueOnce(jwt("u", EXP_1))
+        .mockImplementationOnce(() => fresh.promise);
+      const { shell } = await initShell(getTokenSilently);
+      await shell.connect("ws://localhost:3000");
+
+      const pending = shell.reconnect();
+      await new Promise((r) => setTimeout(r, 0)); // parked in fetchFreshToken()
+      shell.disconnect();
+      fresh.resolve(jwt("u", EXP_2));
+
+      await expect(pending).rejects.toThrow(
+        "reconnect(): superseded by disconnect()/logout() during token fetch.",
+      );
+      expect(sockets).toHaveLength(1);
+      expect(shell.connected).toBe(false);
+      expect(shell.getTokenExpiry()).toBe(EXP_1 * 1000);
+    });
+
+    it("reconnect(): a disconnect() between `open` and resume closes the socket and rejects without committing", async () => {
+      const { shell } = await initShell(
+        vi.fn()
+          .mockResolvedValueOnce(jwt("u", EXP_1))
+          .mockResolvedValueOnce(jwt("u", EXP_2)),
+      );
+      await shell.connect("ws://localhost:3000");
+      interjectOnOpen = () => shell.disconnect();
+
+      await expect(shell.reconnect()).rejects.toThrow(
+        "reconnect(): superseded by disconnect()/logout() during handshake.",
+      );
+
+      expect(sockets).toHaveLength(2);
+      expect(sockets[1].closeCalls[0]).toEqual([1000, "Client disconnect"]);
+      expect(shell.connected).toBe(false);
+      expect(shell.getTokenExpiry()).toBe(EXP_1 * 1000);
+    });
+
+    it("reconnect(): a mode flip between `open` and resume closes the fresh socket itself and drops a stale connected=true", async () => {
+      const { shell, connectedEvents } = await initShell(
+        vi.fn()
+          .mockResolvedValueOnce(jwt("u", EXP_1))
+          .mockResolvedValueOnce(jwt("u", EXP_2))
+          .mockResolvedValue(jwt("u", EXP_2)),
+      );
+      await shell.connect("ws://localhost:3000");
+      interjectOnOpen = () => {
+        shell.mode = "remote";
+      };
+
+      await expect(shell.reconnect()).rejects.toThrow(
+        "reconnect(): superseded by disconnect()/logout() during handshake.",
+      );
+
+      expect(sockets).toHaveLength(2);
+      // The previous socket was closed by reconnect() itself; the
+      // replacement is closed by the supersede guard.
+      expect(sockets[0].closeCalls).toEqual([[1000, "Client disconnect"]]);
+      expect(sockets[1].closeCalls).toEqual([[1000, "Superseded by disconnect/logout"]]);
+      await expect(shell.refreshToken()).rejects.toThrow("No active connection");
+      expect(shell.connected).toBe(false);
+      expect(connectedEvents).toEqual([true, false]);
+      expect(shell.getTokenExpiry()).toBe(EXP_1 * 1000);
+
+      // With no socket reference / stale `connected=true` left behind
+      // (the replacement's `close` event has not even arrived yet), an
+      // ownership-guarded connect (what <auth0-session> uses) is admitted
+      // instead of being rejected as "target already owns a connection".
+      await expect(
+        shell.connect("ws://localhost:3000", { failIfConnected: true }),
+      ).resolves.toBeDefined();
+      expect(shell.connected).toBe(true);
     });
   });
 

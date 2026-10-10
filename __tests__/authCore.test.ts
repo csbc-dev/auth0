@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { AuthCore } from "../src/core/AuthCore";
+import { parseJwtPayload } from "../src/jwtPayload";
 
 function createMockAuth0Client(overrides: Record<string, any> = {}) {
   return {
@@ -774,6 +775,72 @@ describe("AuthCore", () => {
       core.commitToken("not-a-jwt");
 
       expect(core.getTokenExpiry()).toBeNull();
+    });
+
+    it.each([
+      ["array", "[1700000000]"],
+      ["number", "1700000000"],
+      ["null", "null"],
+    ])("returns null when the payload is valid JSON but a %s (not a claims object)", (_label, payloadJson) => {
+      const core = new AuthCore();
+      const segment = (s: string) => Buffer.from(s).toString("base64url");
+      const token = `${segment(JSON.stringify({ alg: "RS256" }))}.${segment(payloadJson)}.sig`;
+
+      // The shared decoder refuses non-object payloads outright (the
+      // server relies on this to report "JWT payload is not an object")…
+      expect(parseJwtPayload(token)).toBeNull();
+
+      // …and the client-side expiry read degrades to "unknown".
+      core.commitToken(token);
+      expect(core.getTokenExpiry()).toBeNull();
+    });
+  });
+
+  describe("エラー正規化（auth0-gate:error に公開される値）", () => {
+    async function loginRejectingWith(reason: unknown) {
+      const mockClient = createMockAuth0Client({
+        loginWithRedirect: vi.fn().mockRejectedValue(reason),
+      });
+      createAuth0Client.mockResolvedValueOnce(mockClient);
+
+      const core = new AuthCore();
+      await core.initialize({ domain: "test.auth0.com", clientId: "client-id" });
+      const published: unknown[] = [];
+      core.addEventListener("auth0-gate:error", (e: Event) => {
+        published.push((e as CustomEvent).detail);
+      });
+      await core.login();
+      return { core, published };
+    }
+
+    it("Auth0 SDK の AuthError 形式（error が文字列のプレーンオブジェクト）は加工せずそのまま公開する", async () => {
+      const sdkError = { error: "login_required", error_description: "Login required" };
+
+      const { core, published } = await loginRejectingWith(sdkError);
+
+      // 同一参照のまま渡すことで error / error_description を購読側が読める
+      expect(core.error).toBe(sdkError);
+      expect(published.at(-1)).toBe(sdkError);
+      expect(core.loading).toBe(false);
+    });
+
+    it("文字列で reject された場合はその文字列をメッセージとする Error に包む", async () => {
+      const { core } = await loginRejectingWith("popup closed by user");
+
+      expect(core.error).toBeInstanceOf(Error);
+      expect(core.error?.message).toBe("popup closed by user");
+    });
+
+    it.each([
+      ["null", null, "null"],
+      ["数値", 42, "42"],
+      ["error が文字列でないオブジェクト", { error: 500 }, "[object Object]"],
+    ])("%s で reject された場合は String() 化した Error に包む", async (_label, reason, message) => {
+      const { core } = await loginRejectingWith(reason);
+
+      expect(core.error).toBeInstanceOf(Error);
+      expect(core.error?.message).toBe(message);
+      expect(core.loading).toBe(false);
     });
   });
 });

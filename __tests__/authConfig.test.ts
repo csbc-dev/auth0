@@ -154,6 +154,138 @@ describe("AuthConfig (auth0-config)", () => {
     expect(el.error).toBeInstanceOf(Error);
   });
 
+  it.each([
+    ["an array", [{ domain: "tenant.example", clientId: "client-123" }]],
+    ["null", null],
+    ["a string", "tenant.example"],
+  ])("rejects a config response that is %s instead of a JSON object", async (_label, body) => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(body));
+    const el = document.createElement("auth0-config") as AuthConfig;
+    el.src = "/auth-config";
+
+    await el.load();
+
+    expect(el.loading).toBe(false);
+    expect(el.error?.message).toBe(
+      "[@csbc-dev/auth0] <auth0-config>: config response must be a JSON object.",
+    );
+    expect(el.domain).toBe("");
+    expect(el.clientId).toBe("");
+  });
+
+  it("normalises a non-Error fetch rejection into an Error", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue("offline");
+    const el = document.createElement("auth0-config") as AuthConfig;
+    el.src = "/auth-config";
+    const published: unknown[] = [];
+    el.addEventListener("auth0-config:error", (event) => published.push((event as CustomEvent).detail));
+
+    await el.load();
+
+    expect(el.loading).toBe(false);
+    expect(el.error).toBeInstanceOf(Error);
+    expect(el.error?.message).toBe("offline");
+    expect(published.at(-1)).toBe(el.error);
+  });
+
+  it("load() without src is a no-op (no fetch, no loading flip, previous values kept)", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({
+      domain: "tenant.example",
+      clientId: "client-123",
+    }));
+    const el = document.createElement("auth0-config") as AuthConfig;
+    el.src = "/auth-config";
+    await el.load();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    el.removeAttribute("src");
+    const loadingEvents: unknown[] = [];
+    el.addEventListener("auth0-config:loading-changed", (event) => loadingEvents.push((event as CustomEvent).detail));
+
+    await el.load();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(loadingEvents).toEqual([]);
+    expect(el.domain).toBe("tenant.example");
+    expect(el.error).toBeNull();
+  });
+
+  it("a reload with identical values does not re-dispatch unchanged domain / clientId events", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => jsonResponse({
+      domain: "tenant.example",
+      clientId: "client-123",
+    }));
+    const el = document.createElement("auth0-config") as AuthConfig;
+    el.src = "/auth-config";
+    const changes: Array<[string, unknown]> = [];
+    for (const type of ["auth0-config:domain-changed", "auth0-config:client-id-changed"]) {
+      el.addEventListener(type, (event) => changes.push([type, (event as CustomEvent).detail]));
+    }
+
+    await el.load();
+    await el.load();
+
+    expect(changes).toEqual([
+      ["auth0-config:domain-changed", "tenant.example"],
+      ["auth0-config:client-id-changed", "client-123"],
+    ]);
+  });
+
+  it("coalesces a burst of src changes while connected into one fetch of the latest src", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({
+      domain: "tenant.example",
+      clientId: "client-123",
+    }));
+    const el = document.createElement("auth0-config") as AuthConfig;
+    document.body.appendChild(el);
+
+    // Frameworks often stamp an attribute several times in one tick.
+    el.src = "/draft";
+    const first = el.connectedCallbackPromise;
+    el.src = "/final";
+
+    // Both mutations share the single queued auto-load.
+    expect(el.connectedCallbackPromise).toBe(first);
+    await el.connectedCallbackPromise;
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith("/final", { signal: expect.any(AbortSignal) });
+  });
+
+  it("an explicit load() issued before the queued auto-load runs supersedes it (single fetch)", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({
+      domain: "tenant.example",
+      clientId: "client-123",
+    }));
+    const el = document.createElement("auth0-config") as AuthConfig;
+    el.src = "/auth-config";
+    document.body.appendChild(el); // queues the auto-load
+
+    await el.load();
+    await el.connectedCallbackPromise;
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(el.domain).toBe("tenant.example");
+  });
+
+  it("removing src before the queued auto-load runs cancels it (no fetch)", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({
+      domain: "tenant.example",
+      clientId: "client-123",
+    }));
+    const el = document.createElement("auth0-config") as AuthConfig;
+    el.src = "/auth-config";
+    document.body.appendChild(el); // queues the auto-load
+    const queued = el.connectedCallbackPromise;
+
+    el.removeAttribute("src");
+    await queued;
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(el.loading).toBe(false);
+    expect(el.domain).toBe("");
+  });
+
   it("validates the config response shape", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({ domain: "tenant.example" }));
     const el = document.createElement("auth0-config") as AuthConfig;
