@@ -7,6 +7,7 @@ import { config } from "../config.js";
 import { ERROR_PREFIX, OWNERSHIP_ERROR_MARKER, isOwnershipError } from "../raiseError.js";
 import { IWcBindable } from "../types.js";
 import { getCoreDeclaration } from "../coreRegistry.js";
+import { releaseAuthTransport } from "../shell/AuthShell.js";
 import type { Auth } from "./Auth.js";
 
 /**
@@ -51,6 +52,15 @@ import type { Auth } from "./Auth.js";
  *      streaming, each property update is mirrored onto the payload
  *      child (when present) so that `bind(child, ...)` and `data-wcs`
  *      observe a live state surface.
+ *
+ * ## Connection ownership
+ *
+ * The session owns the connection it opened in step 1 and gives it back
+ * — closes it through the target — when the session ends: logout or
+ * `authenticated=false`, transport loss, removal from the DOM, a
+ * `start()` restart, or a failure while setting the session up. It
+ * never closes a connection it did not open (an application's own
+ * `authEl.connect()`, a take-over `connect()` / `reconnect()`).
  *
  * The session's own bindable surface is intentionally minimal —
  * `ready`, `connecting`, `error` — so `data-wcs` can gate UI on
@@ -110,6 +120,22 @@ export class AuthSession extends HTMLElement {
   // that completes AFTER logout/remove would still install a live proxy
   // and flip `ready=true`.
   private _generation = 0;
+
+  // Settles once the `_connect()` call that set it has finished —
+  // including, for an attempt that was superseded mid-handshake, giving
+  // back the connection that handshake still delivered. `null` while no
+  // attempt is running. A new attempt that finds it set waits for it:
+  // until then the old handshake holds the target's single connection
+  // slot, and `auth.connect({ failIfConnected: true })` would reject the
+  // new attempt as an ownership conflict with the session's own past.
+  private _connectAttempt: Promise<void> | null = null;
+
+  // True while `_releaseConnection()` closes a connection this session
+  // opened. The `connected-changed: false` that the release dispatches
+  // synchronously is the session's own doing, not a transport loss, so
+  // the `connected-changed` listener must not answer it with a teardown
+  // — least of all of a newer attempt waiting for that very release.
+  private _releasingConnection = false;
 
   // --- Attributes -----------------------------------------------------------
 
@@ -299,7 +325,11 @@ export class AuthSession extends HTMLElement {
    * down any previous cycle (`_unsubscribeAuth()` + `_teardown()`)
    * and bumping the generation counter — so any in-flight handshake
    * from the previous cycle drops its work on resume via the
-   * generation guards in `_connect()`.
+   * generation guards in `_connect()`. The teardown closes the
+   * connection the previous cycle opened, and a handshake still in
+   * flight gives its connection back as soon as it resolves (the new
+   * cycle waits for that), so the restart reconnects instead of
+   * failing the Connection Ownership guard against its own past.
    *
    * Use cases:
    *
@@ -484,7 +514,11 @@ export class AuthSession extends HTMLElement {
     // bump would silently let the resumed `_connect()` wire a
     // `RemoteCoreProxy` onto the closed socket, leaving a
     // half-dead session in `ready=true`.
+    //
+    // A `false` that the session's own `_releaseConnection()` caused is
+    // skipped: the session is giving that connection back on purpose.
     const connectedListener = (e: Event): void => {
+      if (this._releasingConnection) return;
       const next = (e as CustomEvent).detail;
       if (next === false && (this._transport || this._ready || this._connecting)) {
         this._teardown();
@@ -537,7 +571,13 @@ export class AuthSession extends HTMLElement {
     // rather than a message-substring match. The sentinel is the same
     // one `raiseOwnershipError()` stamps on AuthShell-originated
     // ownership failures; both sources funnel into `isOwnershipError()`.
-    if (auth.connected) {
+    //
+    // Skipped while a superseded attempt of this session is still running
+    // (`_connectAttempt`): the open connection may be that attempt's own,
+    // whose handshake completed but which has not yet resumed to give it
+    // back. The attempt below waits for it and then relies on the atomic
+    // `failIfConnected` guard, which still rejects a genuine other owner.
+    if (auth.connected && !this._connectAttempt) {
       const ownershipErr = new Error(
         `${ERROR_PREFIX} <auth0-session>: target is already connected. ` +
         "Use either <auth0-session> OR a manual authEl.connect() — not both. " +
@@ -566,7 +606,28 @@ export class AuthSession extends HTMLElement {
     this._setError(null);
     this._setConnecting(true);
     const myGen = this._generation;
+    // The connection THIS attempt opened, once `auth.connect()` resolves.
+    // Stays `null` when the handshake itself rejects — including the
+    // ownership rejection below, where the open connection belongs to
+    // someone else — so the failure path never releases a connection
+    // this attempt did not establish.
+    let transport: ClientTransport | null = null;
+    // Only an attempt superseded by a teardown can still be running here
+    // (`_connecting` / `_transport` above rule out a live one).
+    const previousAttempt = this._connectAttempt;
+    let finishAttempt!: () => void;
+    const attempt = new Promise<void>((resolve) => { finishAttempt = resolve; });
+    this._connectAttempt = attempt;
     try {
+      // A teardown during a handshake (removal / remount, `start()`)
+      // cannot cancel that handshake; the superseded attempt gives the
+      // connection back once it resolves. Wait for that instead of
+      // racing it into the ownership guard.
+      if (previousAttempt) {
+        await previousAttempt;
+        if (this._generation !== myGen) return;
+      }
+
       // Pass `failIfConnected: true` so AuthShell.connect() atomically
       // rejects when another owner claimed the transport during the
       // `await connectedCallbackPromise` microtask hop inside
@@ -575,7 +636,7 @@ export class AuthSession extends HTMLElement {
       // could open a socket between the check and this call, and the
       // subsequent AuthShell.connect() would `_closeWebSocket()` it,
       // violating the Connection Ownership contract (SPEC-REMOTE §3.7).
-      const transport = await auth.connect(url, { failIfConnected: true });
+      transport = await auth.connect(url, { failIfConnected: true });
 
       // Race guard: a teardown (logout, element removal, or a
       // `connected-changed: false` that fired AFTER `auth.connect`
@@ -590,7 +651,14 @@ export class AuthSession extends HTMLElement {
       //       `connected-changed` listener bumps the generation so
       //       this guard trips and we never wire a `RemoteCoreProxy`
       //       onto a dead socket.
-      if (this._generation !== myGen) return;
+      // Either way the handshake delivered a connection no live session
+      // will use, so give it back. After a logout or a server close the
+      // target has already closed it, and the release closes and
+      // announces nothing more.
+      if (this._generation !== myGen) {
+        this._releaseConnection(transport);
+        return;
+      }
 
       this._transport = transport;
 
@@ -661,23 +729,74 @@ export class AuthSession extends HTMLElement {
       // `this._unbind` (the next teardown would otherwise re-call a
       // disposer that has already fired, which `@wc-bindable/core`
       // tolerates today but the contract does not formally guarantee).
+      // The teardown has already released the connection (it was
+      // `this._transport` by then); releasing again is a no-op and keeps
+      // this path from leaking it should that ever change.
       if (this._proxy !== proxy || this._generation !== myGen) {
         myUnbind?.();
+        this._releaseConnection(transport);
         return;
       }
       this._unbind = myUnbind;
     } catch (err) {
       // Swallow errors from a superseded attempt — reporting them would
       // clobber state the active teardown has already reset.
-      if (this._generation !== myGen) return;
-      this._setError(err instanceof Error ? err : new Error(String(err)));
-      this._teardownProxy();
+      if (this._generation === myGen) {
+        // Clean up BEFORE publishing the error: an `error` listener may
+        // restart the session (`start()` runs `_startWatching()`
+        // synchronously up to its first await, adopting the payload
+        // again), and a `_teardownProxy()` that ran after the dispatch
+        // would wipe the new run's state.
+        this._teardownProxy();
+        this._setError(err instanceof Error ? err : new Error(String(err)));
+        // Settle `connecting` before the release below (rather than in
+        // `finally`), so the session reads idle by the time the target
+        // publishes `connected=false`. No-op when an `error` listener
+        // already restarted (and thereby reset) the session.
+        this._setConnecting(false);
+      }
+      // A failure AFTER the handshake — the declaration lost its
+      // properties, `createRemoteCoreProxy` threw, `bind()`'s synchronous
+      // initial sync threw, or a command forwarder could not be installed
+      // on a locked payload property — must give back the connection
+      // this attempt opened. Dropping the reference alone would leave
+      // the target `<auth0-gate>` at `connected=true` with an open
+      // WebSocket nobody owns, and every retry via `start()` would then
+      // fail the Connection Ownership guard (SPEC-REMOTE §3.7) until
+      // logout. This also runs for a superseded attempt: its transport
+      // was never handed to a live session either.
+      if (transport) this._releaseConnection(transport);
     } finally {
       // Only clear `connecting` if our generation is still active.
       // A teardown that fired during the await already flipped it to
       // false; stepping on that would produce a spurious false→true→false
       // transition for listeners.
       if (this._generation === myGen) this._setConnecting(false);
+      // Let a newer attempt waiting on this one proceed. By now any
+      // connection this attempt no longer needs has been given back.
+      if (this._connectAttempt === attempt) this._connectAttempt = null;
+      finishAttempt();
+    }
+  }
+
+  /**
+   * Give back a connection this session opened (`auth.connect()`'s
+   * transport): close its WebSocket and publish `connected=false` on the
+   * target.
+   *
+   * `releaseAuthTransport()` checks ownership by identity — it closes the
+   * connection only while it is still the target's live one. A
+   * connection the application or a take-over `connect()` /
+   * `reconnect()` opened since then is left alone. For one the target
+   * already closed (logout, `disconnect()`, a server close) there is
+   * nothing left to close or announce, so nothing happens twice.
+   */
+  private _releaseConnection(transport: ClientTransport): void {
+    this._releasingConnection = true;
+    try {
+      releaseAuthTransport(transport);
+    } finally {
+      this._releasingConnection = false;
     }
   }
 
@@ -685,11 +804,23 @@ export class AuthSession extends HTMLElement {
     // Bumping the generation invalidates any in-flight `_connect()`:
     // the handshake it is awaiting may still resolve, but the race
     // guards in `_connect` will see a mismatched generation and drop
-    // the work on the floor.
+    // the work on the floor (and give that connection back).
     this._generation++;
+    // Captured before `_teardownProxy()` drops the reference.
+    const transport = this._transport;
     this._teardownProxy();
     if (this._ready) this._setReady(false);
     if (this._connecting) this._setConnecting(false);
+    // The session's end — logout / `authenticated=false`, transport loss,
+    // removal from the DOM, a `start()` restart — gives back the
+    // connection the session opened, so the next run (a remount,
+    // `start()`, another session on the same target) does not trip the
+    // Connection Ownership guard (SPEC-REMOTE §3.7) on a connection
+    // nobody uses any more. Done last, once the session's own state reads
+    // idle. After a logout or a transport loss the target has already
+    // closed the connection, and the release closes and announces
+    // nothing more.
+    if (transport) this._releaseConnection(transport);
   }
 
   private _teardownProxy(): void {
@@ -705,9 +836,10 @@ export class AuthSession extends HTMLElement {
     // command forwarders before the first sync.
     this._uninstallPayloadForwarders();
     this._payload = null;
-    // NB: we do NOT close the transport here — the transport is owned by
-    // AuthShell (via logout() or reconnect()). Dropping our reference is
-    // enough; the underlying WebSocket is managed by the auth element.
+    // NB: only the references are dropped here. Closing the connection
+    // is up to the callers — `_teardown()` and `_connect()`'s failure
+    // path both give it back via `_releaseConnection()` once the
+    // session's state is cleared.
     this._proxy = null;
     this._transport = null;
   }
@@ -929,6 +1061,17 @@ export class AuthSession extends HTMLElement {
    * prototype, our forwarder shadows it via an own-property assignment
    * for the duration of the session; teardown deletes the own-property
    * so prototype lookup falls back to the user's method.
+   *
+   * Throws when the application has locked a declared command name on
+   * the payload — a non-configurable own property (`configurable: false`,
+   * `Object.seal` / `Object.freeze`), or no own property on a
+   * non-extensible element — because the forwarder cannot be defined
+   * there. Unlike the property mirror (`_writePayloadMirror`), which
+   * skips a locked slot, this fails the session on purpose: running on
+   * would leave `payload.<command>()` calling the application's member
+   * instead of the server, so the command would silently never arrive.
+   * `_connect()`'s failure path then removes the forwarders installed so
+   * far and gives the connection back.
    */
   private _installPayloadCommandForwarders(
     payload: HTMLElement,
@@ -939,6 +1082,13 @@ export class AuthSession extends HTMLElement {
     if (!cmds) return;
     for (const cmd of cmds) {
       const name = cmd.name;
+      // Same lock test as `_writePayloadMirror`: exactly the cases where
+      // the `defineProperty` below would throw a bare
+      // "Cannot redefine property" TypeError.
+      const desc = Object.getOwnPropertyDescriptor(payload, name);
+      if (desc ? !desc.configurable : !Object.isExtensible(payload)) {
+        throw new Error(_lockedCommandMessage(payload, name, desc !== undefined));
+      }
       const forwarder = (...args: unknown[]) => proxy.invoke(name, ...args);
       Object.defineProperty(payload, name, {
         value: forwarder,
@@ -1087,4 +1237,27 @@ export class AuthSession extends HTMLElement {
  */
 function _isAuth(el: Element): boolean {
   return typeof (el as unknown as { connect?: unknown }).connect === "function";
+}
+
+/**
+ * Error message for a declared command whose forwarder cannot be
+ * installed because the application locked that name on the payload
+ * (see `_installPayloadCommandForwarders`). Names the command, the lock,
+ * why the session fails instead of skipping it, and how to fix it.
+ */
+function _lockedCommandMessage(payload: HTMLElement, name: string, ownProperty: boolean): string {
+  const tag = payload.localName;
+  const lock = ownProperty
+    ? `<${tag}>.${name} is a non-configurable own property (locked with ` +
+      "`configurable: false`, Object.seal() or Object.freeze())"
+    : `<${tag}> is non-extensible (Object.preventExtensions(), Object.seal() or ` +
+      `Object.freeze()), so "${name}" cannot be added to it`;
+  return (
+    `${ERROR_PREFIX} <auth0-session>: cannot install the forwarder for command "${name}" ` +
+    `on payload <${tag}>: the application locked it — ${lock}. ` +
+    `Without the forwarder, payload.${name}() never reaches the server, so the session fails ` +
+    "rather than run without the command. " +
+    `Stop locking "${name}" on the payload element (a lock cannot be undone — mount a fresh element), ` +
+    `or remove "${name}" from its wcBindable.commands, then call start().`
+  );
 }

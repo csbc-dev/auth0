@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { AuthShell } from "../src/shell/AuthShell";
+import { AuthShell, releaseAuthTransport } from "../src/shell/AuthShell";
 import { isOwnershipError, OWNERSHIP_ERROR_MARKER } from "../src/raiseError";
 
 function createMockAuth0Client(overrides: Record<string, any> = {}) {
@@ -2469,6 +2469,117 @@ describe("AuthShell", () => {
 
       // The post-flip commit must NOT have escaped to the outer target.
       expect(tokenEvents).toEqual(["local-token"]);
+    });
+  });
+
+  describe("releaseAuthTransport (ownership-checked release)", () => {
+    // `<auth0-session>` uses this to give back a connection it opened but
+    // could not finish setting up. It may only ever close the connection
+    // behind the transport it was handed, and only while that connection
+    // is still the shell's live one.
+    class RecordingSocket extends MockWebSocket {
+      closeCalls: unknown[][] = [];
+      close(...args: unknown[]): void {
+        this.closeCalls.push(args);
+        super.close();
+      }
+    }
+
+    let sockets: RecordingSocket[];
+    let originalWS: unknown;
+
+    beforeEach(() => {
+      sockets = [];
+      originalWS = globalThis.WebSocket;
+      (globalThis as any).WebSocket = class extends RecordingSocket {
+        constructor(url: string, protocols?: string | string[]) {
+          super(url, protocols);
+          sockets.push(this);
+        }
+      };
+    });
+
+    afterEach(() => {
+      (globalThis as any).WebSocket = originalWS;
+    });
+
+    async function initializedShell() {
+      createAuth0Client.mockResolvedValue(createMockAuth0Client({
+        getTokenSilently: vi.fn().mockResolvedValue("token"),
+      }));
+      const shell = new AuthShell();
+      await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+      const connectedEvents: boolean[] = [];
+      shell.addEventListener("auth0-gate:connected-changed",
+        (e) => connectedEvents.push((e as CustomEvent).detail));
+      return { shell, connectedEvents };
+    }
+
+    it("closes the live connection and publishes connected=false synchronously", async () => {
+      const { shell, connectedEvents } = await initializedShell();
+      const transport = await shell.connect("ws://localhost:3000", { failIfConnected: true });
+
+      expect(releaseAuthTransport(transport)).toBe(true);
+
+      expect(sockets).toHaveLength(1);
+      expect(sockets[0].readyState).toBe(MockWebSocket.CLOSED);
+      expect(sockets[0].closeCalls).toEqual([[1000, "Client disconnect"]]);
+      expect(shell.connected).toBe(false);
+      expect(connectedEvents).toEqual([true, false]);
+
+      // Released once: a second call has nothing left to release.
+      expect(releaseAuthTransport(transport)).toBe(false);
+      expect(connectedEvents).toEqual([true, false]);
+
+      // The ownership guard no longer sees a connection, so the same
+      // owner can connect again.
+      await shell.connect("ws://localhost:3000", { failIfConnected: true });
+      expect(shell.connected).toBe(true);
+      expect(sockets[1].readyState).toBe(MockWebSocket.OPEN);
+    });
+
+    it("leaves alone a connection that replaced the transport", async () => {
+      const { shell, connectedEvents } = await initializedShell();
+      const first = await shell.connect("ws://localhost:3000");
+      // A take-over connect closes the first socket and opens its own.
+      await shell.connect("ws://localhost:3000");
+
+      expect(releaseAuthTransport(first)).toBe(false);
+
+      expect(sockets).toHaveLength(2);
+      expect(sockets[1].readyState).toBe(MockWebSocket.OPEN);
+      expect(sockets[1].closeCalls).toEqual([]);
+      expect(shell.connected).toBe(true);
+      expect(connectedEvents).toEqual([true]);
+    });
+
+    it("returns false for a transport the shell did not create, or one already released by disconnect()", async () => {
+      const { shell, connectedEvents } = await initializedShell();
+      const transport = await shell.connect("ws://localhost:3000");
+
+      expect(releaseAuthTransport({ send: vi.fn(), onMessage: vi.fn() })).toBe(false);
+      expect(shell.connected).toBe(true);
+
+      shell.disconnect();
+      expect(releaseAuthTransport(transport)).toBe(false);
+      expect(connectedEvents).toEqual([true, false]);
+    });
+
+    it("does not supersede a take-over handshake that is already in flight (unlike disconnect())", async () => {
+      // disconnect() vetoes connections in general (it bumps the connect
+      // generation, so a pending connect() rejects as superseded). The
+      // release only gives up one specific connection.
+      const { shell, connectedEvents } = await initializedShell();
+      const first = await shell.connect("ws://localhost:3000");
+      const takeOver = shell.connect("ws://localhost:3000"); // awaiting its token
+
+      expect(releaseAuthTransport(first)).toBe(true);
+      expect(shell.connected).toBe(false);
+
+      await expect(takeOver).resolves.toBeDefined();
+      expect(shell.connected).toBe(true);
+      expect(sockets.map((s) => s.readyState)).toEqual([MockWebSocket.CLOSED, MockWebSocket.OPEN]);
+      expect(connectedEvents).toEqual([true, false, true]);
     });
   });
 
