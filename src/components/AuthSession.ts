@@ -7,7 +7,7 @@ import { config } from "../config.js";
 import { ERROR_PREFIX, OWNERSHIP_ERROR_MARKER, isOwnershipError } from "../raiseError.js";
 import { IWcBindable } from "../types.js";
 import { getCoreDeclaration } from "../coreRegistry.js";
-import { releaseAuthTransport } from "../shell/AuthShell.js";
+import { currentAuthTransport, releaseAuthTransport } from "../shell/AuthShell.js";
 import type { Auth } from "./Auth.js";
 
 /**
@@ -58,9 +58,13 @@ import type { Auth } from "./Auth.js";
  * The session owns the connection it opened in step 1 and gives it back
  * — closes it through the target — when the session ends: logout or
  * `authenticated=false`, transport loss, removal from the DOM, a
- * `start()` restart, or a failure while setting the session up. It
- * never closes a connection it did not open (an application's own
- * `authEl.connect()`, a take-over `connect()` / `reconnect()`).
+ * `start()` restart, or a failure while setting the session up. When
+ * the application replaces that connection with `authEl.reconnect()`
+ * (Strategy B, typically re-attaching `session.proxy` to the result),
+ * the replacement is still the session's: `transport` returns it and
+ * the session's end closes it. It never closes a connection it did not
+ * open (an application's own `authEl.connect()`, a take-over
+ * `connect()`, or a `reconnect()` of either).
  *
  * The session's own bindable surface is intentionally minimal —
  * `ready`, `connecting`, `error` — so `data-wcs` can gate UI on
@@ -123,11 +127,15 @@ export class AuthSession extends HTMLElement {
 
   // Settles once the `_connect()` call that set it has finished —
   // including, for an attempt that was superseded mid-handshake, giving
-  // back the connection that handshake still delivered. `null` while no
-  // attempt is running. A new attempt that finds it set waits for it:
-  // until then the old handshake holds the target's single connection
-  // slot, and `auth.connect({ failIfConnected: true })` would reject the
-  // new attempt as an ownership conflict with the session's own past.
+  // back the connection that handshake still delivered. `_releaseConnection()`
+  // extends it when the connection it gives back was being replaced by
+  // an `authEl.reconnect()`: then it also waits for that call to discard
+  // its new socket. `null` while nothing of the session's past is still
+  // running. A new attempt that finds it set waits for it: until then
+  // the old handshake (or the reconnect) holds the target's single
+  // connection slot, and `auth.connect({ failIfConnected: true })` would
+  // reject the new attempt as an ownership conflict with the session's
+  // own past.
   private _connectAttempt: Promise<void> | null = null;
 
   // True while `_releaseConnection()` closes a connection this session
@@ -227,9 +235,14 @@ export class AuthSession extends HTMLElement {
    * that need direct access (e.g. sending raw commands alongside
    * proxy-bound state). Same lifecycle as `proxy` — the pair is
    * installed and cleared atomically.
+   *
+   * After the application replaced the session's connection with
+   * `authEl.reconnect()`, this is the replacement — the transport to
+   * re-attach `proxy` to (`proxy.reconnect(transport)`) and the one the
+   * session closes when it ends.
    */
   get transport(): ClientTransport | null {
-    return this._transport;
+    return this._transport && currentAuthTransport(this._transport);
   }
 
   /**
@@ -575,8 +588,10 @@ export class AuthSession extends HTMLElement {
     // Skipped while a superseded attempt of this session is still running
     // (`_connectAttempt`): the open connection may be that attempt's own,
     // whose handshake completed but which has not yet resumed to give it
-    // back. The attempt below waits for it and then relies on the atomic
-    // `failIfConnected` guard, which still rejects a genuine other owner.
+    // back — or the replacement a `reconnect()` of the session's connection
+    // is still opening. The attempt below waits for it and then relies on
+    // the atomic `failIfConnected` guard, which still rejects a genuine
+    // other owner.
     if (auth.connected && !this._connectAttempt) {
       const ownershipErr = new Error(
         `${ERROR_PREFIX} <auth0-session>: target is already connected. ` +
@@ -612,8 +627,9 @@ export class AuthSession extends HTMLElement {
     // someone else — so the failure path never releases a connection
     // this attempt did not establish.
     let transport: ClientTransport | null = null;
-    // Only an attempt superseded by a teardown can still be running here
-    // (`_connecting` / `_transport` above rule out a live one).
+    // Only an attempt superseded by a teardown — or a `reconnect()` of a
+    // connection the session gave back — can still be running here
+    // (`_connecting` / `_transport` above rule out a live attempt).
     const previousAttempt = this._connectAttempt;
     let finishAttempt!: () => void;
     const attempt = new Promise<void>((resolve) => { finishAttempt = resolve; });
@@ -621,8 +637,10 @@ export class AuthSession extends HTMLElement {
     try {
       // A teardown during a handshake (removal / remount, `start()`)
       // cannot cancel that handshake; the superseded attempt gives the
-      // connection back once it resolves. Wait for that instead of
-      // racing it into the ownership guard.
+      // connection back once it resolves. Likewise a `reconnect()` that
+      // was replacing the connection the teardown gave back discards its
+      // socket only once its handshake resolves. Wait for that instead
+      // of racing it into the ownership guard.
       if (previousAttempt) {
         await previousAttempt;
         if (this._generation !== myGen) return;
@@ -785,16 +803,30 @@ export class AuthSession extends HTMLElement {
    * target.
    *
    * `releaseAuthTransport()` checks ownership by identity — it closes the
-   * connection only while it is still the target's live one. A
-   * connection the application or a take-over `connect()` /
-   * `reconnect()` opened since then is left alone. For one the target
-   * already closed (logout, `disconnect()`, a server close) there is
-   * nothing left to close or announce, so nothing happens twice.
+   * connection only while it is still the target's live one, following
+   * it through every `authEl.reconnect()` that replaced it (the
+   * replacement continues the session's connection). A connection the
+   * application or a take-over `connect()` opened since then is left
+   * alone. For one the target already closed (logout, `disconnect()`, a
+   * server close) there is nothing left to close or announce, so nothing
+   * happens twice.
+   *
+   * When a `reconnect()` is replacing the connection right now, the
+   * release cannot cancel its handshake. That call discards its new
+   * socket once the handshake resolves, and `_connectAttempt` is extended
+   * to wait for it, so the session's next `_connect()` does not fail
+   * the ownership guard against it.
    */
   private _releaseConnection(transport: ClientTransport): void {
     this._releasingConnection = true;
     try {
-      releaseAuthTransport(transport);
+      const released = releaseAuthTransport(transport);
+      if (released instanceof Promise) {
+        const settled = Promise.all([this._connectAttempt, released]).then(() => {
+          if (this._connectAttempt === settled) this._connectAttempt = null;
+        });
+        this._connectAttempt = settled;
+      }
     } finally {
       this._releasingConnection = false;
     }
@@ -813,7 +845,8 @@ export class AuthSession extends HTMLElement {
     if (this._connecting) this._setConnecting(false);
     // The session's end — logout / `authenticated=false`, transport loss,
     // removal from the DOM, a `start()` restart — gives back the
-    // connection the session opened, so the next run (a remount,
+    // connection the session opened (by now possibly the replacement an
+    // `authEl.reconnect()` opened for it), so the next run (a remount,
     // `start()`, another session on the same target) does not trip the
     // Connection Ownership guard (SPEC-REMOTE §3.7) on a connection
     // nobody uses any more. Done last, once the session's own state reads
