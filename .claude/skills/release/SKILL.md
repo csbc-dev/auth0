@@ -56,6 +56,8 @@ Confirm the next version with the user before bumping. Follow semver:
 - **minor** — backwards-compatible feature additions
 - **major** — breaking changes (any change to the wcBindable surface, exported types, attribute contract, error contract, or remote wire protocol counts as breaking)
 
+> **While the package is in `0.x.y`, map a breaking change to minor and a feature addition or fix to patch.** This is the convention of the upstream `@wc-bindable/*` line and of `@csbc-dev/ai-agent`. Upstream still ships breaking changes as 0.x minors, so a 1.0 here would not be a stable promise. Bump major only once the package is at 1.0 or later.
+
 Once the user approves the bump level, update `version` in [package.json](package.json). Prefer editing the field directly rather than running `npm version`, so the user keeps control over commit/tag creation.
 
 If the change touches the remote protocol, also confirm whether [SPEC-REMOTE.md](SPEC-REMOTE.md) needs a version note.
