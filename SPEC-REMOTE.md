@@ -1045,6 +1045,8 @@ function _sameStringSet(a: readonly string[], b: readonly string[]): boolean {
 An aggregate Core that bundles multiple Cores onto a single WebSocket connection.
 
 ```typescript
+import type { IWcBindable } from "@csbc-dev/auth0/server"; // also exported from "@csbc-dev/auth0"
+
 export class AppCore extends EventTarget {
   static wcBindable: IWcBindable = {
     protocol: "wc-bindable",

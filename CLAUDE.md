@@ -211,6 +211,10 @@ The test environment uses `happy-dom` (see [vitest.config.ts](vitest.config.ts) 
 ### Dependency notes
 
 - `@wc-bindable/core` (`^0.10.0`) — the wcBindable protocol implementation (runtime dependency)
+- `static wcBindable` declarations are typed `IWcBindable`, which `extends` `@wc-bindable/core`'s `WcBindableDeclaration`, so they pass to `createRemoteCoreProxy()` / `registerCoreDeclaration()` without a cast. `IWcBindable` and its entry types are exported from both entry points.
+  - Its lists are deliberately mutable arrays: upstream types them `T[]`, and a `readonly T[]` is not assignable to that.
+  - Immutability comes from `freezeWcBindable()` (src/freezeWcBindable.ts), which deep-freezes every declaration. Do not "tighten" the lists back to `readonly` arrays, and wrap any new declaration in `freezeWcBindable()`.
+  - `__tests__/wcBindableDeclarations.test.ts` guards both; its no-cast half runs only under `npm run typecheck`.
 - `@wc-bindable/remote` (`^0.10.0`) — proxy used by remote mode, resolved from the npm registry like every other dependency (there is no `file:` / sibling-monorepo reference). 0.10 enforces a strict **JsonValue gate** on everything that crosses the wire (SPEC-REMOTE §5.0): `invoke` arguments that are not JSON (`undefined`, `Date`, class instances, DOM `Event`s) reject with `WC_BINDABLE_INVALID_JSON_VALUE`, non-JSON command return values with `WC_BINDABLE_INVALID_RETURN_VALUE`, and a non-JSON property value — **including an object with a field whose value is `undefined`** — is silently dropped by `RemoteShellProxy`. That is why `UserCore.currentUser` omits absent `email` / `name` keys instead of setting them to `undefined`; do not "simplify" it back to an object literal. Forwarders installed by `<auth0-session>` pass their arguments through unchanged, so never wire a DOM event straight to one (README-REMOTE "Wire values must be JSON").
 - `jose` — JWT verification / decoding
 - `@auth0/auth0-spa-js` / `ws` — **peerDependencies (optional)**. The former is required only by local mode and the latter only by the server / remote side, so consumers install whichever matches their mode

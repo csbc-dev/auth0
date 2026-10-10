@@ -6,6 +6,7 @@ import { bind, isWcBindable } from "@wc-bindable/core";
 import { config } from "../config.js";
 import { ERROR_PREFIX, OWNERSHIP_ERROR_MARKER, isOwnershipError } from "../raiseError.js";
 import { IWcBindable } from "../types.js";
+import { freezeWcBindable } from "../freezeWcBindable.js";
 import { getCoreDeclaration } from "../coreRegistry.js";
 import { releaseAuthTransport } from "../shell/AuthShell.js";
 import type { Auth } from "./Auth.js";
@@ -70,7 +71,7 @@ import type { Auth } from "./Auth.js";
 export class AuthSession extends HTMLElement {
   static hasConnectedCallbackPromise = true;
 
-  static wcBindable: IWcBindable = {
+  static wcBindable: IWcBindable = freezeWcBindable({
     protocol: "wc-bindable",
     version: 1,
     properties: [
@@ -78,7 +79,7 @@ export class AuthSession extends HTMLElement {
       { name: "connecting", event: "auth0-session:connecting-changed" },
       { name: "error",      event: "auth0-session:error" },
     ],
-  };
+  });
 
   static get observedAttributes(): string[] {
     return ["target", "core", "url", "auto-connect"];
