@@ -188,6 +188,10 @@ export class AuthConfig extends HTMLElement {
       if (!this._autoLoadQueued) return;
       this._autoLoadQueued = false;
       this._autoLoadPromise = null;
+      // Defensive: disconnectedCallback and the src-removal branch of
+      // attributeChangedCallback both clear `_autoLoadQueued`
+      // synchronously, so the guard above always trips first.
+      /* v8 ignore next -- unreachable while the two lifecycle callbacks reset `_autoLoadQueued` (see above) */
       if (!this.isConnected || !this.src) return;
       await this.load();
     });

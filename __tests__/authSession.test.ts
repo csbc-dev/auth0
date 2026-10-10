@@ -11,6 +11,7 @@ import {
   _clearCoreRegistry,
 } from "../src/coreRegistry";
 import { isOwnershipError, OWNERSHIP_ERROR_MARKER } from "../src/raiseError";
+import { setConfig } from "../src/config";
 
 vi.mock("@auth0/auth0-spa-js", () => ({
   createAuth0Client: vi.fn(),
@@ -34,6 +35,14 @@ vi.mock("@auth0/auth0-spa-js", () => ({
 // Note: createRemoteCoreProxy is mocked as a plain function (NOT vi.fn()) so
 // that vi.restoreAllMocks() in afterEach does not wipe its implementation
 // between tests.
+//
+// `proxyHooks.onCreate` lets an individual test observe / prepare the proxy
+// right after construction (before `<auth0-session>` binds to it). It is
+// reset in afterEach.
+const proxyHooks = vi.hoisted(() => ({
+  onCreate: null as null | ((proxy: EventTarget) => void),
+}));
+
 vi.mock("@wc-bindable/remote", async (importActual) => {
   const actual = await importActual<Record<string, unknown>>();
   const factory = (decl: WcBindableDeclaration) => {
@@ -58,6 +67,7 @@ vi.mock("@wc-bindable/remote", async (importActual) => {
         proxy.dispatchEvent(new CustomEvent(EVENT_PREFIX + name, { detail: value }));
       }
     };
+    proxyHooks.onCreate?.(proxy);
     return proxy as any;
   };
   return {
@@ -104,6 +114,7 @@ describe("AuthSession (auth0-session)", () => {
     vi.restoreAllMocks();
     document.body.innerHTML = "";
     _clearCoreRegistry();
+    proxyHooks.onCreate = null;
   });
 
   it("registered as a custom element", () => {
@@ -427,6 +438,32 @@ describe("AuthSession (auth0-session)", () => {
       await el.connectedCallbackPromise;
 
       expect(el.error?.message).toContain('target "auth" not found');
+    });
+
+    it("reports a target that carries the gate tag name but has not upgraded yet as not found", async () => {
+      // Script-load race: the element is parsed with the configured
+      // <auth0-gate> tag name before its definition arrives, so it has no
+      // `connect()` / `connectedCallbackPromise`. Reproduced by pointing the
+      // configured tag at a name that is never defined.
+      const pendingTag = "pending-session-gate";
+      setConfig({ tagNames: { auth: pendingTag } });
+      try {
+        const pending = document.createElement(pendingTag);
+        pending.id = "auth";
+        document.body.appendChild(pending);
+
+        const el = document.createElement("auth0-session") as AuthSession;
+        el.target = "auth";
+        el.core = "app-core";
+        document.body.appendChild(el);
+        await el.connectedCallbackPromise;
+
+        expect(el.error?.message).toContain('target "auth" not found');
+        expect(el.proxy).toBeNull();
+        expect(el.connecting).toBe(false);
+      } finally {
+        setConfig({ tagNames: { auth: "auth0-gate" } });
+      }
     });
 
     it("sets a friendly error when neither session.url nor target.remote-url is set", async () => {
@@ -1823,6 +1860,40 @@ describe("AuthSession (auth0-session)", () => {
       expect(Object.prototype.hasOwnProperty.call(child, "count")).toBe(false);
     });
 
+    it("teardown tolerates mirrored properties the user deleted or locked mid-session", async () => {
+      // Teardown only deletes mirrors that are still configurable own
+      // properties. A user `delete` (no descriptor) or a lock
+      // (configurable: false — deleting it would throw in strict mode)
+      // must not break teardown or the rest of the cleanup.
+      const { authEl } = await setupAuthenticated();
+      const tag = definePayloadTag(PAYLOAD_DECL);
+
+      const el = document.createElement("auth0-session") as AuthSession;
+      el.target = "auth";
+      const child = document.createElement(tag);
+      el.appendChild(child);
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      (el.proxy as any)._simulateSync({ count: 3, lastUpdatedBy: "alice@example.com" });
+      delete (child as any).count;
+      Object.defineProperty(child, "lastUpdatedBy", {
+        value: "pinned-by-app", writable: false, configurable: false,
+      });
+
+      authEl.dispatchEvent(new CustomEvent("auth0-gate:authenticated-changed", {
+        detail: false,
+      }));
+
+      expect(el.proxy).toBeNull();
+      expect(el.payload).toBeNull();
+      // The locked value is left alone; the deleted one stays absent.
+      expect((child as any).lastUpdatedBy).toBe("pinned-by-app");
+      expect(Object.prototype.hasOwnProperty.call(child, "count")).toBe(false);
+      // The rest of the cleanup still ran: command forwarders are removed.
+      expect(Object.prototype.hasOwnProperty.call(child, "increment")).toBe(false);
+    });
+
     it("preserves a user-replaced command forwarder on teardown (identity match required)", async () => {
       const { authEl } = await setupAuthenticated();
       const tag = definePayloadTag(PAYLOAD_DECL);
@@ -1847,6 +1918,278 @@ describe("AuthSession (auth0-session)", () => {
 
       // Our identity check sees the user's replacement and leaves it alone.
       expect((child as any).increment).toBe(userIncrement);
+    });
+
+    it("surfaces an error (instead of crashing later) when the payload's declaration vanishes between discovery and read", async () => {
+      // `isWcBindable()` performs a live property read of
+      // `constructor.wcBindable`; an accessor-based declaration can
+      // therefore answer differently on the next read.
+      const { authEl } = await setupAuthenticated();
+      const tag = `test-payload-${++payloadTagSeq}`;
+      let reads = 0;
+      class VanishingPayload extends HTMLElement {
+        static get wcBindable(): WcBindableDeclaration | undefined {
+          reads += 1;
+          return reads === 1 ? PAYLOAD_DECL : undefined;
+        }
+      }
+      customElements.define(tag, VanishingPayload);
+
+      const el = document.createElement("auth0-session") as AuthSession;
+      el.target = "auth";
+      el.appendChild(document.createElement(tag));
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      expect(el.error?.message).toContain(`payload child <${tag}> has no wcBindable declaration`);
+      expect(el.payload).toBeNull();
+      expect(el.proxy).toBeNull();
+      expect((authEl as any)._shell.connect).not.toHaveBeenCalled();
+    });
+
+    it("disposes the bind subscription immediately when a payload listener tears the session down during bind()'s initial sync", async () => {
+      // If the proxy already holds cached values when `bind()` runs (a
+      // transport that delivers the initial sync synchronously), bind()
+      // invokes the callback re-entrantly; the mirrored event lets user
+      // code remove the session before bind() has even returned its
+      // disposer. That disposer must still be called — not parked in
+      // `_unbind` for a teardown that may never come.
+      await setupAuthenticated();
+      const tag = definePayloadTag(PAYLOAD_DECL);
+
+      const removedEventTypes: string[] = [];
+      proxyHooks.onCreate = (proxy) => {
+        const original = proxy.removeEventListener.bind(proxy);
+        proxy.removeEventListener = (type: string, ...rest: any[]) => {
+          removedEventTypes.push(type);
+          return original(type, ...(rest as [any, any]));
+        };
+        Object.defineProperty(proxy, "count", {
+          value: 1, writable: true, configurable: true, enumerable: true,
+        });
+      };
+
+      const el = document.createElement("auth0-session") as AuthSession;
+      el.target = "auth";
+      const child = document.createElement(tag);
+      el.appendChild(child);
+      const readyEvents: boolean[] = [];
+      el.addEventListener("auth0-session:ready-changed", (e) => {
+        readyEvents.push((e as CustomEvent).detail);
+      });
+      // The application unmounts the session as soon as it sees a value.
+      child.addEventListener("test-payload:count-changed", () => el.remove());
+      document.body.appendChild(el);
+
+      await el.connectedCallbackPromise;
+      await new Promise((r) => setTimeout(r, 0)); // drain the queued ready check
+
+      // bind()'s disposer removed its listener for every proxy property.
+      expect(removedEventTypes).toEqual(expect.arrayContaining([
+        "mock-proxy:count",
+        "mock-proxy:lastUpdatedBy",
+      ]));
+      expect(el.ready).toBe(false);
+      expect(readyEvents).toEqual([]);
+      expect(el.proxy).toBeNull();
+      expect(el.payload).toBeNull();
+      expect(el.error).toBeNull();
+      expect(el.connecting).toBe(false);
+      // The child is restored to its pre-adoption state.
+      expect(Object.prototype.hasOwnProperty.call(child, "count")).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(child, "increment")).toBe(false);
+    });
+
+    describe("async discovery (payload class defined after discovery started)", () => {
+      // The session's discovery runs in a microtask after connect. These
+      // tests settle the pending child only AFTER that point, so the
+      // `customElements.whenDefined()` race is what picks the payload.
+      const flush = () => new Promise((r) => setTimeout(r, 0));
+
+      // Per the HTML spec (and in browsers) `customElements.define()`
+      // upgrades an already-connected element IN PLACE before
+      // `whenDefined()` resolves. happy-dom instead swaps in a fresh node,
+      // so the instance the session holds would never look upgraded. For
+      // the tests that need a wc-bindable upgrade to win, emulate the spec:
+      // hold `whenDefined()` for the `test-payload-late-*` tags, upgrade
+      // the original instance (prototype swap), then resolve.
+      function emulateInPlaceUpgrade() {
+        const gates = new Map<string, () => void>();
+        const realWhenDefined = customElements.whenDefined.bind(customElements);
+        vi.spyOn(customElements, "whenDefined").mockImplementation((name: string) => {
+          if (!name.startsWith("test-payload-late-")) return realWhenDefined(name);
+          return new Promise<CustomElementConstructor>((resolve) => {
+            gates.set(name, () => resolve(HTMLElement as unknown as CustomElementConstructor));
+          });
+        });
+        return (child: Element, decl: WcBindableDeclaration): void => {
+          class Upgraded extends HTMLElement {
+            static wcBindable = decl;
+          }
+          Object.setPrototypeOf(child, Upgraded.prototype);
+          gates.get(child.localName)!();
+        };
+      }
+
+      it("waits for the pending child and adopts it once it upgrades", async () => {
+        const { authEl } = await setupAuthenticated();
+        const upgrade = emulateInPlaceUpgrade();
+        const tag = `test-payload-late-${++payloadTagSeq}`;
+
+        const el = document.createElement("auth0-session") as AuthSession;
+        el.target = "auth";
+        const child = document.createElement(tag);
+        el.appendChild(child);
+        document.body.appendChild(el);
+        await flush();
+
+        // Still waiting: no payload, no error, no handshake yet.
+        expect(el.payload).toBeNull();
+        expect(el.error).toBeNull();
+        expect((authEl as any)._shell.connect).not.toHaveBeenCalled();
+
+        upgrade(child, PAYLOAD_DECL);
+        await el.connectedCallbackPromise;
+
+        expect(el.error).toBeNull();
+        expect(el.payload).toBe(child);
+        expect(el.proxy).not.toBeNull();
+        expect((authEl as any)._shell.connect).toHaveBeenCalledTimes(1);
+        // The adopted child is live: command forwarders are installed.
+        expect(typeof (child as any).increment).toBe("function");
+      });
+
+      it("adopts the first wc-bindable child to upgrade, not the first in DOM order", async () => {
+        await setupAuthenticated();
+        const upgrade = emulateInPlaceUpgrade();
+        const first = document.createElement(`test-payload-late-${++payloadTagSeq}`);
+        const second = document.createElement(`test-payload-late-${++payloadTagSeq}`);
+
+        const el = document.createElement("auth0-session") as AuthSession;
+        el.target = "auth";
+        el.appendChild(first);
+        el.appendChild(second);
+        document.body.appendChild(el);
+        await flush();
+
+        upgrade(second, PAYLOAD_DECL);
+        await el.connectedCallbackPromise;
+        expect(el.payload).toBe(second);
+
+        // A later upgrade of an earlier sibling does not displace the
+        // adopted payload (SPEC-REMOTE §3.7: one proxy per session).
+        upgrade(first, PAYLOAD_DECL);
+        await flush();
+        expect(el.payload).toBe(second);
+        expect(Object.prototype.hasOwnProperty.call(first, "increment")).toBe(false);
+        expect(el.error).toBeNull();
+      });
+
+      it("falls back to the registered `core` when every candidate settles as non-wc-bindable (mixed children)", async () => {
+        const { authEl } = await setupAuthenticated();
+        const plainCustomTag = `test-plain-${++payloadTagSeq}`;
+        customElements.define(plainCustomTag, class extends HTMLElement {});
+        const lateTag = `test-plain-late-${++payloadTagSeq}`;
+
+        const el = document.createElement("auth0-session") as AuthSession;
+        el.target = "auth";
+        el.core = "app-core";
+        // A non-custom element, an already-defined non-bindable custom
+        // element, a non-HTML (SVG) child and a not-yet-defined one.
+        el.appendChild(document.createElement("div"));
+        el.appendChild(document.createElement(plainCustomTag));
+        el.appendChild(document.createElementNS("http://www.w3.org/2000/svg", "svg"));
+        el.appendChild(document.createElement(lateTag));
+        document.body.appendChild(el);
+        await flush();
+        expect((authEl as any)._shell.connect).not.toHaveBeenCalled();
+
+        // The last candidate upgrades into a plain element: nothing is
+        // wc-bindable, so the legacy registry path takes over.
+        customElements.define(lateTag, class extends HTMLElement {});
+        await el.connectedCallbackPromise;
+
+        expect(el.error).toBeNull();
+        expect(el.payload).toBeNull();
+        expect(el.proxy).not.toBeNull();
+        expect((authEl as any)._shell.connect).toHaveBeenCalledTimes(1);
+      });
+
+      it("does not stall on a dashed child whose name can never be defined (whenDefined rejects)", async () => {
+        // `font-face` contains a dash but is a reserved name, so
+        // customElements.whenDefined("font-face") rejects. Without
+        // draining the pending counter on rejection, discovery (and
+        // connectedCallbackPromise) would hang forever.
+        const { authEl } = await setupAuthenticated();
+
+        const el = document.createElement("auth0-session") as AuthSession;
+        el.target = "auth";
+        el.core = "app-core";
+        el.appendChild(document.createElement("font-face"));
+        document.body.appendChild(el);
+
+        const timeout = new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 250));
+        const winner = await Promise.race([
+          el.connectedCallbackPromise.then(() => "ok" as const),
+          timeout,
+        ]);
+
+        expect(winner).toBe("ok");
+        expect(el.error).toBeNull();
+        expect(el.payload).toBeNull();
+        expect(el.proxy).not.toBeNull();
+        expect((authEl as any)._shell.connect).toHaveBeenCalledTimes(1);
+      });
+
+      it("a never-definable dashed sibling does not prevent a pending payload from being adopted", async () => {
+        const { authEl } = await setupAuthenticated();
+        const upgrade = emulateInPlaceUpgrade();
+        const child = document.createElement(`test-payload-late-${++payloadTagSeq}`);
+
+        const el = document.createElement("auth0-session") as AuthSession;
+        el.target = "auth";
+        el.appendChild(document.createElement("font-face")); // whenDefined rejects
+        el.appendChild(child);
+        document.body.appendChild(el);
+        await flush();
+
+        // The rejected candidate is counted out, but discovery keeps
+        // waiting for the remaining one instead of giving up.
+        expect(el.error).toBeNull();
+        expect((authEl as any)._shell.connect).not.toHaveBeenCalled();
+
+        upgrade(child, PAYLOAD_DECL);
+        await el.connectedCallbackPromise;
+
+        expect(el.payload).toBe(child);
+        expect(el.proxy).not.toBeNull();
+        expect((authEl as any)._shell.connect).toHaveBeenCalledTimes(1);
+      });
+
+      it("abandons the run when the session is removed while waiting for the payload class", async () => {
+        const { authEl } = await setupAuthenticated();
+        const tag = `test-payload-late-${++payloadTagSeq}`;
+
+        const el = document.createElement("auth0-session") as AuthSession;
+        el.target = "auth";
+        // No `core` fallback: a run that wrongly resumed after removal
+        // would surface "no payload source" on the detached session.
+        el.appendChild(document.createElement(tag));
+        document.body.appendChild(el);
+        await flush();
+
+        el.remove();
+        customElements.define(tag, class extends HTMLElement {
+          static wcBindable = PAYLOAD_DECL;
+        });
+        await el.connectedCallbackPromise;
+        await flush();
+
+        expect(el.error).toBeNull();
+        expect(el.payload).toBeNull();
+        expect(el.proxy).toBeNull();
+        expect((authEl as any)._shell.connect).not.toHaveBeenCalled();
+      });
     });
   });
 

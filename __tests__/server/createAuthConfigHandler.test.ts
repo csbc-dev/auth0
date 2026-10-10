@@ -140,6 +140,30 @@ describe("createAuthConfigHandler", () => {
     expect(res.ended).toBe(false);
   });
 
+  it("routes a request with no url as `/` (only a handler mounted at `/` claims it)", () => {
+    // `IncomingMessage.url` is typed optional; a request without one must
+    // neither throw inside `new URL(...)` nor be mistaken for the config
+    // path. It is treated as `/`.
+    const atDefault = createAuthConfigHandler({ ...base });
+    const resDefault = createRes();
+    expect(atDefault(createReq({ url: undefined }), resDefault)).toBe(false);
+    expect(resDefault.ended).toBe(false);
+
+    const atRoot = createAuthConfigHandler({ ...base, path: "/" });
+    const resRoot = createRes();
+    expect(atRoot(createReq({ url: undefined, headers: { host: "h" } }), resRoot)).toBe(true);
+    expect(resRoot.statusCode).toBe(200);
+    expect(JSON.parse(resRoot.body!).clientId).toBe("spa-123");
+  });
+
+  it("treats a request with no method as GET and serves the config", () => {
+    const handle = createAuthConfigHandler({ ...base });
+    const res = createRes();
+    expect(handle(createReq({ method: undefined, headers: { host: "h" } }), res)).toBe(true);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body!)).toMatchObject({ domain: "tenant.auth0.com", clientId: "spa-123" });
+  });
+
   it("answers OPTIONS preflight with 204 and allowed methods", () => {
     const handle = createAuthConfigHandler({ ...base, allowedOrigins: ["https://app.example"] });
     const res = createRes();

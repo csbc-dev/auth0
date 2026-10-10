@@ -27,10 +27,12 @@ export function extractTokenFromProtocol(
   // and `Array.isArray(Buffer)` returns `false` so we would silently
   // call `.split` on a Buffer and crash. Rejecting explicitly keeps
   // the error surface uniform with the other "malformed header" paths.
+  // (`null` never reaches this point — the falsy guard above already
+  // rejects it as a missing header — so `typeof` is always meaningful.)
   if (typeof protocolHeader !== "string" && !Array.isArray(protocolHeader)) {
     throw new Error(
       `${ERROR_PREFIX} Sec-WebSocket-Protocol header must be a string or string[]; got ` +
-        (protocolHeader === null ? "null" : typeof protocolHeader) +
+        typeof protocolHeader +
         ".",
     );
   }

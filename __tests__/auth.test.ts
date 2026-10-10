@@ -225,6 +225,57 @@ describe("bootstrapAuth", () => {
   });
 });
 
+describe("registerComponents（重複登録の検出）", () => {
+  afterEach(() => {
+    setConfig({ tagNames: { authConfig: "auth0-config", auth: "auth0-gate" } });
+  });
+
+  it("同じタグに別のコンストラクタが登録済みなら（パッケージ重複など）黙って無視せず throw する", () => {
+    // 別コピーの @csbc-dev/auth0 や手動 define が先に同じタグを取っている状況
+    class ForeignConfig extends HTMLElement {}
+    customElements.define("dup-auth0-config", ForeignConfig);
+    setConfig({ tagNames: { authConfig: "dup-auth0-config" } });
+
+    expect(() => registerComponents()).toThrow(
+      /tag "dup-auth0-config" is already registered with a different constructor/,
+    );
+    // 既存の登録は上書きされない
+    expect(customElements.get("dup-auth0-config")).toBe(ForeignConfig);
+  });
+
+  it("このパッケージのコンストラクタが別タグで登録済みなら（bootstrap 後の tagNames 変更）throw する", () => {
+    // Auth は既に "auth0-gate" で登録済み。後からタグ名だけ変えて再登録しようとするケース
+    setConfig({ tagNames: { auth: "renamed-auth0-gate" } });
+
+    expect(() => registerComponents()).toThrow(
+      /constructor for "renamed-auth0-gate" is already registered under a different tag "auth0-gate"/,
+    );
+    // 新しいタグで二重定義されていない
+    expect(customElements.get("renamed-auth0-gate")).toBeUndefined();
+    expect(customElements.get("auth0-gate")).toBe(Auth);
+  });
+
+  it("customElements.getName を持たない古いレジストリ shim でも、既存登録の再検証は throw せずに通る", () => {
+    // getName は任意 API。無い環境では逆引きチェックだけを省略し、
+    // 登録処理そのものを TypeError で止めない。
+    const registry = customElements as unknown as { getName?: unknown };
+    const original = Object.getOwnPropertyDescriptor(registry, "getName");
+    Object.defineProperty(registry, "getName", { value: undefined, configurable: true, writable: true });
+    try {
+      expect(registry.getName).toBeUndefined();
+      expect(() => registerComponents()).not.toThrow();
+      expect(customElements.get("auth0-gate")).toBe(Auth);
+    } finally {
+      if (original) {
+        Object.defineProperty(registry, "getName", original);
+      } else {
+        delete registry.getName;
+      }
+    }
+    expect(typeof registry.getName).toBe("function");
+  });
+});
+
 describe("Auth (auth0-gate)", () => {
   let createAuth0Client: ReturnType<typeof vi.fn>;
 
@@ -637,6 +688,41 @@ describe("Auth (auth0-gate)", () => {
       expect(el.trigger).toBe(false);
     });
 
+    it("login() 実行中の trigger=true 再設定は無視され、login は1回だけ・true 遷移も1回だけ", async () => {
+      let finishLogin!: () => void;
+      const mockClient = createMockAuth0Client({
+        loginWithRedirect: vi.fn(() => new Promise<void>((resolve) => { finishLogin = resolve; })),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const el = document.createElement("auth0-gate") as Auth;
+      el.setAttribute("domain", "test.auth0.com");
+      el.setAttribute("client-id", "client-id");
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      const triggerEvents: boolean[] = [];
+      el.addEventListener("auth0-gate:trigger-changed", (e: Event) => {
+        triggerEvents.push((e as CustomEvent).detail);
+      });
+
+      el.trigger = true;
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(mockClient.loginWithRedirect).toHaveBeenCalledTimes(1);
+
+      // 2回目の true は in-flight 中なので無視される（並行リダイレクトを起こさない）
+      el.trigger = true;
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(mockClient.loginWithRedirect).toHaveBeenCalledTimes(1);
+      expect(el.trigger).toBe(true);
+      expect(triggerEvents).toEqual([true]);
+
+      finishLogin();
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(el.trigger).toBe(false);
+      expect(triggerEvents).toEqual([true, false]);
+    });
+
     it("login()がrejectしてもunhandled rejectionにならず、_triggerリセットとイベント発火が行われる", async () => {
       const mockClient = createMockAuth0Client({
         loginWithRedirect: vi.fn().mockRejectedValue(new Error("auth0 login failed")),
@@ -991,6 +1077,83 @@ describe("Auth (auth0-gate)", () => {
       expect(el.mode).toBe("remote");
     });
 
+    it("未知の mode 値（typo）は暗黙解決にフォールバックし、console.warn を要素ごとに1回だけ出す", () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const el = document.createElement("auth0-gate") as Auth;
+        el.setAttribute("mode", "remot");
+
+        // remote-url なし → local
+        expect(el.mode).toBe("local");
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        const message = String(warnSpy.mock.calls[0][0]);
+        expect(message).toContain('unknown mode="remot"');
+        expect(message).toContain('"local" | "remote"');
+
+        // remote-url あり → remote（暗黙解決）。再読込してもラッチで再warnしない
+        el.setAttribute("remote-url", "ws://example.com");
+        expect(el.mode).toBe("remote");
+        expect(el.mode).toBe("remote");
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("mode 属性が空文字列なら暗黙解決のみで warn しない", () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const el = document.createElement("auth0-gate") as Auth;
+        el.setAttribute("mode", "");
+        expect(el.mode).toBe("local");
+        el.setAttribute("remote-url", "ws://example.com");
+        expect(el.mode).toBe("remote");
+        expect(warnSpy).not.toHaveBeenCalled();
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("remote モードでも audience が設定されていれば audience 欠落の warn は出さない", () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const el = document.createElement("auth0-gate") as Auth;
+        el.setAttribute("remote-url", "ws://example.com");
+        el.setAttribute("audience", "https://api.example.com");
+        document.body.appendChild(el);
+        el.setAttribute("mode", "remote");
+
+        expect(el.mode).toBe("remote");
+        expect(warnSpy).not.toHaveBeenCalled();
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("remote モードで audience 未設定なら console.warn を1回だけ出す（属性の再スタンプでは再warnしない）", () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const el = document.createElement("auth0-gate") as Auth;
+        el.setAttribute("mode", "remote");
+        document.body.appendChild(el);
+
+        const audienceWarns = () =>
+          warnSpy.mock.calls.filter((c) => String(c[0]).includes("`audience` is missing"));
+        expect(audienceWarns()).toHaveLength(1);
+        expect(String(audienceWarns()[0][0])).toContain("close code 1008");
+
+        // フレームワークが mode / remote-url / audience を何度スタンプしても
+        // ラッチされているので同じ警告は繰り返さない
+        el.setAttribute("remote-url", "ws://example.com");
+        el.setAttribute("mode", "local");
+        el.setAttribute("mode", "remote");
+        el.setAttribute("audience", "");
+        expect(audienceWarns()).toHaveLength(1);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
     it("local モードでは el.token が値を返し、el.getToken() も動く", async () => {
       const mockClient = createMockAuth0Client({
         isAuthenticated: vi.fn().mockResolvedValue(true),
@@ -1301,6 +1464,67 @@ describe("Auth (auth0-gate)", () => {
         warnSpy.mockRestore();
       }
     });
+
+    it("初期化前（client も initPromise も無い）の変更は inert ではないので warn しない", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const mockClient = createMockAuth0Client();
+        createAuth0Client.mockResolvedValue(mockClient);
+
+        // domain / client-id が揃う前に接続 → まだ初期化は走らない
+        const el = document.createElement("auth0-gate") as Auth;
+        el.setAttribute("audience", "https://api.example.com");
+        document.body.appendChild(el);
+        await el.connectedCallbackPromise;
+        expect(createAuth0Client).not.toHaveBeenCalled();
+
+        // oldValue !== null の変更だが、SDK はまだ構築されていない
+        el.setAttribute("audience", "https://api.example.com/v2");
+        expect(warnSpy).not.toHaveBeenCalled();
+
+        // この値は後続の初期化にそのまま反映される
+        el.setAttribute("domain", "test.auth0.com");
+        el.setAttribute("client-id", "client-id");
+        await el.connectedCallbackPromise;
+        expect(createAuth0Client).toHaveBeenCalledWith(
+          expect.objectContaining({
+            authorizationParams: expect.objectContaining({ audience: "https://api.example.com/v2" }),
+          }),
+        );
+        expect(warnSpy).not.toHaveBeenCalled();
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("初期化の in-flight 中（initPromise あり・client 未確定）の変更でも warn が出る", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        let resolveClient!: (client: unknown) => void;
+        createAuth0Client.mockImplementation(
+          () => new Promise((resolve) => { resolveClient = resolve; }),
+        );
+
+        const el = document.createElement("auth0-gate") as Auth;
+        el.setAttribute("domain", "test.auth0.com");
+        el.setAttribute("client-id", "client-id");
+        el.setAttribute("audience", "https://api.example.com");
+        document.body.appendChild(el);
+        // createAuth0Client() が呼ばれた = SDK は旧 audience で構築中
+        await new Promise(resolve => setTimeout(resolve, 0));
+        expect(createAuth0Client).toHaveBeenCalledTimes(1);
+        expect((el as any)._shell.client).toBeNull();
+
+        el.setAttribute("audience", "https://api.example.com/v2");
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(String(warnSpy.mock.calls[0][0])).toContain("mutated after initialize()");
+
+        resolveClient(createMockAuth0Client());
+        await el.connectedCallbackPromise;
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
   });
 });
 
@@ -1472,6 +1696,65 @@ describe("AuthLogout (auth0-logout)", () => {
     } finally {
       warnSpy.mockRestore();
     }
+  });
+
+  describe("対象の <auth0-gate> がまだ upgrade されていない場合", () => {
+    // 定義スクリプトの読み込み前（タグ名は一致するが logout メソッドがまだ無い）
+    // を再現するため、auth のタグ名を未定義のタグへ一時的に切り替える。
+    // クリックハンドラ内の例外は happy-dom では window の "error" イベントになるので
+    // それを捕捉して「TypeError を投げていない」ことを確認する。
+    let listenerErrors: unknown[];
+    const onWindowError = (e: ErrorEvent) => {
+      listenerErrors.push(e.error);
+    };
+
+    beforeEach(() => {
+      listenerErrors = [];
+      window.addEventListener("error", onWindowError);
+    });
+
+    afterEach(() => {
+      window.removeEventListener("error", onWindowError);
+      setConfig({ tagNames: { auth: "auth0-gate" } });
+    });
+
+    it("target ID が未 upgrade の要素を指すときは logout を呼ばず（TypeError を出さず）未解決として warn する", () => {
+      const tag = "pending-gate-logout-target";
+      setConfig({ tagNames: { auth: tag } });
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const pending = document.createElement(tag);
+      pending.id = "pending-auth";
+      document.body.appendChild(pending);
+      const logoutEl = document.createElement("auth0-logout") as AuthLogout;
+      logoutEl.target = "pending-auth";
+      document.body.appendChild(logoutEl);
+
+      logoutEl.click();
+
+      expect(listenerErrors).toEqual([]);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0][0])).toContain(
+        'target="pending-auth" did not resolve to a <auth0-gate> element',
+      );
+    });
+
+    it("最寄りの祖先が未 upgrade のときは logout を呼ばず、TypeError も warn も出さない", () => {
+      const tag = "pending-gate-logout-closest";
+      setConfig({ tagNames: { auth: tag } });
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const pending = document.createElement(tag);
+      const logoutEl = document.createElement("auth0-logout") as AuthLogout;
+      pending.appendChild(logoutEl);
+      document.body.appendChild(pending);
+
+      logoutEl.click();
+
+      expect(listenerErrors).toEqual([]);
+      // target 未指定のフォールバック経路なので warn は出さない契約
+      expect(warnSpy).not.toHaveBeenCalled();
+    });
   });
 
   it("logout()がrejectしてもunhandled rejectionにならない", async () => {
@@ -1776,6 +2059,37 @@ describe("autoTrigger", () => {
 
     // data-authtarget属性なしのクリック
     expect(() => button.click()).not.toThrow();
+  });
+
+  it("対象の auth 要素がまだ upgrade されていないクリックは preventDefault せず既定動作に任せる", () => {
+    // 定義スクリプト（defer）が届く前の最初のクリック。タグ名は一致するが
+    // login メソッドがまだ無い。クリックを握り潰さず、TypeError も投げない。
+    const tag = "pending-gate-autotrigger";
+    setConfig({ tagNames: { auth: tag } });
+    const listenerErrors: unknown[] = [];
+    const onWindowError = (e: ErrorEvent) => {
+      listenerErrors.push(e.error);
+    };
+    window.addEventListener("error", onWindowError);
+    try {
+      registerAutoTrigger();
+
+      const pending = document.createElement(tag);
+      pending.id = "pending-trigger";
+      document.body.appendChild(pending);
+      const link = document.createElement("a");
+      link.setAttribute("data-authtarget", "pending-trigger");
+      document.body.appendChild(link);
+
+      const click = new MouseEvent("click", { bubbles: true, cancelable: true });
+      link.dispatchEvent(click);
+
+      expect(click.defaultPrevented).toBe(false);
+      expect(listenerErrors).toEqual([]);
+    } finally {
+      window.removeEventListener("error", onWindowError);
+      setConfig({ tagNames: { auth: "auth0-gate" } });
+    }
   });
 
   it("autoTrigger経由のlogin()がPromiseを返さなくても処理できる", () => {

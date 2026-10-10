@@ -612,6 +612,14 @@ export class AuthShell extends EventTarget {
         // path above — a superseded connect should not poison
         // `reconnect()` with the to-be-discarded URL.
         this._url = priorUrl;
+        // Same `connected` rationale as the handshake-failure path:
+        // `_closeWebSocket()` above already severed any previous socket
+        // without publishing `connected=false`. disconnect()/logout()
+        // publish it themselves, but a `mode` change (the other
+        // generation bump) does not — without this, a take-over connect
+        // superseded by a mode flip would leave `connected=true` with no
+        // live socket (and `failIfConnected` callers falsely rejected).
+        this._setConnected(false);
         raiseError("connect(): superseded by disconnect()/logout() during handshake.");
       }
 
@@ -861,6 +869,9 @@ export class AuthShell extends EventTarget {
         } catch {
           // see _closeWebSocket() — alternative runtimes may throw
         }
+        // See connect(): the previous socket is already closed, so drop
+        // a stale `connected=true` (a `mode` flip does not publish it).
+        this._setConnected(false);
         raiseError("reconnect(): superseded by disconnect()/logout() during handshake.");
       }
 

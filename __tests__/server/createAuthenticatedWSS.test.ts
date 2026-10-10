@@ -621,6 +621,162 @@ describe("createAuthenticatedWSS", () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 
+  it("exposeAuthConfig: answers every non-config HTTP request on the owned server with 426 Upgrade Required", async () => {
+    const wss: any = await createAuthenticatedWSS({
+      auth0Domain: "test.auth0.com",
+      auth0Audience: "aud",
+      createCores: () => new EventTarget(),
+      port: 0,
+      exposeAuthConfig: { clientId: "spa-client-123" },
+    });
+
+    const server = wss.options.server as import("http").Server;
+    await new Promise<void>((resolve) => {
+      if ((server as any).listening) resolve();
+      else server.once("listening", () => resolve());
+    });
+    const addr = server.address() as import("net").AddressInfo;
+
+    const { request } = await import("node:http");
+    const send = (path: string, method: string) =>
+      new Promise<{ status?: number; contentType?: string; body: string }>((resolve, reject) => {
+        const req = request({ host: "127.0.0.1", port: addr.port, path, method }, (res) => {
+          let data = "";
+          res.on("data", (c) => (data += c));
+          res.on("end", () =>
+            resolve({
+              status: res.statusCode,
+              contentType: res.headers["content-type"],
+              body: data,
+            }),
+          );
+        });
+        req.on("error", reject);
+        req.end();
+      });
+
+    try {
+      // Any other path, and a method the config handler declines on the
+      // config path, must not fall through to an unanswered request: the
+      // server exists only for WebSocket upgrades + the config route.
+      for (const [path, method] of [
+        ["/not-the-config", "GET"],
+        ["/auth-config", "POST"],
+      ]) {
+        const result = await send(path, method);
+        expect(result.status).toBe(426);
+        expect(result.contentType).toBe("text/plain");
+        expect(result.body).toBe("Upgrade Required");
+      }
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("exposeAuthConfig: does not close the owned http.Server again when it has already closed", async () => {
+    const wss: any = await createAuthenticatedWSS({
+      auth0Domain: "test.auth0.com",
+      auth0Audience: "aud",
+      createCores: () => new EventTarget(),
+      port: 0,
+      exposeAuthConfig: { clientId: "spa-client-123" },
+    });
+
+    const server = wss.options.server as import("http").Server;
+    await new Promise<void>((resolve) => {
+      if ((server as any).listening) resolve();
+      else server.once("listening", () => resolve());
+    });
+    // The server goes away first (e.g. the process shuts it down)…
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+
+    const closeSpy = vi.spyOn(server, "close");
+    const onError = vi.fn();
+    wss.on("error", onError);
+
+    // …then wss closes: no second close() (which would only produce a
+    // spurious ERR_SERVER_NOT_RUNNING), and nothing reported as an error.
+    wss.emit("close");
+    await new Promise((r) => setImmediate(r));
+
+    expect(closeSpy).not.toHaveBeenCalled();
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("exposeAuthConfig: a listen failure is reported once; the later wss close does not re-report ERR_SERVER_NOT_RUNNING", async () => {
+    const { createServer } = await import("node:http");
+    const blocker = createServer();
+    await new Promise<void>((resolve) => blocker.listen(0, () => resolve()));
+    const busyPort = (blocker.address() as import("net").AddressInfo).port;
+
+    try {
+      const wss: any = await createAuthenticatedWSS({
+        auth0Domain: "test.auth0.com",
+        auth0Audience: "aud",
+        createCores: () => new EventTarget(),
+        port: busyPort,
+        exposeAuthConfig: { clientId: "spa-client-123" },
+      });
+      const onError = vi.fn();
+      wss.on("error", onError);
+
+      await vi.waitFor(() => expect(onError).toHaveBeenCalledTimes(1));
+      expect((onError.mock.calls[0][0] as NodeJS.ErrnoException).code).toBe("EADDRINUSE");
+
+      const server = wss.options.server as import("http").Server;
+      const closeSpy = vi.spyOn(server, "close");
+      wss.emit("close");
+      // close() on a never-listening server calls back with
+      // ERR_SERVER_NOT_RUNNING on a later tick.
+      await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setImmediate(r));
+
+      expect(closeSpy).toHaveBeenCalledTimes(1);
+      // Still only the original EADDRINUSE — the expected
+      // "not running" close outcome is not an operator-facing error.
+      expect(onError).toHaveBeenCalledTimes(1);
+    } finally {
+      await new Promise<void>((resolve) => blocker.close(() => resolve()));
+    }
+  });
+
+  it("exposeAuthConfig: forwards an unexpected owned-server close() failure to wss error listeners", async () => {
+    const wss: any = await createAuthenticatedWSS({
+      auth0Domain: "test.auth0.com",
+      auth0Audience: "aud",
+      createCores: () => new EventTarget(),
+      port: 0,
+      exposeAuthConfig: { clientId: "spa-client-123" },
+    });
+
+    const server = wss.options.server as import("http").Server;
+    await new Promise<void>((resolve) => {
+      if ((server as any).listening) resolve();
+      else server.once("listening", () => resolve());
+    });
+
+    const onError = vi.fn();
+    wss.on("error", onError);
+    // Node's own http.Server only ever reports ERR_SERVER_NOT_RUNNING
+    // here, but node:http compatibility layers in other runtimes may
+    // fail differently; such a failure must not be swallowed.
+    const closeErr = Object.assign(new Error("close failed"), { code: "EUNEXPECTED" });
+    const closeSpy = vi
+      .spyOn(server, "close")
+      .mockImplementation(((cb?: (err?: Error) => void) => {
+        cb?.(closeErr);
+        return server;
+      }) as any);
+
+    wss.emit("close");
+
+    expect(closeSpy).toHaveBeenCalledTimes(1);
+    expect(onError).toHaveBeenCalledWith(closeErr);
+
+    closeSpy.mockRestore();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
   it("exposeAuthConfig + heartbeat: close dispatch runs both owned-server shutdown and heartbeat cleanup", async () => {
     vi.useFakeTimers();
     try {
