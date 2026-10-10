@@ -88,6 +88,12 @@ export class AuthSession extends HTMLElement {
   // remove only what we added (and not blast over user-set props).
   private _payloadInstalledProps: string[] = [];
   private _payloadInstalledCmds: Array<{ name: string; forwarder: (...args: unknown[]) => unknown }> = [];
+  // Property names whose mirror was skipped because the application
+  // locked the slot (see `_writePayloadMirror`). Latches the console
+  // warning to once per property per session — the server may push the
+  // same property many times. Cleared with the other payload bookkeeping
+  // on teardown.
+  private _payloadMirrorSkipWarned = new Set<string>();
   private _authListener: ((e: Event) => void) | null = null;
   private _connectedListener: ((e: Event) => void) | null = null;
   private _connectedCallbackPromise: Promise<void> = Promise.resolve();
@@ -831,6 +837,15 @@ export class AuthSession extends HTMLElement {
    * `delete` it to leave the child in a pristine state, and so a
    * subsequent value can replace it without the noisy
    * defineProperty-twice warning some engines emit on identical descriptors.
+   *
+   * Never throws. This runs inside the bind callback, where an exception
+   * used to keep the `ready` flip from being queued when every property
+   * of the first batch failed, fail `_connect()` outright during
+   * `bind()`'s synchronous initial sync, and — on an EventTarget that
+   * rethrows listener errors instead of reporting them — abort the rest
+   * of the proxy's update batch. A property whose slot the application
+   * locked is skipped entirely (no write, no re-dispatch), so a listener
+   * never receives an event whose `detail` contradicts `child[name]`.
    */
   private _mirrorToPayload(
     payload: HTMLElement,
@@ -838,12 +853,7 @@ export class AuthSession extends HTMLElement {
     name: string,
     value: unknown,
   ): void {
-    Object.defineProperty(payload, name, {
-      value,
-      writable: true,
-      configurable: true,
-      enumerable: true,
-    });
+    if (!this._writePayloadMirror(payload, name, value)) return;
     if (this._payloadInstalledProps.indexOf(name) === -1) {
       this._payloadInstalledProps.push(name);
     }
@@ -851,6 +861,56 @@ export class AuthSession extends HTMLElement {
     /* v8 ignore next -- `name` comes from bind() on a proxy whose declaration createRemoteCoreProxy derives 1:1 from `decl.properties`, so the lookup always succeeds */
     if (!prop) return;
     payload.dispatchEvent(new CustomEvent(prop.event, { detail: value, bubbles: true }));
+  }
+
+  /**
+   * Write `value` to `payload[name]`; returns whether the payload now
+   * holds it.
+   *
+   * The normal path (re)defines a configurable own data property. That
+   * redefinition throws a TypeError once the application has locked the
+   * slot: the own property is non-configurable
+   * (`Object.defineProperty(..., { configurable: false })`,
+   * `Object.seal`, `Object.freeze`), or it does not exist yet and the
+   * element is non-extensible (`Object.preventExtensions`). For a locked
+   * slot this falls back to a plain assignment, which still lands on a
+   * writable data property (e.g. after `Object.seal`) or reaches an
+   * accessor's setter. When that fails too — read-only, frozen, no
+   * setter, or the setter throws — the property is skipped with a
+   * one-time warning. Teardown likewise leaves non-configurable
+   * properties alone (`_uninstallPayloadForwarders`), so a locked slot
+   * keeps whatever value it last held.
+   */
+  private _writePayloadMirror(payload: HTMLElement, name: string, value: unknown): boolean {
+    const desc = Object.getOwnPropertyDescriptor(payload, name);
+    if (desc ? desc.configurable : Object.isExtensible(payload)) {
+      Object.defineProperty(payload, name, {
+        value,
+        writable: true,
+        configurable: true,
+        enumerable: true,
+      });
+      return true;
+    }
+    try {
+      if (Reflect.set(payload, name, value)) return true;
+      this._warnPayloadMirrorSkipped(payload, name);
+    } catch (err) {
+      this._warnPayloadMirrorSkipped(payload, name, err);
+    }
+    return false;
+  }
+
+  private _warnPayloadMirrorSkipped(payload: HTMLElement, name: string, cause?: unknown): void {
+    if (this._payloadMirrorSkipWarned.has(name)) return;
+    this._payloadMirrorSkipWarned.add(name);
+    const message =
+      `${ERROR_PREFIX} <auth0-session>: cannot mirror "${name}" onto payload <${payload.localName}> — ` +
+      "the application locked the property (non-configurable and not writable, a non-extensible element, " +
+      "or a setter that threw). Server updates it cannot take are skipped (no value write, no event); " +
+      "the other properties and the session keep running. Shown once per property per session.";
+    if (cause === undefined) console.warn(message);
+    else console.warn(message, cause);
   }
 
   /**
@@ -891,6 +951,7 @@ export class AuthSession extends HTMLElement {
   }
 
   private _uninstallPayloadForwarders(): void {
+    this._payloadMirrorSkipWarned.clear();
     const payload = this._payload;
     if (!payload) {
       this._payloadInstalledProps.length = 0;
