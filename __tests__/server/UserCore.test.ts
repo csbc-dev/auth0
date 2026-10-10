@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { isJsonValue } from "@wc-bindable/remote";
 import { UserCore } from "../../src/server/UserCore";
 import type { UserContext } from "../../src/types";
 
@@ -59,9 +60,31 @@ describe("UserCore", () => {
       raw: { sub: "auth0|min" },
     };
     const core = new UserCore(minimal);
-    expect(core.currentUser).toEqual({ sub: "auth0|min", email: undefined, name: undefined });
+    expect(core.currentUser).toStrictEqual({ sub: "auth0|min" });
     expect(core.permissions).toEqual([]);
     expect(core.roles).toEqual([]);
+  });
+
+  it("omits absent claims from currentUser instead of carrying undefined fields", () => {
+    // `verifyAuth0Token` sets `email` / `name` to `undefined` when the
+    // access token lacks the claim (the Auth0 default). @wc-bindable/remote
+    // >= 0.10 rejects a value with an `undefined` field outright — the
+    // property would never reach the client — so the keys must be absent.
+    const core = new UserCore({
+      sub: "auth0|claimless",
+      email: undefined,
+      name: undefined,
+      permissions: [],
+      roles: [],
+      raw: { sub: "auth0|claimless" },
+    });
+    expect(core.currentUser).toStrictEqual({ sub: "auth0|claimless" });
+    expect(Object.keys(core.currentUser)).toEqual(["sub"]);
+    expect(isJsonValue(core.currentUser)).toBe(true);
+
+    core.updateUser({ ...mockUser, sub: "auth0|claimless", email: undefined });
+    expect(core.currentUser).toStrictEqual({ sub: "auth0|claimless", name: "Test User" });
+    expect(isJsonValue(core.currentUser)).toBe(true);
   });
 
   describe("updateUser", () => {
@@ -118,6 +141,19 @@ describe("UserCore", () => {
         email: "new@example.com",
         name: "Test User",
       });
+    });
+
+    it("user-changed detail omits a claim the refreshed token no longer carries", () => {
+      const core = new UserCore(mockUser);
+      const events: unknown[] = [];
+      core.addEventListener("auth0-gate-user:user-changed", (e) => {
+        events.push((e as CustomEvent).detail);
+      });
+
+      core.updateUser({ ...mockUser, email: undefined, name: undefined });
+      expect(events).toHaveLength(1);
+      expect(events[0]).toStrictEqual({ sub: "auth0|abc123" });
+      expect(isJsonValue(events[0])).toBe(true);
     });
 
     it("event detail for permissions is a fresh copy (not the internal array)", () => {

@@ -46,10 +46,14 @@ vi.mock("jose", async () => {
   };
 });
 
+import { bind, type WcBindableDeclaration } from "@wc-bindable/core";
+import { createRemoteCoreProxy, WebSocketClientTransport } from "@wc-bindable/remote";
 import { createAuthenticatedWSS } from "../src/server/createAuthenticatedWSS";
 import { PROTOCOL_PREFIX } from "../src/protocolPrefix";
 import { AuthCore } from "../src/core/AuthCore";
 import { verifyAuth0Token, _clearJwksCache } from "../src/server/verifyAuth0Token";
+import { UserCore } from "../src/server/UserCore";
+import type { UserContext } from "../src/types";
 
 // --- key + JWT helpers ---------------------------------------------------
 
@@ -98,6 +102,10 @@ async function startWss(args: {
   onEvent?: (e: any) => void;
   onTokenRefresh?: (core: any, user: any) => void | Promise<void>;
   sessionGraceMs?: number;
+  minRefreshIntervalMs?: number;
+  proxyOptions?: Parameters<typeof createAuthenticatedWSS>[0]["proxyOptions"];
+  /** Defaults to the minimal `TestCore` fixture below. */
+  createCores?: (user: UserContext) => EventTarget;
 }): Promise<{ wss: any; port: number; cores: any[]; close: () => Promise<void> }> {
   const cores: any[] = [];
   const wss = await createAuthenticatedWSS({
@@ -107,7 +115,14 @@ async function startWss(args: {
     onEvent: args.onEvent,
     onTokenRefresh: args.onTokenRefresh,
     sessionGraceMs: args.sessionGraceMs,
+    minRefreshIntervalMs: args.minRefreshIntervalMs,
+    proxyOptions: args.proxyOptions,
     createCores: (user) => {
+      if (args.createCores) {
+        const custom = args.createCores(user);
+        cores.push(custom);
+        return custom;
+      }
       // Minimal Core that satisfies the wcBindable contract the
       // RemoteShellProxy introspects. Holds the user so the refresh hook
       // can mutate it and the test can assert.
@@ -122,7 +137,14 @@ async function startWss(args: {
           commands: [],
         };
         public _user = user;
-        get user() { return this._user; }
+        // Expose a JSON-safe projection, never the raw `UserContext`:
+        // its absent optional claims (`email` / `name` / `orgId`) are
+        // `undefined` fields, which @wc-bindable/remote >= 0.10 rejects
+        // as a whole — `sync` would list `user` under `getterFailures`
+        // and the client would never receive it.
+        get user() {
+          return { sub: this._user.sub, permissions: [...this._user.permissions] };
+        }
       }
       const core = new TestCore();
       cores.push(core);
@@ -225,6 +247,20 @@ describe("e2e: real JWT + JWKS + Sec-WebSocket-Protocol + refresh", () => {
       expect(types).toContain("connection:open");
       // The user from the JWT made it all the way to createCores.
       expect(server.cores.at(-1)?._user?.sub).toBe("auth0|user-123");
+      // ...and back out over the wire: the RemoteShellProxy `sync` snapshot
+      // carries the Core's (JSON-safe) `user` property. The token has no
+      // email / name claims, so a non-JSON-safe projection would land in
+      // `getterFailures` instead of `values`.
+      const syncReply = new Promise<any>((resolve) => {
+        result.ws.on("message", (data: Buffer) => {
+          const msg = JSON.parse(data.toString());
+          if (msg.type === "sync") resolve(msg);
+        });
+      });
+      result.ws.send(JSON.stringify({ type: "sync" }));
+      const sync = await syncReply;
+      expect(sync.values.user).toStrictEqual({ sub: "auth0|user-123", permissions: ["read"] });
+      expect(sync.getterFailures).toBeUndefined();
       result.ws.close();
     } finally {
       await server.close();
@@ -386,6 +422,91 @@ describe("e2e: real JWT + JWKS + Sec-WebSocket-Protocol + refresh", () => {
       expect(close.code).toBe(4403);
       expect(events.some(e => e.type === "auth:refresh-failure")).toBe(true);
     } finally {
+      await server.close();
+    }
+  });
+
+  it("UserCore over the real wire: a token without email / name claims still delivers currentUser via sync and user-changed", async () => {
+    // Regression for @wc-bindable/remote 0.10's JsonValue gate. Auth0
+    // access tokens carry no email / name claim by default, so
+    // `verifyAuth0Token` yields `email: undefined, name: undefined`. A
+    // `currentUser` projection that kept those `undefined` fields was
+    // rejected whole by the producer: the `sync` snapshot listed it under
+    // `getterFailures` and every `user-changed` update was dropped, so the
+    // client never received the user. Both paths run here through the real
+    // RemoteShellProxy (server) and RemoteCoreProxy (client).
+    const shellLog: string[] = [];
+    const proxyLog: string[] = [];
+    const server = await startWss({
+      domain, audience,
+      createCores: (user) => new UserCore(user),
+      onTokenRefresh: (core, user) => { (core as UserCore).updateUser(user); },
+      // Two refreshes back to back below; the rate limit is not under test.
+      minRefreshIntervalMs: 0,
+      proxyOptions: {
+        logger: { warn: (m) => shellLog.push(m), error: (m) => shellLog.push(m) },
+      },
+    });
+    // Closed in `finally`: a still-open client keeps `wss.close()` (which
+    // waits for the owned http.Server) from resolving, so a failed
+    // assertion would otherwise surface as a test timeout.
+    let ws: any = null;
+    try {
+      const sub = "auth0|claimless";
+      const t1 = await signToken(mat, { permissions: ["read"] }, { issuer, audience, expiresIn: "60s", sub });
+      const { WebSocket } = await import("ws");
+      ws = new WebSocket(`ws://127.0.0.1:${server.port}`, [`${PROTOCOL_PREFIX}${t1}`]);
+      const proxy = createRemoteCoreProxy(
+        // `IWcBindable` declares its lists `readonly`; core's type does not.
+        UserCore.wcBindable as WcBindableDeclaration,
+        new WebSocketClientTransport(ws as unknown as globalThis.WebSocket),
+        { logger: { warn: (m) => proxyLog.push(m), error: (m) => proxyLog.push(m) } },
+      );
+      // Observe through `bind()`, the same consumer path `<auth0-session>` uses.
+      const latest: Record<string, unknown> = {};
+      const unbind = bind(proxy, (name, value) => { latest[name] = value; });
+
+      // Raw in-band refresh (what AuthShell.refreshToken() puts on the wire).
+      // The intercepting server transport answers it outside the proxy, so
+      // the ack is read off the socket directly.
+      const refresh = (token: string, id: string): Promise<any> => {
+        const ack = new Promise<any>((resolve) => {
+          const onMessage = (data: Buffer): void => {
+            const msg = JSON.parse(data.toString());
+            if (msg.id !== id) return;
+            ws.off("message", onMessage);
+            resolve(msg);
+          };
+          ws.on("message", onMessage);
+        });
+        ws.send(JSON.stringify({ type: "cmd", name: "auth:refresh", id, args: [token] }));
+        return ack;
+      };
+
+      // sync path: the claim-less user arrives as `{ sub }`.
+      await vi.waitFor(() => expect(latest.currentUser).toStrictEqual({ sub }));
+      expect(latest.permissions).toEqual(["read"]);
+
+      // update path: a refreshed token adds `name` but still has no `email`.
+      const t2 = await signToken(mat, { permissions: ["read"], name: "Alice" }, { issuer, audience, expiresIn: "60s", sub });
+      expect((await refresh(t2, "refresh-add-name")).type).toBe("return");
+      await vi.waitFor(() => expect(latest.currentUser).toStrictEqual({ sub, name: "Alice" }));
+
+      // update path: back to a token with neither claim.
+      const t3 = await signToken(mat, { permissions: ["read"] }, { issuer, audience, expiresIn: "60s", sub });
+      expect((await refresh(t3, "refresh-drop-name")).type).toBe("return");
+      await vi.waitFor(() => expect(latest.currentUser).toStrictEqual({ sub }));
+
+      // Nothing was dropped on the producer side, and the consumer never
+      // reported `currentUser` as a getter failure. (The proxy does log the
+      // raw refresh acks as unknown request ids — AuthShell's intercepting
+      // client transport filters those in the real client.)
+      expect(shellLog).toEqual([]);
+      expect(proxyLog.filter((m) => m.includes("currentUser"))).toEqual([]);
+
+      unbind();
+    } finally {
+      ws?.close();
       await server.close();
     }
   });
