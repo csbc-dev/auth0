@@ -631,7 +631,7 @@ export class AuthShell extends EventTarget {
       // sending a frame (its unauthorized-rejection path).
       this._core.commitToken(token);
       this._setConnected(true);
-      return this._createTransport(ws);
+      return this._createTransport(ws, null);
     } finally {
       // Always release the ownership claim, whether we succeeded,
       // threw from a precondition, or rejected at handshake.
@@ -761,6 +761,14 @@ export class AuthShell extends EventTarget {
    * pairs. Without this, a second reconnect call would close the
    * first reconnect's in-flight socket, leaving the first caller with
    * a broken transport while `_ws` pointed at the second's socket.
+   *
+   * The new transport continues the connection it replaces: it joins
+   * that connection's `ConnectionRecord`, so whoever opened the
+   * connection keeps owning it — `releaseAuthTransport()` on the
+   * originally handed-out transport now closes the replacement. When
+   * that owner releases the connection while this call is still in
+   * flight, the call discards its new socket and rejects as superseded
+   * (see `_releaseConnection()`).
    */
   async reconnect(): Promise<ClientTransport> {
     if (!this._core.client) {
@@ -796,6 +804,18 @@ export class AuthShell extends EventTarget {
     // so a concurrent `disconnect()` / `logout()` that bumps the
     // counter while we're mid-handshake is observable on resume.
     const myGeneration = this._connectGeneration;
+    // The connection this call replaces, when the shell has handed one
+    // out. Captured BEFORE the first await, like the generation: from
+    // here on the call is part of that connection, so a release by its
+    // owner (`_releaseConnection()`) marks `replaced.released` and
+    // waits on `replaced.replacing` instead of missing a connection
+    // that is between two sockets. The non-null assertion holds because
+    // every `_transport` comes from `_createTransport()`, which records it.
+    const replaced = this._transport ? _connections.get(this._transport)! : null;
+    let finishReplacing!: () => void;
+    if (replaced) {
+      replaced.replacing = new Promise<void>((resolve) => { finishReplacing = resolve; });
+    }
 
     try {
       // Fetch-then-commit: the new token is published to AuthCore only
@@ -808,6 +828,12 @@ export class AuthShell extends EventTarget {
       }
       if (this._connectGeneration !== myGeneration) {
         raiseError("reconnect(): superseded by disconnect()/logout() during token fetch.");
+      }
+      // The owner gave back the connection this call was about to
+      // replace (the release already closed it): there is nobody to
+      // hand a replacement to, so do not open one.
+      if (replaced?.released) {
+        raiseError("reconnect(): superseded by the release of the connection it was replacing, during token fetch.");
       }
 
       // See connect(): capture the last server-accepted token so we can
@@ -860,20 +886,26 @@ export class AuthShell extends EventTarget {
       // between WebSocket `open` and this resume point invalidates the
       // session we just opened. Close the freshly-opened socket
       // synchronously and reject so `connected` cannot be flipped to
-      // `true` AFTER teardown.
-      if (this._connectGeneration !== myGeneration) {
+      // `true` AFTER teardown. The same goes when the owner released
+      // the connection this call replaces during the handshake: the
+      // release already published `connected=false`, and the new socket
+      // has nobody to belong to.
+      const tornDown = this._connectGeneration !== myGeneration;
+      if (tornDown || replaced?.released) {
         if (this._ws === ws) {
           this._ws = null;
         }
         try {
-          ws.close(1000, "Superseded by disconnect/logout");
+          ws.close(1000, tornDown ? "Superseded by disconnect/logout" : "Superseded by connection release");
         } catch {
           // see _closeWebSocket() — alternative runtimes may throw
         }
         // See connect(): the previous socket is already closed, so drop
         // a stale `connected=true` (a `mode` flip does not publish it).
         this._setConnected(false);
-        raiseError("reconnect(): superseded by disconnect()/logout() during handshake.");
+        raiseError(tornDown
+          ? "reconnect(): superseded by disconnect()/logout() during handshake."
+          : "reconnect(): superseded by the release of the connection it was replacing, during handshake.");
       }
 
       // 101 handshake completed — commit provisionally. See connect():
@@ -882,11 +914,17 @@ export class AuthShell extends EventTarget {
       // rollback of `_token` to the prior server-accepted value.
       this._core.commitToken(token);
       this._setConnected(true);
-      return this._createTransport(ws);
+      return this._createTransport(ws, replaced);
     } finally {
       // Always release the ownership claim so the next connect /
       // reconnect can proceed (including post-failure retries).
       this._connectInFlight = false;
+      // Settle the replacement only now, so a release waiting on it
+      // finds the claim above already dropped.
+      if (replaced) {
+        replaced.replacing = null;
+        finishReplacing();
+      }
     }
   }
 
@@ -1021,54 +1059,115 @@ export class AuthShell extends EventTarget {
     }
   }
 
-  private _createTransport(ws: WebSocket): InterceptingClientTransport {
+  /**
+   * Wrap `ws`, make it the live transport, and record which connection
+   * it carries: a new one for `connect()` (and for a `reconnect()` that
+   * had nothing to replace), or `replaced` — the connection a
+   * `reconnect()` continues.
+   */
+  private _createTransport(ws: WebSocket, replaced: ConnectionRecord | null): InterceptingClientTransport {
     const transport = new InterceptingClientTransport(ws);
     this._transport = transport;
-    _transportReleasers.set(transport, () => this._releaseTransport(transport));
+    const record: ConnectionRecord = replaced ?? {
+      current: transport,
+      replacing: null,
+      released: false,
+      release: () => this._releaseConnection(record),
+    };
+    record.current = transport;
+    _connections.set(transport, record);
     return transport;
   }
 
   /**
    * Ownership-checked counterpart of `disconnect()`, reached through
-   * `releaseAuthTransport()`. Closes the connection only while
-   * `transport` is still the live one this shell handed out; once a
-   * later `connect()` / `reconnect()` replaced it, or `disconnect()` /
-   * `logout()` already released it, `_transport` no longer matches and
-   * this is a no-op — so a caller can never close a connection another
-   * owner opened in the meantime.
+   * `releaseAuthTransport()`. Gives up the connection `record` describes:
+   *
+   *   - While its current transport — the one handed out, or the latest
+   *     `reconnect()` replacement of it — is the live one, closes it and
+   *     publishes `connected=false`. (After a server close both already
+   *     happened; only the transport is disposed.)
+   *   - While a `reconnect()` is replacing it, also marks it released:
+   *     that call discards its new socket when it resumes and rejects as
+   *     superseded. During the token fetch the old socket is still live
+   *     and is closed here; during the handshake the call has already
+   *     closed it, and only `connected=false` is left to publish. The
+   *     returned promise settles once the call has finished, i.e. once
+   *     the connection slot is free again.
+   *   - Otherwise — a take-over `connect()` replaced it, or
+   *     `disconnect()` / `logout()` already closed it — does nothing, so
+   *     a caller can never close a connection another owner opened in
+   *     the meantime.
    *
    * Unlike `disconnect()` it does NOT bump `_connectGeneration`: it
    * gives up one specific connection rather than vetoing connections in
    * general, so an unrelated take-over `connect()` / `reconnect()`
    * already in flight must still be allowed to complete.
    */
-  private _releaseTransport(transport: InterceptingClientTransport): boolean {
-    if (this._transport !== transport) return false;
-    this._closeWebSocket();
+  private _releaseConnection(record: ConnectionRecord): boolean | Promise<void> {
+    const live = this._transport === record.current;
+    if (live) this._closeWebSocket();
+    const replacing = record.replacing;
+    if (replacing) record.released = true;
+    if (!live && !replacing) return false;
     this._setConnected(false);
-    return true;
+    return replacing ?? true;
   }
 }
 
-// Release hooks for the transports AuthShell hands out, keyed by the
-// transport object itself. Kept in a module-private WeakMap rather than
-// as a method on the transport (or on AuthShell / `<auth0-gate>`) so the
+/**
+ * One connection as the party that opened it sees it: the transport
+ * `connect()` handed out, followed through every `reconnect()` that
+ * replaced it since. Package-internal — reached only through
+ * `_connections`.
+ */
+interface ConnectionRecord {
+  /** The transport carrying the connection now (the latest `reconnect()` replacement). */
+  current: InterceptingClientTransport;
+  /**
+   * Settles once the `reconnect()` that is replacing `current` has
+   * finished, whatever its outcome; `null` while none is in flight.
+   */
+  replacing: Promise<void> | null;
+  /**
+   * The owner released the connection while `replacing` was in flight:
+   * that `reconnect()` discards its new socket instead of continuing the
+   * connection.
+   */
+  released: boolean;
+  /** `AuthShell._releaseConnection()` bound to the shell and this record. */
+  release(): boolean | Promise<void>;
+}
+
+// The connection each transport AuthShell hands out belongs to, keyed by
+// the transport object itself. A `reconnect()` replacement is keyed to
+// the record of the connection it replaced, so every transport of one
+// connection leads to the same record. Kept in a module-private WeakMap
+// rather than on the transport (or on AuthShell / `<auth0-gate>`) so the
 // capability stays package-internal: application code that holds a
 // transport — `authEl.connect()`'s return value, `session.transport` —
 // gains no new public close surface.
-const _transportReleasers = new WeakMap<ClientTransport, () => boolean>();
+const _connections = new WeakMap<ClientTransport, ConnectionRecord>();
 
 /**
- * Package-internal: close the connection behind `transport` if, and only
- * if, it is still the live connection of the `AuthShell` that created it.
- * Closes the WebSocket (code 1000) and publishes `connected=false` (with
+ * Package-internal: give up the connection behind `transport` — the one
+ * `AuthShell.connect()` / `reconnect()` handed it out for, followed
+ * through every later `reconnect()` that replaced it. Closes its current
+ * WebSocket (code 1000) and publishes `connected=false` (with
  * `auth0-gate:connected-changed`) synchronously, the same way
  * `disconnect()` does.
  *
- * Returns `false` without side effects for a transport that was not
- * created by `AuthShell.connect()` / `reconnect()`, or that is no longer
- * that shell's live connection (replaced by a later connect / reconnect,
- * or already closed by `disconnect()` / `logout()`).
+ * Returns:
+ *   - `true` when it gave the live connection up (after a server close
+ *     only the transport is left to dispose; nothing is announced twice).
+ *   - A promise when a `reconnect()` replacing the connection is still in
+ *     flight. That call discards its new socket when it resumes and
+ *     rejects; the promise settles once it has, i.e. once the target can
+ *     take a new connection.
+ *   - `false`, without side effects, for a transport the shell did not
+ *     create, or for a connection that is no longer live: a take-over
+ *     `connect()` replaced it (that connection belongs to its caller), or
+ *     `disconnect()` / `logout()` already closed it.
  *
  * Used by `<auth0-session>` to give back the connection it opened when
  * the session ends (logout, removal from the DOM, a `start()` restart,
@@ -1078,9 +1177,20 @@ const _transportReleasers = new WeakMap<ClientTransport, () => boolean>();
  * guard (SPEC-REMOTE §3.7). Not re-exported from the package entry
  * point.
  */
-export function releaseAuthTransport(transport: ClientTransport): boolean {
-  const release = _transportReleasers.get(transport);
-  return release ? release() : false;
+export function releaseAuthTransport(transport: ClientTransport): boolean | Promise<void> {
+  const record = _connections.get(transport);
+  return record ? record.release() : false;
+}
+
+/**
+ * Package-internal: the transport that carries `transport`'s connection
+ * now — the latest `reconnect()` replacement of it, or `transport` itself
+ * (also for a transport the shell did not create). Lets `<auth0-session>`
+ * expose the connection it owns after the application replaced it with
+ * `reconnect()`. Not re-exported from the package entry point.
+ */
+export function currentAuthTransport(transport: ClientTransport): ClientTransport {
+  return _connections.get(transport)?.current ?? transport;
 }
 
 class InterceptingClientTransport implements ClientTransport {

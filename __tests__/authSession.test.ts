@@ -1801,20 +1801,306 @@ describe("AuthSession (auth0-session)", () => {
         expect(connectedEvents).toEqual([true]);
       });
 
-      it("does not close a connection that authEl.reconnect() opened in place of the session's (Strategy B)", async () => {
-        const { authEl, connectedEvents, el } = await mountReadySession();
-        await authEl.reconnect();
+      describe("a replacement authEl.reconnect() opened for the session's connection stays the session's (Strategy B)", () => {
+        // `reconnect()` closes the session's socket and opens a new one
+        // without publishing `connected=false`; the application then
+        // re-attaches `session.proxy` to the result (SPEC-REMOTE §3.4.1).
+        // The session used to know only the first transport, so its end
+        // left the replacement open and every `start()` / remount failed
+        // the ownership guard against it until logout. The replacement
+        // continues the session's connection: `transport` returns it and
+        // the session's end closes it.
 
-        // The replacement is not the session's: a restart neither closes
-        // it nor takes it over, and reports the ownership conflict.
-        await el.start();
-        el.remove();
+        function deferred<T>() {
+          let resolve!: (value: T) => void;
+          const promise = new Promise<T>((r) => { resolve = r; });
+          return { promise, resolve };
+        }
 
-        expect(isOwnershipError(el.error)).toBe(true);
-        expect(socketStates()).toEqual([MockSocket.CLOSED, MockSocket.OPEN]);
-        expect(MockSocket.instances[1].closeCalls).toBe(0);
-        expect(authEl.connected).toBe(true);
-        expect(connectedEvents).toEqual([true]);
+        // The Strategy B flow: reconnect, then re-attach the session's
+        // proxy (a stand-in for `RemoteCoreProxy.reconnect`) to the result.
+        async function reconnectSession(authEl: Auth, el: AuthSession) {
+          const reattach = vi.fn();
+          Object.assign(el.proxy as object, { reconnect: reattach });
+          const replacement = await authEl.reconnect();
+          (el.proxy as unknown as { reconnect(t: unknown): void }).reconnect(replacement);
+          expect(reattach).toHaveBeenCalledWith(replacement);
+          return replacement;
+        }
+
+        async function mountReconnectedSession() {
+          const ready = await mountReadySession();
+          const firstTransport = ready.el.transport;
+          const replacement = await reconnectSession(ready.authEl, ready.el);
+          // The replacement is live, nothing was announced, the session
+          // carries on, and its `transport` is the replacement.
+          expect(socketStates()).toEqual([MockSocket.CLOSED, MockSocket.OPEN]);
+          expect(MockSocket.instances[0].closeCalls).toBe(1);
+          expect(ready.connectedEvents).toEqual([true]);
+          expect(ready.el.ready).toBe(true);
+          expect(ready.el.transport).toBe(replacement);
+          expect(replacement).not.toBe(firstTransport);
+          return { ...ready, replacement };
+        }
+
+        // Pumps microtasks until `reconnect()` has asked Auth0 for its
+        // fresh token, i.e. it is parked in the token fetch.
+        async function untilTokenRequested(authEl: Auth, count: number): Promise<void> {
+          const getTokenSilently = (authEl.client as { getTokenSilently: ReturnType<typeof vi.fn> }).getTokenSilently;
+          for (let i = 0; i < 100 && getTokenSilently.mock.calls.length < count; i++) {
+            await Promise.resolve();
+          }
+          expect(getTokenSilently.mock.calls).toHaveLength(count);
+        }
+
+        function holdNextToken(authEl: Auth) {
+          const token = deferred<string>();
+          const getTokenSilently = (authEl.client as { getTokenSilently: ReturnType<typeof vi.fn> }).getTokenSilently;
+          getTokenSilently.mockImplementationOnce(() => token.promise);
+          return { token, calls: getTokenSilently.mock.calls.length };
+        }
+
+        const SUPERSEDED_IN_HANDSHAKE =
+          "reconnect(): superseded by the release of the connection it was replacing, during handshake.";
+        const SUPERSEDED_IN_TOKEN_FETCH =
+          "reconnect(): superseded by the release of the connection it was replacing, during token fetch.";
+
+        it("start() closes the replacement, reconnects, and returns to ready", async () => {
+          const { authEl, connectedEvents, el, readyEvents, replacement } = await mountReconnectedSession();
+
+          await el.start();
+
+          expect(el.error).toBeNull();
+          expect(socketStates()).toEqual([MockSocket.CLOSED, MockSocket.CLOSED, MockSocket.OPEN]);
+          expect(MockSocket.instances[1].closeCalls).toBe(1);
+          expect(MockSocket.instances[1].closeCode).toBe(1000);
+          expect(authEl.connected).toBe(true);
+          expect(connectedEvents).toEqual([true, false, true]);
+          expect(el.transport).not.toBeNull();
+          expect(el.transport).not.toBe(replacement);
+          await expectSynced(el);
+          expect(readyEvents).toEqual([true, false, true]);
+        });
+
+        it("removing the session closes the replacement, and adding it back reconnects", async () => {
+          const { authEl, connectedEvents, el } = await mountReconnectedSession();
+
+          el.remove();
+
+          expect(socketStates()).toEqual([MockSocket.CLOSED, MockSocket.CLOSED]);
+          expect(MockSocket.instances[1].closeCalls).toBe(1);
+          expect(MockSocket.instances[1].closeCode).toBe(1000);
+          expect(authEl.connected).toBe(false);
+          expect(connectedEvents).toEqual([true, false]);
+          expect(el.ready).toBe(false);
+          expect(el.proxy).toBeNull();
+          expect(el.transport).toBeNull();
+
+          document.body.appendChild(el);
+          await el.connectedCallbackPromise;
+
+          expect(el.error).toBeNull();
+          expect(socketStates()).toEqual([MockSocket.CLOSED, MockSocket.CLOSED, MockSocket.OPEN]);
+          expect(connectedEvents).toEqual([true, false, true]);
+          await expectSynced(el);
+        });
+
+        it.each([
+          ["authenticated turning false", (authEl: Auth) => {
+            authEl.dispatchEvent(new CustomEvent("auth0-gate:authenticated-changed", { detail: false }));
+          }],
+          ["logout()", async (authEl: Auth) => { await authEl.logout(); }],
+          ["a server close", () => { MockSocket.instances[1].close(4401, "Session expired"); }],
+        ])("%s ends the session with the replacement closed exactly once and announced once", async (_name, end) => {
+          const { authEl, connectedEvents, el } = await mountReconnectedSession();
+
+          await end(authEl);
+
+          expect(MockSocket.instances[1].closeCalls).toBe(1);
+          expect(socketStates()).toEqual([MockSocket.CLOSED, MockSocket.CLOSED]);
+          expect(authEl.connected).toBe(false);
+          expect(connectedEvents).toEqual([true, false]);
+          expect(el.ready).toBe(false);
+          expect(el.proxy).toBeNull();
+          expect(el.transport).toBeNull();
+          expect(el.error).toBeNull();
+        });
+
+        it("several reconnects in a row: the session owns the latest replacement", async () => {
+          const { authEl, connectedEvents, el } = await mountReadySession();
+          await reconnectSession(authEl, el);
+          await reconnectSession(authEl, el);
+          const latest = await reconnectSession(authEl, el);
+
+          expect(el.transport).toBe(latest);
+          expect(socketStates()).toEqual([
+            MockSocket.CLOSED, MockSocket.CLOSED, MockSocket.CLOSED, MockSocket.OPEN,
+          ]);
+          expect(connectedEvents).toEqual([true]);
+
+          el.remove();
+
+          expect(MockSocket.instances.map((s) => s.closeCalls)).toEqual([1, 1, 1, 1]);
+          expect(authEl.connected).toBe(false);
+          expect(connectedEvents).toEqual([true, false]);
+
+          document.body.appendChild(el);
+          await el.connectedCallbackPromise;
+          expect(el.error).toBeNull();
+          expect(MockSocket.instances).toHaveLength(5);
+          expect(MockSocket.instances[4].readyState).toBe(MockSocket.OPEN);
+          await expectSynced(el);
+        });
+
+        describe("a connection the session does not own is not taken over when it is reconnected", () => {
+          it("the application's own connection (Pattern B)", async () => {
+            const { authEl, connectedEvents } = await mountGate();
+            await authEl.connect();
+            const el = await mountSession((s) => { s.core = "app-core"; });
+            expect(isOwnershipError(el.error)).toBe(true);
+
+            await authEl.reconnect();
+            await el.start();
+            expect(isOwnershipError(el.error)).toBe(true);
+            el.remove();
+
+            expect(socketStates()).toEqual([MockSocket.CLOSED, MockSocket.OPEN]);
+            expect(MockSocket.instances[1].closeCalls).toBe(0);
+            expect(authEl.connected).toBe(true);
+            expect(connectedEvents).toEqual([true]);
+          });
+
+          it("a take-over connect()'s connection", async () => {
+            const { authEl, connectedEvents, el } = await mountReadySession();
+            await authEl.connect(); // replaces the session's socket
+            await authEl.reconnect(); // replaces the take-over's socket
+
+            el.remove();
+
+            expect(socketStates()).toEqual([MockSocket.CLOSED, MockSocket.CLOSED, MockSocket.OPEN]);
+            expect(MockSocket.instances[2].closeCalls).toBe(0);
+            expect(authEl.connected).toBe(true);
+            expect(connectedEvents).toEqual([true]);
+          });
+
+          it("a second session leaves the first session's replacement alone; the first session closes it", async () => {
+            const { authEl, connectedEvents, el: first } = await mountReadySession();
+            const second = await mountSession((s) => { s.core = "app-core"; });
+            expect(isOwnershipError(second.error)).toBe(true);
+            const replacement = await reconnectSession(authEl, first);
+
+            await second.start();
+            expect(isOwnershipError(second.error)).toBe(true);
+            expect(second.transport).toBeNull();
+            second.remove();
+
+            expect(socketStates()).toEqual([MockSocket.CLOSED, MockSocket.OPEN]);
+            expect(MockSocket.instances[1].closeCalls).toBe(0);
+            expect(connectedEvents).toEqual([true]);
+            expect(first.ready).toBe(true);
+            expect(first.transport).toBe(replacement);
+
+            first.remove();
+            expect(socketStates()).toEqual([MockSocket.CLOSED, MockSocket.CLOSED]);
+            expect(MockSocket.instances[1].closeCalls).toBe(1);
+            expect(connectedEvents).toEqual([true, false]);
+          });
+        });
+
+        describe("the session ends while reconnect() is replacing its connection", () => {
+          // The release cannot cancel the reconnect's handshake. It gives
+          // the connection up at once (`connected=false`); the reconnect
+          // discards its new socket — or does not open one — when it
+          // resumes, and rejects. A run started meanwhile waits for that
+          // instead of failing the ownership guard.
+
+          it("removal during the handshake: the replacement is closed as soon as it opens, and reconnect() rejects", async () => {
+            const { authEl, connectedEvents, el } = await mountReadySession();
+            const pending = authEl.reconnect();
+            await untilSocketCount(2);
+
+            el.remove();
+
+            expect(authEl.connected).toBe(false);
+            expect(connectedEvents).toEqual([true, false]);
+            await expect(pending).rejects.toThrow(SUPERSEDED_IN_HANDSHAKE);
+            expect(socketStates()).toEqual([MockSocket.CLOSED, MockSocket.CLOSED]);
+            expect(MockSocket.instances[1].closeCalls).toBe(1);
+            expect(MockSocket.instances[1].closeCode).toBe(1000);
+            expect(authEl.connected).toBe(false);
+            expect(connectedEvents).toEqual([true, false]);
+            expect(el.transport).toBeNull();
+            expect(el.error).toBeNull();
+          });
+
+          it("start() during the handshake waits for the reconnect to give up, then connects", async () => {
+            const { authEl, connectedEvents, el } = await mountReadySession();
+            const errorEvents: unknown[] = [];
+            el.addEventListener("auth0-session:error", (e) => errorEvents.push((e as CustomEvent).detail));
+            const pending = authEl.reconnect();
+            await untilSocketCount(2);
+
+            const restart = el.start();
+            for (let i = 0; i < 10; i++) await Promise.resolve();
+            expect(el.connecting).toBe(true);
+            expect(MockSocket.instances).toHaveLength(2);
+
+            await expect(pending).rejects.toThrow(SUPERSEDED_IN_HANDSHAKE);
+            await restart;
+
+            expect(el.error).toBeNull();
+            expect(errorEvents).toEqual([]);
+            expect(socketStates()).toEqual([MockSocket.CLOSED, MockSocket.CLOSED, MockSocket.OPEN]);
+            expect(MockSocket.instances[1].closeCalls).toBe(1);
+            expect(authEl.connected).toBe(true);
+            expect(connectedEvents).toEqual([true, false, true]);
+            await expectSynced(el);
+          });
+
+          it("removal during the token fetch: the connection closes at once, and reconnect() opens none and rejects", async () => {
+            const { authEl, connectedEvents, el } = await mountReadySession();
+            const { token, calls } = holdNextToken(authEl);
+            const pending = authEl.reconnect();
+            await untilTokenRequested(authEl, calls + 1);
+
+            el.remove();
+
+            expect(socketStates()).toEqual([MockSocket.CLOSED]);
+            expect(MockSocket.instances[0].closeCalls).toBe(1);
+            expect(MockSocket.instances[0].closeCode).toBe(1000);
+            expect(authEl.connected).toBe(false);
+            expect(connectedEvents).toEqual([true, false]);
+
+            token.resolve("fresh-token");
+            await expect(pending).rejects.toThrow(SUPERSEDED_IN_TOKEN_FETCH);
+            expect(MockSocket.instances).toHaveLength(1);
+            expect(connectedEvents).toEqual([true, false]);
+            expect(el.error).toBeNull();
+          });
+
+          it("start() during the token fetch waits for the reconnect to give up, then connects", async () => {
+            const { authEl, connectedEvents, el } = await mountReadySession();
+            const { token, calls } = holdNextToken(authEl);
+            const pending = authEl.reconnect();
+            await untilTokenRequested(authEl, calls + 1);
+
+            const restart = el.start();
+            for (let i = 0; i < 10; i++) await Promise.resolve();
+            expect(el.connecting).toBe(true);
+            expect(socketStates()).toEqual([MockSocket.CLOSED]);
+            expect(connectedEvents).toEqual([true, false]);
+
+            token.resolve("fresh-token");
+            await expect(pending).rejects.toThrow(SUPERSEDED_IN_TOKEN_FETCH);
+            await restart;
+
+            expect(el.error).toBeNull();
+            expect(socketStates()).toEqual([MockSocket.CLOSED, MockSocket.OPEN]);
+            expect(authEl.connected).toBe(true);
+            expect(connectedEvents).toEqual([true, false, true]);
+            await expectSynced(el);
+          });
+        });
       });
     });
   });

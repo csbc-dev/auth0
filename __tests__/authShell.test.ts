@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { AuthShell, releaseAuthTransport } from "../src/shell/AuthShell";
+import { AuthShell, currentAuthTransport, releaseAuthTransport } from "../src/shell/AuthShell";
 import { isOwnershipError, OWNERSHIP_ERROR_MARKER } from "../src/raiseError";
 
 function createMockAuth0Client(overrides: Record<string, any> = {}) {
@@ -1365,6 +1365,100 @@ describe("AuthShell", () => {
       ).resolves.toBeDefined();
       expect(shell.connected).toBe(true);
     });
+
+    // The owner of the connection a reconnect() is replacing gives it
+    // back (`releaseAuthTransport()`, what <auth0-session> does when it
+    // ends). The release cannot cancel the handshake; the reconnect must
+    // not hand a connection to an owner that is gone.
+    it("reconnect(): a release of the connection it replaces during the token fetch closes that connection at once; the reconnect opens nothing and rejects", async () => {
+      const fresh = deferred<string>();
+      const { shell, connectedEvents } = await initShell(
+        vi.fn()
+          .mockResolvedValueOnce(jwt("u", EXP_1))
+          .mockImplementationOnce(() => fresh.promise)
+          .mockResolvedValue(jwt("u", EXP_2)),
+      );
+      const transport = await shell.connect("ws://localhost:3000", { failIfConnected: true });
+
+      const pending = shell.reconnect(); // parked in fetchFreshToken()
+      const released = releaseAuthTransport(transport);
+
+      expect(released).toBeInstanceOf(Promise);
+      expect(sockets[0].closeCalls).toEqual([[1000, "Client disconnect"]]);
+      expect(shell.connected).toBe(false);
+      expect(connectedEvents).toEqual([true, false]);
+      let settled = false;
+      void (released as Promise<void>).then(() => { settled = true; });
+      await Promise.resolve();
+      expect(settled).toBe(false); // the reconnect still holds the slot
+
+      fresh.resolve(jwt("u", EXP_2));
+      await expect(pending).rejects.toThrow(
+        "reconnect(): superseded by the release of the connection it was replacing, during token fetch.",
+      );
+      await released;
+      expect(settled).toBe(true);
+      expect(sockets).toHaveLength(1);
+      expect(connectedEvents).toEqual([true, false]);
+      expect(shell.getTokenExpiry()).toBe(EXP_1 * 1000);
+      // Released once; the slot is free for the next owner.
+      expect(releaseAuthTransport(transport)).toBe(false);
+      await expect(
+        shell.connect("ws://localhost:3000", { failIfConnected: true }),
+      ).resolves.toBeDefined();
+    });
+
+    it("reconnect(): a release of the connection it replaces during the handshake publishes connected=false at once; the replacement is closed when it opens and the reconnect rejects", async () => {
+      const { shell, connectedEvents } = await initShell(
+        vi.fn()
+          .mockResolvedValueOnce(jwt("u", EXP_1))
+          .mockResolvedValue(jwt("u", EXP_2)),
+      );
+      const transport = await shell.connect("ws://localhost:3000", { failIfConnected: true });
+      let released: boolean | Promise<void> | undefined;
+      let connectedAtRelease: boolean | undefined;
+      interjectOnOpen = () => {
+        released = releaseAuthTransport(transport);
+        connectedAtRelease = shell.connected;
+      };
+
+      await expect(shell.reconnect()).rejects.toThrow(
+        "reconnect(): superseded by the release of the connection it was replacing, during handshake.",
+      );
+
+      expect(released).toBeInstanceOf(Promise);
+      expect(connectedAtRelease).toBe(false);
+      expect(sockets).toHaveLength(2);
+      // The reconnect closed the old socket; the replacement is closed by
+      // the supersede guard. Nothing is closed or announced twice.
+      expect(sockets[0].closeCalls).toEqual([[1000, "Client disconnect"]]);
+      expect(sockets[1].closeCalls).toEqual([[1000, "Superseded by connection release"]]);
+      expect(shell.connected).toBe(false);
+      expect(connectedEvents).toEqual([true, false]);
+      expect(shell.getTokenExpiry()).toBe(EXP_1 * 1000);
+      await released;
+      await expect(
+        shell.connect("ws://localhost:3000", { failIfConnected: true }),
+      ).resolves.toBeDefined();
+    });
+
+    it("reconnect(): a disconnect() during the handshake is reported as the cause even when the owner also released the connection", async () => {
+      const { shell, connectedEvents } = await initShell(
+        vi.fn()
+          .mockResolvedValueOnce(jwt("u", EXP_1))
+          .mockResolvedValue(jwt("u", EXP_2)),
+      );
+      const transport = await shell.connect("ws://localhost:3000", { failIfConnected: true });
+      interjectOnOpen = () => {
+        shell.disconnect();
+        releaseAuthTransport(transport);
+      };
+
+      await expect(shell.reconnect()).rejects.toThrow(
+        "reconnect(): superseded by disconnect()/logout() during handshake.",
+      );
+      expect(connectedEvents).toEqual([true, false]);
+    });
   });
 
   describe("refreshToken (in-band refresh)", () => {
@@ -2580,6 +2674,71 @@ describe("AuthShell", () => {
       expect(shell.connected).toBe(true);
       expect(sockets.map((s) => s.readyState)).toEqual([MockWebSocket.CLOSED, MockWebSocket.OPEN]);
       expect(connectedEvents).toEqual([true, false, true]);
+    });
+
+    describe("a reconnect() replacement continues the connection it replaced", () => {
+      it("follows reconnect() to the replacement: closes it once and publishes connected=false once", async () => {
+        const { shell, connectedEvents } = await initializedShell();
+        const first = await shell.connect("ws://localhost:3000", { failIfConnected: true });
+        const second = await shell.reconnect();
+        const third = await shell.reconnect();
+
+        expect(currentAuthTransport(first)).toBe(third);
+        expect(currentAuthTransport(second)).toBe(third);
+        expect(currentAuthTransport(third)).toBe(third);
+        expect(connectedEvents).toEqual([true]);
+
+        expect(releaseAuthTransport(first)).toBe(true);
+
+        expect(sockets.map((s) => s.closeCalls)).toEqual([
+          [[1000, "Client disconnect"]],
+          [[1000, "Client disconnect"]],
+          [[1000, "Client disconnect"]],
+        ]);
+        expect(shell.connected).toBe(false);
+        expect(connectedEvents).toEqual([true, false]);
+        // Any transport of the connection leads to the same, now released,
+        // connection.
+        expect(releaseAuthTransport(second)).toBe(false);
+        expect(releaseAuthTransport(third)).toBe(false);
+        expect(connectedEvents).toEqual([true, false]);
+      });
+
+      it("does not follow a take-over connect(), nor a reconnect() of the take-over's connection", async () => {
+        const { shell, connectedEvents } = await initializedShell();
+        const first = await shell.connect("ws://localhost:3000");
+        await shell.reconnect();
+        const takeOver = await shell.connect("ws://localhost:3000");
+        const takeOverReplacement = await shell.reconnect();
+
+        expect(currentAuthTransport(takeOver)).toBe(takeOverReplacement);
+        expect(releaseAuthTransport(first)).toBe(false);
+        expect(sockets[3].closeCalls).toEqual([]);
+        expect(shell.connected).toBe(true);
+        expect(connectedEvents).toEqual([true]);
+
+        expect(releaseAuthTransport(takeOver)).toBe(true);
+        expect(sockets[3].closeCalls).toEqual([[1000, "Client disconnect"]]);
+        expect(connectedEvents).toEqual([true, false]);
+      });
+
+      it("a reconnect() with no live connection to replace opens a connection of its own", async () => {
+        const { shell } = await initializedShell();
+        const first = await shell.connect("ws://localhost:3000");
+        shell.disconnect();
+        const fresh = await shell.reconnect();
+
+        expect(currentAuthTransport(first)).toBe(first);
+        expect(releaseAuthTransport(first)).toBe(false);
+        expect(shell.connected).toBe(true);
+        expect(releaseAuthTransport(fresh)).toBe(true);
+        expect(shell.connected).toBe(false);
+      });
+
+      it("returns a transport the shell did not create unchanged", () => {
+        const foreign = { send: vi.fn(), onMessage: vi.fn() };
+        expect(currentAuthTransport(foreign)).toBe(foreign);
+      });
     });
   });
 

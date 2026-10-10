@@ -586,7 +586,7 @@ function _defaultIsAuthError(err: unknown): boolean {
 }
 ```
 
-The `proxy` argument is required because Strategy B needs `proxy.reconnect(newTransport)` to swap the proxy onto the rebuilt connection (§3.4.2). Callers using `<auth0-session>` can pass `session.proxy` once `session.ready` is true.
+The `proxy` argument is required because Strategy B needs `proxy.reconnect(newTransport)` to swap the proxy onto the rebuilt connection (§3.4.2). Callers using `<auth0-session>` can pass `session.proxy` once `session.ready` is true; the connection `reconnect()` opens in place of the session's stays owned by the session (§3.7), and the session's end closes it. Dispose the scheduler when the session ends.
 
 #### 3.4.2 Strategy B: WebSocket Reconnection (Fallback)
 
@@ -723,7 +723,11 @@ The application owns the transport and the proxy. No session element is mounted.
 - `start()` restarts the session;
 - setting the session up fails after the handshake (proxy construction, `bind()`'s initial sync, or a command forwarder that cannot be installed).
 
-A handshake in flight when the session ends cannot be cancelled; its connection is closed as soon as it opens, and a run started meanwhile on the same element waits for that before calling `connect()` instead of failing the ownership guard against it. The release is identity-checked inside the package: it closes the connection only while it is still the gate's live one. It therefore never touches a connection the session did not open — Pattern B's, a take-over `connect()`, or the replacement `reconnect()` opened (§3.4.2, even when `session.proxy` was re-attached to it) — and it does not cancel another caller's in-flight handshake the way `disconnect()` does. Such a connection stays until `logout()` or until `<auth0-gate>` leaves the DOM; the session's next `connect()` reports the ownership conflict meanwhile.
+A handshake in flight when the session ends cannot be cancelled; its connection is closed as soon as it opens, and a run started meanwhile on the same element waits for that before calling `connect()` instead of failing the ownership guard against it.
+
+**Replacement by `reconnect()` (Strategy B).** A `reconnect()` (§3.4.2) continues the connection it replaces: when the application replaces the session's connection — typically followed by re-attaching `session.proxy` to the returned transport (§3.4.1) — the replacement is the session's connection from then on, through any number of further `reconnect()` calls. `session.transport` returns the latest replacement, and the session's end releases it exactly as listed above. When the session ends while such a `reconnect()` is in flight, the release cannot cancel it either: `connected` turns `false` at once (during the token fetch the session's socket is closed right away; during the handshake `reconnect()` has already closed it), the replacement is closed with `1000` as soon as it opens — or never opened, if the token fetch was still pending — and that `reconnect()` rejects with `superseded by the release of the connection it was replacing`. A run started meanwhile waits for it, as above. A `reconnect()` that starts when the gate has no live connection replaces nothing and opens a connection of its caller's.
+
+The release is identity-checked inside the package: it closes the connection only while it — or its latest `reconnect()` replacement — is still the gate's live one. It therefore never touches a connection the session did not open — Pattern B's, a take-over `connect()`, or a `reconnect()` of either — and it does not cancel another caller's in-flight handshake the way `disconnect()` does. Such a connection stays until `logout()` or until `<auth0-gate>` leaves the DOM; the session's next `connect()` reports the ownership conflict meanwhile.
 
 ---
 
